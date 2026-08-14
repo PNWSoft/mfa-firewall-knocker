@@ -157,6 +157,11 @@ namespace MFAAdmin
 
         private static string RulePrefix => Config?["RulePrefix"] ?? "MFA_Temp_";
 
+        // Passkey-only mode. Defaults to TRUE and MUST match MFAWeb's RequirePasskey.
+        // When true no TOTP secret is ever generated, so users.dat holds no recoverable
+        // shared secret — only passkey public keys and BCrypt hashes.
+        private static bool RequirePasskey => Config?.GetValue<bool?>("RequirePasskey") ?? true;
+
         // DPAPI Entropy (Windows Only) — loaded from config in Main()
         private static byte[] Entropy = Array.Empty<byte>();
 
@@ -182,6 +187,15 @@ namespace MFAAdmin
             if (entropyStr.Trim().Length < 16)
                 throw new InvalidOperationException("DpapiEntropy must be at least 16 characters. Generate a unique random string for this deployment (e.g. 32 random bytes, base64-encoded).");
             Entropy = Encoding.UTF8.GetBytes(entropyStr);
+
+            // Surface the authentication posture on every run. Which mode is active decides
+            // whether 'add'/'reprovision' mint a TOTP secret and whether the provisioning email
+            // carries an authenticator-app link, so an operator should never have to guess --
+            // particularly since this key must match MFAWeb's and a mismatch is otherwise silent.
+            if (RequirePasskey)
+                AdminLogger.Log("[INFO] TOTP is not enabled (RequirePasskey=true). Passkey-only: no TOTP secret will be stored.");
+            else
+                AdminLogger.Warn("[WARN] TOTP is ENABLED (RequirePasskey=false). Accounts will be provisioned with a TOTP secret.");
 
             if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
             {
@@ -233,7 +247,7 @@ namespace MFAAdmin
                 Console.WriteLine($"       {SiteName} MFA Admin Tool          ");
                 Console.WriteLine($"       v{_ver}  |  Built {_built} UTC");
                 Console.WriteLine("========================================");
-                Console.WriteLine("Usage: MFAAdmin [add|list|delete|diag|reset|reprovision|export|import] [username|filepath]");
+                Console.WriteLine("Usage: MFAAdmin [add|list|delete|diag|reset|reprovision|export|import|purge-totp] [username|filepath]");
                 return;
             }
 
@@ -265,8 +279,11 @@ namespace MFAAdmin
                 case "import":
                     ImportUsers(cleanArgs.Length > 1 ? cleanArgs[1] : "");
                     break;
+                case "purge-totp":
+                    PurgeTotpSecrets();
+                    break;
                 default:
-                    AdminLogger.Log("Unknown command. Use: add, list, delete, diag, reset, reprovision, export, import");
+                    AdminLogger.Log("Unknown command. Use: add, list, delete, diag, reset, reprovision, export, import, purge-totp");
                     break;
             }
 
@@ -300,8 +317,11 @@ namespace MFAAdmin
 
             // Credentials generated outside the lock — BCrypt hashing is expensive
             string password = GenerateRandomPassword(12);
-            byte[] secretBytes = KeyGeneration.GenerateRandomKey(32);
-            string base32Secret = Base32Encoding.ToString(secretBytes);
+            // Passkey-only deployments mint no TOTP secret at all, so there is nothing
+            // recoverable to steal from users.dat for accounts that never use TOTP.
+            string base32Secret = RequirePasskey
+                ? ""
+                : Base32Encoding.ToString(KeyGeneration.GenerateRandomKey(32));
             string provisioningToken = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32)).Replace('+', '-').Replace('/', '_').TrimEnd('=');
             string passkeyToken = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32)).Replace('+', '-').Replace('/', '_').TrimEnd('=');
             DateTime expiresUtc = DateTime.UtcNow.AddMinutes(60);
@@ -338,7 +358,7 @@ namespace MFAAdmin
             AdminLogger.Log($"[INFO] Setup links expire at: {expiresUtc.ToLocalTime():HH:mm} (Local Time)");
 
             string baseUrl = Config["BouncerUrl"] ?? "";
-            string totpUrl    = $"{baseUrl.TrimEnd('/')}/setup/{provisioningToken}";
+            string totpUrl    = RequirePasskey ? "" : $"{baseUrl.TrimEnd('/')}/setup/{provisioningToken}";
             string passkeyUrl = $"{baseUrl.TrimEnd('/')}/setup-passkey/{passkeyToken}";
 
             AdminLogger.Log("[INFO] Sending provisioning email...");
@@ -400,14 +420,15 @@ namespace MFAAdmin
         <a href='{passkeyUrl}' style='display:inline-block; background:#2e7d32; color:#fff; padding:11px 20px; border-radius:4px; text-decoration:none; font-weight:bold;'>Set Up Passkey &rarr;</a>
     </div>
 
-    <!-- Secondary: TOTP -->
+    <!-- Secondary: TOTP. Omitted entirely in passkey-only deployments. -->
+    {(string.IsNullOrEmpty(totpUrl) ? "" : $@"
     <p style='font-size: 0.88em; color: #666; margin: 24px 0 6px 0;'>
         <strong>Don&rsquo;t have a compatible device?</strong> You can use an authenticator app instead.
         Google Authenticator, Authy, and Microsoft Authenticator are all supported.
         You&rsquo;ll enter a 6-digit code each time you log in.
     </p>
     <p style='font-size: 0.82em; color: #d9534f; margin: 0 0 8px 0;'><strong>Note:</strong> Have your authenticator app open before clicking &mdash; the QR code is shown only once.</p>
-    <a href='{totpUrl}' style='display:inline-block; background:#555; color:#fff; padding:9px 16px; border-radius:4px; text-decoration:none; font-size:0.88em;'>Set Up Authenticator App &rarr;</a>
+    <a href='{totpUrl}' style='display:inline-block; background:#555; color:#fff; padding:9px 16px; border-radius:4px; text-decoration:none; font-size:0.88em;'>Set Up Authenticator App &rarr;</a>")}
 
     <p style='font-size: 0.82em; color: #888; margin-top: 28px;'>You&rsquo;ll be asked to enter your temporary password on the setup page to confirm your identity.</p>
 
@@ -437,6 +458,57 @@ namespace MFAAdmin
                 return false;
             }
         }
+        // Clears stored TOTP secrets after a deployment switches to passkey-only.
+        // Enabling RequirePasskey stops new secrets being minted but does not remove secrets
+        // already in users.dat — without this, a "passkey-only" deployment can still be sitting
+        // on a database full of live, recoverable shared secrets.
+        //
+        // Refuses to strand anyone: an account with no passkey enrolled keeps its secret, since
+        // clearing it would leave that user with no way to authenticate at all.
+        static void PurgeTotpSecrets()
+        {
+            int cleared = 0, skipped = 0, alreadyClear = 0;
+            var strandedUsers = new List<string>();
+
+            using (AcquireDbLock())
+            {
+                var users = LoadUsers();
+
+                foreach (var u in users)
+                {
+                    if (string.IsNullOrEmpty(u.TotpSecret) && !u.TotpConfirmed) { alreadyClear++; continue; }
+
+                    if (u.PasskeyCredentials.Count == 0)
+                    {
+                        skipped++;
+                        strandedUsers.Add(u.Username);
+                        continue;
+                    }
+
+                    u.TotpSecret    = "";
+                    u.TotpConfirmed = false;
+                    cleared++;
+                }
+
+                if (cleared > 0)
+                {
+                    UnlockDatabase();
+                    SaveUsers(users);
+                }
+            }
+
+            AdminLogger.Log($"[SUCCESS] TOTP purge complete: {cleared} secret(s) cleared, {alreadyClear} already clear, {skipped} skipped.");
+
+            if (skipped > 0)
+            {
+                AdminLogger.Warn($"[WARN] {skipped} account(s) kept their TOTP secret because no passkey is enrolled - " +
+                                 "clearing it would lock them out entirely:");
+                foreach (var name in strandedUsers)
+                    AdminLogger.Warn($"        {name}");
+                AdminLogger.Warn("[WARN] Have these users enroll a passkey, or run 'reprovision <email>' for each, then re-run purge-totp.");
+            }
+        }
+
         static void ReprovisionUser(string username)
         {
             if (string.IsNullOrEmpty(username))
@@ -449,8 +521,11 @@ namespace MFAAdmin
 
             // Generate credentials outside the lock — BCrypt hashing is expensive
             string newPassword     = GenerateRandomPassword(12);
-            byte[] secretBytes     = KeyGeneration.GenerateRandomKey(32);
-            string newBase32Secret = Base32Encoding.ToString(secretBytes);
+            // Passkey-only deployments mint no TOTP secret; reprovisioning also clears any
+            // secret an account picked up before the mode was enabled.
+            string newBase32Secret = RequirePasskey
+                ? ""
+                : Base32Encoding.ToString(KeyGeneration.GenerateRandomKey(32));
             string newTotpToken    = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32)).Replace('+', '-').Replace('/', '_').TrimEnd('=');
             string newPasskeyToken = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32)).Replace('+', '-').Replace('/', '_').TrimEnd('=');
             DateTime expiresUtc    = DateTime.UtcNow.AddMinutes(60);
@@ -487,7 +562,7 @@ namespace MFAAdmin
 
             // Construct URLs and send email
             string baseUrl    = Config["BouncerUrl"] ?? "";
-            string totpUrl    = $"{baseUrl.TrimEnd('/')}/setup/{newTotpToken}";
+            string totpUrl    = RequirePasskey ? "" : $"{baseUrl.TrimEnd('/')}/setup/{newTotpToken}";
             string passkeyUrl = $"{baseUrl.TrimEnd('/')}/setup-passkey/{newPasskeyToken}";
 
             AdminLogger.Log("[INFO] Sending reprovisioning email...");
@@ -706,7 +781,7 @@ namespace MFAAdmin
             catch (AbandonedMutexException)
             {
                 // A prior process crashed while holding the lock; Windows transferred ownership to us.
-                AdminLogger.Warn("[DB LOCK] Mutex was abandoned by a prior process — ownership transferred, proceeding.");
+                AdminLogger.Warn("[DB LOCK] Mutex was abandoned by a prior process - ownership transferred, proceeding.");
             }
             return new DbLock(_dbMutex);
         }

@@ -35,10 +35,10 @@ exposed to the network and re-checks every policy decision rather than trusting 
 
 ## Features
 
-- **WebAuthn / FIDO2 passkeys** and **TOTP** (authenticator app) as first-class login methods.
-  Passkeys are restricted to **platform authenticators with user verification** — see
-  [Passkey requirements](#passkey-requirements) below, which is stricter than most WebAuthn
-  deployments and will reject a YubiKey
+- **Passkey-only by default.** WebAuthn/FIDO2 with a platform authenticator is the default and
+  only login method; TOTP is available but **off by default** (`RequirePasskey`). See
+  [Passkey requirements](#passkey-requirements) — the WebAuthn configuration is stricter than
+  most deployments and will reject a YubiKey
 - **Per-IP, auto-expiring** firewall rules — nothing is left open
 - **Public-IP-only enforcement** — requests from RFC-1918, CGNAT, loopback, and link-local ranges
   are rejected, on both sides of the privilege boundary
@@ -77,16 +77,47 @@ authenticator with user verification** — the built-in kind, unlocked by biomet
 
 Set in `MFAWeb/Program.cs` (registration options and assertion options).
 
+This works out of the box on **iOS/iPadOS, macOS (Touch ID / Face ID), Windows Hello, and
+Android**.
+
 Practical consequences to plan for:
 
-- **A passkey is bound to one device.** A user with a laptop and a phone needs one registered
-  per device. Losing the device means an admin must run `MFAAdmin reprovision <email>`.
-- **Machines without a platform authenticator cannot register a passkey at all** — an older
-  desktop with no Hello-capable hardware falls back to TOTP.
+- **Whether a passkey survives losing the device depends on the platform.** Apple passkeys
+  sync through iCloud Keychain and Google's sync through Google Password Manager, so the
+  credential is available on the user's other devices in the same ecosystem. Windows Hello
+  passkeys have historically been device-bound (newer Windows 11 builds add sync via Microsoft
+  account or a third-party provider). **Plan recovery around the pessimistic case:** an admin
+  runs `MFAAdmin reprovision <email>`.
+- **Machines without a platform authenticator cannot register a passkey at all.** An older
+  desktop with no Hello-capable hardware has no way in unless you enable TOTP by setting
+  `RequirePasskey` to `false`.
 - **If you want security-key support**, change `AuthenticatorAttachment` to
   `CrossPlatform`, or drop the property entirely to allow both. Keep
-  `UserVerification = Required` if you do — a PIN-less key would weaken the second factor to
+  `UserVerification = Required` if you do — a PIN-less key would weaken the factor to
   mere possession.
+
+### Passkey-only mode (`RequirePasskey`, default `true`)
+
+TOTP is phishable, and per the security audit a captured code stays valid for roughly 90
+seconds. An account is only as strong as its weakest enrolled method, so leaving TOTP on
+means the passkey buys you little. It is therefore **off by default**.
+
+With `RequirePasskey: true`:
+
+- `/auth` (password + authenticator code) returns **403 regardless of credentials** — the form
+  is refused at the endpoint, not merely hidden in the UI.
+- The TOTP enrollment pages (`/setup/{token}`, `/setup`) are refused the same way.
+- `MFAAdmin add` and `reprovision` **mint no TOTP secret at all**, and the provisioning email
+  omits the authenticator-app link. `users.dat` therefore holds no recoverable shared secret —
+  only passkey public keys and BCrypt hashes.
+
+The key must be set identically in **MFAWeb's and MFAAdmin's** `appsettings.json`.
+
+> **Switching an existing deployment?** Enabling the flag stops new secrets being minted but
+> does **not** remove secrets already in the database. Run `MFAAdmin purge-totp` to clear them,
+> or you have a "passkey-only" deployment still sitting on live secrets. That command
+> deliberately skips accounts with no passkey enrolled — clearing those would lock the user out
+> entirely — and lists them so you can reprovision them first.
 
 ## Requirements
 
@@ -142,6 +173,8 @@ A few that are easy to get wrong:
   **identical across all three components** and must not be left at the placeholder value.
 - **`HttpsCert:Subject` / `Store` / `Location`** — must match between MFAWeb and MFAService, or the
   cert monitor will watch a different certificate than the one being served.
+- **`RequirePasskey`** — passkey-only mode, **default `true`**. Must be identical in MFAWeb's
+  and MFAAdmin's config. See [Passkey-only mode](#passkey-only-mode-requirepasskey-default-true).
 - **`AllowedDomains`** — restricts which email domains can be provisioned.
 - **`BouncerConfig:AllowedPorts`** — the only ports MFAService will ever open, e.g. `["22/TCP"]`.
 - **`LogoUrl`** — leave empty to use the bundled knocker logo, or point it at your own image.

@@ -253,6 +253,14 @@ if (dpapiEntropyStr.Trim().Length < 16)
     throw new InvalidOperationException("DpapiEntropy must be at least 16 characters. Generate a unique random string for this deployment (e.g. 32 random bytes, base64-encoded).");
 byte[] Entropy = Encoding.UTF8.GetBytes(dpapiEntropyStr);
 
+// Passkey-only mode. Defaults to TRUE: TOTP is a phishable, replayable second factor, and
+// leaving it enabled means the account is only as strong as its weakest enrolled method.
+// When true the TOTP login form and the TOTP enrollment pages are refused outright — not
+// merely hidden — and MFAAdmin (which reads the same key) mints no TOTP secret at all.
+bool requirePasskey = app.Configuration.GetValue<bool?>("RequirePasskey") ?? true;
+if (requirePasskey)
+    AuditLogger.Log("RequirePasskey is enabled - TOTP login and TOTP enrollment are disabled.");
+
 // --- Serve the Login UI ---
 app.MapGet("/", async (HttpContext context, IAntiforgery antiforgery) =>
 {
@@ -307,6 +315,7 @@ app.MapGet("/", async (HttpContext context, IAntiforgery antiforgery) =>
                 <button type='button' id='passkeyBtn'>Sign in with Passkey</button>
                 <div class='passkey-error' id='passkeyError'></div>
 
+                {(requirePasskey ? "" : $@"
                 <div class='try-another'>
                     <button type='button' id='toggleTotpBtn' class='try-another-btn'>Try another way&hellip;</button>
                 </div>
@@ -320,7 +329,7 @@ app.MapGet("/", async (HttpContext context, IAntiforgery antiforgery) =>
                                required autocomplete='one-time-code' maxlength='6' />
                         <button type='submit'>Authorize My IP</button>
                     </form>
-                </div>
+                </div>")}
 
                 <div class='disclaimer'>Authorized Use Only</div>
             </div>
@@ -332,6 +341,15 @@ app.MapGet("/", async (HttpContext context, IAntiforgery antiforgery) =>
 // --- Handle the Login POST ---
 app.MapPost("/auth", async (HttpContext context, IAntiforgery antiforgery, IConfiguration config) =>
 {
+    // Passkey-only: refuse at the endpoint, not just by hiding the form. Anyone can POST here.
+    if (requirePasskey)
+    {
+        AuditLogger.Warn("[SECURITY] Rejected /auth - TOTP login is disabled (RequirePasskey).");
+        context.Response.StatusCode = 403;
+        await context.Response.WriteAsync("Password + authenticator login is disabled. Sign in with your passkey.");
+        return;
+    }
+
     try { await antiforgery.ValidateRequestAsync(context); }
     catch { context.Response.StatusCode = 400; await context.Response.WriteAsync("Invalid request."); return; }
 
@@ -454,6 +472,13 @@ app.MapGet("/setup/{token}", async (HttpContext context, string token, IAntiforg
 {
     AuditLogger.Debug("TOTP setup page requested");   // never log the provisioning token
 
+    if (requirePasskey)
+    {
+        AuditLogger.Warn("[SECURITY] Rejected /setup - TOTP enrollment is disabled (RequirePasskey).");
+        await SendDenyResponse(context, "Authenticator app enrollment is disabled. Use your passkey setup link instead.");
+        return;
+    }
+
     string? provisionUsername = null;
     {
         var users = LoadUsers(DbPath, Entropy);
@@ -504,6 +529,15 @@ app.MapGet("/setup/{token}", async (HttpContext context, string token, IAntiforg
 // --- POST: Verify Password and Display QR Code ---
 app.MapPost("/setup", async (HttpContext context, IAntiforgery antiforgery) =>
 {
+    // Passkey-only: refuse at the endpoint, not just by hiding the page.
+    if (requirePasskey)
+    {
+        AuditLogger.Warn("[SECURITY] Rejected /setup POST - TOTP enrollment is disabled (RequirePasskey).");
+        context.Response.StatusCode = 403;
+        await context.Response.WriteAsync("Authenticator app enrollment is disabled.");
+        return;
+    }
+
     try { await antiforgery.ValidateRequestAsync(context); }
     catch { context.Response.StatusCode = 400; await context.Response.WriteAsync("Invalid request."); return; }
 
@@ -900,7 +934,7 @@ app.MapPost("/passkey/verify", async (HttpContext context, IConfiguration config
         bool isCounterAnomaly = ex.Message.Contains("counter", StringComparison.OrdinalIgnoreCase)
                              || ex.Message.Contains("sign count", StringComparison.OrdinalIgnoreCase);
         if (isCounterAnomaly)
-            AuditLogger.Error($"[SECURITY ALERT] Possible credential clone for '{username}' — sign count anomaly: {ex.Message}");
+            AuditLogger.Error($"[SECURITY ALERT] Possible credential clone for '{username}' - sign count anomaly: {ex.Message}");
         else
             AuditLogger.Warn($"Passkey assertion failed for '{username}': {ex.Message}");
         context.Response.StatusCode = 401; await context.Response.WriteAsync("Passkey verification failed."); return;
@@ -908,7 +942,7 @@ app.MapPost("/passkey/verify", async (HttpContext context, IConfiguration config
 
     // Defense-in-depth: if the library somehow allowed a non-increasing counter, flag it.
     if (credSignCount > 0 && newSignCount <= credSignCount)
-        AuditLogger.Error($"[SECURITY ALERT] Sign count did not increase for '{username}' credential '{matchedCredId}': stored={credSignCount}, received={newSignCount} — possible credential clone.");
+        AuditLogger.Error($"[SECURITY ALERT] Sign count did not increase for '{username}' credential '{matchedCredId}': stored={credSignCount}, received={newSignCount} - possible credential clone.");
 
     // Phase 2: update sign counter via IPC (best-effort — don't block login on failure)
     if (!await IpcFirewallClient.UpdateSignCountAsync(matchedCredId!, newSignCount))
