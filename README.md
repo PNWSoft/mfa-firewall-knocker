@@ -41,12 +41,13 @@ migrate anything.
 ```
   Browser ──HTTPS──▶  MFAWeb          ──named pipe / unix socket──▶  MFAService
                       (unprivileged)                                 (privileged)
-                      passkey / TOTP                                 writes firewall rules
+                      passkey (WebAuthn)                             writes firewall rules
                       read-only to DB                                sole writer of users.dat
 ```
 
 1. You hit MFAWeb from the machine you want access from. It shows you the IP it sees.
-2. You authenticate with a **FIDO2 passkey** (preferred) or a **TOTP** code.
+2. You authenticate with a **FIDO2 passkey** (or a TOTP code, in a build made with
+   `-p:AllowTotp=true`).
 3. MFAWeb hands the request to MFAService over local IPC. It never touches the firewall itself.
 4. MFAService **independently re-validates** the request and opens a rule scoped to that single IP
    and the ports you allowed.
@@ -59,7 +60,7 @@ exposed to the network and re-checks every policy decision rather than trusting 
 ## Features
 
 - **Passkey-only by default.** WebAuthn/FIDO2 with a platform authenticator is the default and
-  only login method; TOTP is available but **off by default** (`RequirePasskey`). See
+  only login method; TOTP is not compiled in unless you ask for it at build time. See
   [Passkey requirements](#passkey-requirements) — the WebAuthn configuration is stricter than
   most deployments and will reject a YubiKey
 - **Per-IP, auto-expiring** firewall rules — nothing is left open
@@ -112,33 +113,47 @@ Practical consequences to plan for:
   account or a third-party provider). **Plan recovery around the pessimistic case:** an admin
   runs `MFAAdmin reprovision <email>`.
 - **Machines without a platform authenticator cannot register a passkey at all.** An older
-  desktop with no Hello-capable hardware has no way in unless you enable TOTP by setting
-  `RequirePasskey` to `false`.
+  desktop with no Hello-capable hardware has no way in unless you rebuild all three components
+  with `-p:AllowTotp=true` to include TOTP.
 - **If you want security-key support**, change `AuthenticatorAttachment` to
   `CrossPlatform`, or drop the property entirely to allow both. Keep
   `UserVerification = Required` if you do — a PIN-less key would weaken the factor to
   mere possession.
 
-### Passkey-only mode (`RequirePasskey`, default `true`)
+### Passkey-only builds (the default)
 
-TOTP is phishable, and per the security audit a captured code stays valid for roughly 90
-seconds. An account is only as strong as its weakest enrolled method, so leaving TOTP on
-means the passkey buys you little. It is therefore **off by default**.
+TOTP is phishable, and a captured code stays valid for roughly 90 seconds. An account is only
+as strong as its weakest enrolled method, so leaving TOTP available means the passkey buys you
+little.
 
-With `RequirePasskey: true`:
+**TOTP is therefore a compile-time decision, not a setting.** By default it is not built at
+all:
 
-- `/auth` (password + authenticator code) returns **403 regardless of credentials** — the form
-  is refused at the endpoint, not merely hidden in the UI.
-- The TOTP enrollment pages (`/setup/{token}`, `/setup`) are refused the same way.
-- `MFAAdmin add` and `reprovision` **mint no TOTP secret at all**, and the provisioning email
-  omits the authenticator-app link. `users.dat` therefore holds no recoverable shared secret —
-  only passkey public keys and BCrypt hashes.
+- There is **no `/auth` route** and no TOTP enrollment route — they return `404`, because no
+  handler exists rather than one that declines.
+- The login page emits no TOTP form, and `MFAService` doesn't even carry the
+  `BURN_TOTP_TOKEN` IPC verb.
+- `MFAAdmin add` and `reprovision` **mint no TOTP secret**, and the provisioning email omits
+  the authenticator-app link. `users.dat` holds no recoverable shared secret — only passkey
+  public keys and BCrypt hashes.
 
-The key must be set identically in **MFAWeb's and MFAAdmin's** `appsettings.json`.
+There is no configuration key to get this wrong, nothing to leave in the weaker state by
+mistake, and no second code path for a reviewer to audit.
 
-> **Switching an existing deployment?** Enabling the flag stops new secrets being minted but
-> does **not** remove secrets already in the database. Run `MFAAdmin purge-totp` to clear them,
-> or you have a "passkey-only" deployment still sitting on live secrets. That command
+**If you need TOTP** — typically because some users are on machines with no platform
+authenticator — build all three components with the flag:
+
+```bash
+dotnet build MFA.slnx -c Release -p:AllowTotp=true
+```
+
+Use the same flag for every component. They are deployed together anyway, since they share the
+`users.dat` schema. A mismatch is not dangerous — one direction leaves unused secrets in the
+database, the other offers a login that always fails — but it is not useful either.
+
+> **Moving an existing deployment to a passkey-only build?** Rebuilding stops new secrets being
+> minted but does **not** remove secrets already in the database. Run `MFAAdmin purge-totp` to
+> clear them, or you have a passkey-only deployment still sitting on live secrets. That command
 > deliberately skips accounts with no passkey enrolled — clearing those would lock the user out
 > entirely — and lists them so you can reprovision them first.
 
@@ -202,8 +217,6 @@ A few that are easy to get wrong:
   **identical across all three components** and must not be left at the placeholder value.
 - **`HttpsCert:Subject` / `Store` / `Location`** — must match between MFAWeb and MFAService, or the
   cert monitor will watch a different certificate than the one being served.
-- **`RequirePasskey`** — passkey-only mode, **default `true`**. Must be identical in MFAWeb's
-  and MFAAdmin's config. See [Passkey-only mode](#passkey-only-mode-requirepasskey-default-true).
 - **`AllowedDomains`** — restricts which email domains can be provisioned.
 - **`BouncerConfig:AllowedPorts`** — the only ports MFAService will ever open, e.g. `["22/TCP"]`.
 - **`LogoUrl`** — leave empty to use the bundled knocker logo, or point it at your own image.

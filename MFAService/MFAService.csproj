@@ -23,4 +23,15 @@
     <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="10.0.5" />
   </ItemGroup>
 
+
+  <!-- Optional TOTP (authenticator app) support. OFF by default.
+       TOTP is phishable and a captured code stays valid for ~90s, so an account with it
+       enrolled is only as strong as that weaker method. Leaving it out of the build means
+       there is no TOTP code path to misconfigure, disable incorrectly, or audit.
+       Build with -p:AllowTotp=true to compile it in. The flag MUST match across all three
+       components, which are deployed together anyway (shared users.dat schema). -->
+  <PropertyGroup Condition="'$(AllowTotp)' == 'true'">
+    <DefineConstants>$(DefineConstants);ALLOW_TOTP</DefineConstants>
+  </PropertyGroup>
+
 </Project>

@@ -44,7 +44,7 @@ logs, or bypass the passkey-registration password gate.
   Reports that assume arbitrary code execution as the MFAWeb service account are describing
   this known boundary.
 - **TOTP code replay** within the code's validity window, when TOTP is explicitly enabled.
-  This is inherent to TOTP and is why `RequirePasskey` defaults to `true`.
+  This is inherent to TOTP and is why TOTP is not compiled into the default build.
 - **Anything requiring Administrator or root** on the host. Those principals already own the
   database and the firewall.
 

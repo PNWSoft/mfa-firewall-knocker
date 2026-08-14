@@ -1,4 +1,4 @@
-﻿// Copyright (c) 2026 Pacific Northwest Software, Inc.
+// Copyright (c) 2026 Pacific Northwest Software, Inc.
 // This source code is licensed under the MIT license found in the
 // LICENSE file in the root directory of this source tree.
 
@@ -158,10 +158,15 @@ namespace MFAAdmin
 
         private static string RulePrefix => Config?["RulePrefix"] ?? "MFA_Temp_";
 
-        // Passkey-only mode. Defaults to TRUE and MUST match MFAWeb's RequirePasskey.
-        // When true no TOTP secret is ever generated, so users.dat holds no recoverable
-        // shared secret — only passkey public keys and BCrypt hashes.
-        private static bool RequirePasskey => Config?.GetValue<bool?>("RequirePasskey") ?? true;
+        // TOTP support is a COMPILE-TIME decision (-p:AllowTotp=true), not a config value, so
+        // it cannot drift out of step with MFAWeb at runtime. Without the flag no TOTP secret
+        // is ever generated and users.dat holds no recoverable shared secret — only passkey
+        // public keys and BCrypt hashes.
+#if ALLOW_TOTP
+        private const bool TotpEnabled = true;
+#else
+        private const bool TotpEnabled = false;
+#endif
 
         // DPAPI Entropy (Windows Only) — loaded from config in Main()
         private static byte[] Entropy = Array.Empty<byte>();
@@ -193,10 +198,12 @@ namespace MFAAdmin
             // whether 'add'/'reprovision' mint a TOTP secret and whether the provisioning email
             // carries an authenticator-app link, so an operator should never have to guess --
             // particularly since this key must match MFAWeb's and a mismatch is otherwise silent.
-            if (RequirePasskey)
-                AdminLogger.Log("[INFO] TOTP is not enabled (RequirePasskey=true). Passkey-only: no TOTP secret will be stored.");
-            else
-                AdminLogger.Warn("[WARN] TOTP is ENABLED (RequirePasskey=false). Accounts will be provisioned with a TOTP secret.");
+#if ALLOW_TOTP
+            AdminLogger.Warn("[WARN] TOTP is ENABLED (built with AllowTotp). Accounts will be provisioned with a TOTP secret. " +
+                             "Ensure MFAWeb was built with the same flag.");
+#else
+            AdminLogger.Log("[INFO] TOTP is not enabled (built without AllowTotp). Passkey-only: no TOTP secret will be stored.");
+#endif
 
             if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
             {
@@ -320,9 +327,9 @@ namespace MFAAdmin
             string password = GenerateRandomPassword(12);
             // Passkey-only deployments mint no TOTP secret at all, so there is nothing
             // recoverable to steal from users.dat for accounts that never use TOTP.
-            string base32Secret = RequirePasskey
-                ? ""
-                : Base32Encoding.ToString(KeyGeneration.GenerateRandomKey(32));
+            string base32Secret = TotpEnabled
+                ? Base32Encoding.ToString(KeyGeneration.GenerateRandomKey(32))
+                : "";
             string provisioningToken = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32)).Replace('+', '-').Replace('/', '_').TrimEnd('=');
             string passkeyToken = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32)).Replace('+', '-').Replace('/', '_').TrimEnd('=');
             DateTime expiresUtc = DateTime.UtcNow.AddMinutes(60);
@@ -359,7 +366,7 @@ namespace MFAAdmin
             AdminLogger.Log($"[INFO] Setup links expire at: {expiresUtc.ToLocalTime():HH:mm} (Local Time)");
 
             string baseUrl = Config["BouncerUrl"] ?? "";
-            string totpUrl    = RequirePasskey ? "" : $"{baseUrl.TrimEnd('/')}/setup/{provisioningToken}";
+            string totpUrl    = TotpEnabled ? $"{baseUrl.TrimEnd('/')}/setup/{provisioningToken}" : "";
             string passkeyUrl = $"{baseUrl.TrimEnd('/')}/setup-passkey/{passkeyToken}";
 
             AdminLogger.Log("[INFO] Sending provisioning email...");
@@ -460,7 +467,7 @@ namespace MFAAdmin
             }
         }
         // Clears stored TOTP secrets after a deployment switches to passkey-only.
-        // Enabling RequirePasskey stops new secrets being minted but does not remove secrets
+        // Building without AllowTotp stops new secrets being minted but does not remove secrets
         // already in users.dat — without this, a "passkey-only" deployment can still be sitting
         // on a database full of live, recoverable shared secrets.
         //
@@ -524,9 +531,9 @@ namespace MFAAdmin
             string newPassword     = GenerateRandomPassword(12);
             // Passkey-only deployments mint no TOTP secret; reprovisioning also clears any
             // secret an account picked up before the mode was enabled.
-            string newBase32Secret = RequirePasskey
-                ? ""
-                : Base32Encoding.ToString(KeyGeneration.GenerateRandomKey(32));
+            string newBase32Secret = TotpEnabled
+                ? Base32Encoding.ToString(KeyGeneration.GenerateRandomKey(32))
+                : "";
             string newTotpToken    = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32)).Replace('+', '-').Replace('/', '_').TrimEnd('=');
             string newPasskeyToken = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32)).Replace('+', '-').Replace('/', '_').TrimEnd('=');
             DateTime expiresUtc    = DateTime.UtcNow.AddMinutes(60);
@@ -563,7 +570,7 @@ namespace MFAAdmin
 
             // Construct URLs and send email
             string baseUrl    = Config["BouncerUrl"] ?? "";
-            string totpUrl    = RequirePasskey ? "" : $"{baseUrl.TrimEnd('/')}/setup/{newTotpToken}";
+            string totpUrl    = TotpEnabled ? $"{baseUrl.TrimEnd('/')}/setup/{newTotpToken}" : "";
             string passkeyUrl = $"{baseUrl.TrimEnd('/')}/setup-passkey/{newPasskeyToken}";
 
             AdminLogger.Log("[INFO] Sending reprovisioning email...");
@@ -976,12 +983,11 @@ namespace MFAAdmin
             Console.WriteLine("                ACTIVE FIREWALL RULES                      ");
             Console.WriteLine("===========================================================\n");
 
-            // Surface the auth posture here too. MFAWeb reads RequirePasskey from its own
-            // appsettings.json, so a mismatch between the two components is otherwise silent
-            // and only visible by comparing startup logs on two different machines.
-            Console.WriteLine(RequirePasskey
-                ? "Auth mode: PASSKEY-ONLY (RequirePasskey=true). Verify MFAWeb's config matches.\n"
-                : "Auth mode: TOTP ENABLED (RequirePasskey=false). Verify MFAWeb's config matches.\n");
+            // Surface the auth posture. Baked in at build time, so it cannot drift from MFAWeb
+            // at runtime -- but the two binaries do need to have been built the same way.
+            Console.WriteLine(TotpEnabled
+                ? "Auth mode: TOTP ENABLED (built with AllowTotp).\n"
+                : "Auth mode: PASSKEY-ONLY (built without AllowTotp).\n");
 
             if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
             {

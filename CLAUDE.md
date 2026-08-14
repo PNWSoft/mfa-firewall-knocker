@@ -84,8 +84,7 @@ challenge needs port 80 and it stores certs in a directory rather than the Windo
 
 ## Config keys
 
-- **MFAWeb:** `AppUrl`, `SiteName`, `LogoUrl`, `DpapiEntropy` (required), `RequirePasskey`
-  (default **true**), `RateLimitPerWindow`,
+- **MFAWeb:** `AppUrl`, `SiteName`, `LogoUrl`, `DpapiEntropy` (required), `RateLimitPerWindow`,
   `AllowedDomains`, `Kestrel:Endpoints:Https:Url`, `HttpsCert:{Subject,Store,Location}`,
   `CertAlert:WarnDays`, `AccountAlert:{Threshold,WindowMinutes,SendEmail}`, `Smtp:*` (for account
   alerts), `UseLettuceEncrypt` (+ `LettuceEncrypt:*` when true).
@@ -93,8 +92,8 @@ challenge needs port 80 and it stores certs in a directory rather than the Windo
   `FirewallService:GmsaAccount`, `HttpsCert:{Subject,Store,Location}` (must match MFAWeb),
   `CertAlert:{WarnDays,CheckIntervalHours}`,
   `Smtp:{Host,Port,UseSsl,Username,Password,FromAddress,NotifyAddress}`.
-- **MFAAdmin:** `DpapiEntropy` (required), `RequirePasskey` (default **true**, must match MFAWeb),
-  `SiteName`, `RulePrefix`, `BouncerUrl`, `AllowedDomains`, `FirewallService:GmsaAccount`, `Smtp:*`.
+- **MFAAdmin:** `DpapiEntropy` (required), `SiteName`, `RulePrefix`, `BouncerUrl`,
+  `AllowedDomains`, `FirewallService:GmsaAccount`, `Smtp:*`.
 
 ## Security invariants (do not regress)
 
@@ -108,11 +107,14 @@ challenge needs port 80 and it stores certs in a directory rather than the Windo
   `PasskeyProvisioningToken` without this flag — that reintroduces the emailed-link bypass. The
   field lives in all three `UserEntry` classes and must stay in sync (shared `users.dat` schema →
   deploy all three together).
-- **`RequirePasskey` is enforced at the endpoint, not in the UI.** It defaults to **true**. When
-  on, `/auth`, `/setup/{token}`, and `/setup` return 403/deny *before* validating anything —
-  hiding the TOTP form on the login page is cosmetic and anyone can POST directly. MFAAdmin reads
-  the same key and mints no TOTP secret, so `users.dat` holds no recoverable shared secret. The
-  key must be identical in MFAWeb and MFAAdmin. Never "simplify" this to a UI-only toggle.
+- **TOTP is a compile-time decision, not a config value.** It is excluded unless built with
+  `-p:AllowTotp=true` (`ALLOW_TOTP`). In the default build `/auth`, `/setup/{token}` and `/setup`
+  do not exist (404 — no handler, rather than a handler that declines), the login page emits no
+  TOTP form, MFAService omits the `BURN_TOTP_TOKEN` IPC verb, and MFAAdmin mints no TOTP secret,
+  so `users.dat` holds no recoverable shared secret. **Do not reintroduce this as a runtime
+  setting.** A config switch can be flipped, mis-defaulted, or drift between components; an
+  absent code path cannot. The flag must match across all three components, which are deployed
+  together anyway.
 - **The privilege boundary re-validates, it does not trust MFAWeb.** MFAService independently
   re-checks `IsPublicIpAddress` before opening a firewall rule and strictly validates every IPC
   request. Keep policy checks (public-IP-only, input validation) on the privileged side even though
