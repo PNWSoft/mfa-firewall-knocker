@@ -258,8 +258,14 @@ byte[] Entropy = Encoding.UTF8.GetBytes(dpapiEntropyStr);
 // When true the TOTP login form and the TOTP enrollment pages are refused outright — not
 // merely hidden — and MFAAdmin (which reads the same key) mints no TOTP secret at all.
 bool requirePasskey = app.Configuration.GetValue<bool?>("RequirePasskey") ?? true;
+// Log BOTH modes. The weaker one especially: an operator needs to be able to confirm the
+// posture from this log alone, and a mismatch with MFAAdmin's copy of the key is otherwise
+// silent (the two components read separate appsettings.json files).
 if (requirePasskey)
-    AuditLogger.Log("RequirePasskey is enabled - TOTP login and TOTP enrollment are disabled.");
+    AuditLogger.Log("TOTP is not enabled (RequirePasskey=true). Passkey-only: TOTP login and enrollment are disabled.");
+else
+    AuditLogger.Warn("TOTP is ENABLED (RequirePasskey=false). Password + authenticator login is accepted. " +
+                     "Ensure MFAAdmin's RequirePasskey matches.");
 
 // --- Serve the Login UI ---
 app.MapGet("/", async (HttpContext context, IAntiforgery antiforgery) =>
@@ -392,7 +398,13 @@ app.MapPost("/auth", async (HttpContext context, IAntiforgery antiforgery, IConf
     {
         var users = LoadUsers(DbPath, Entropy);
         var user = users.FirstOrDefault(u => u.Username.Equals(username, StringComparison.OrdinalIgnoreCase));
-        if (user != null && user.TotpConfirmed && BCrypt.Net.BCrypt.Verify(password, user.PasswordHash))
+        // The empty-secret check is defence in depth. Passkey-only accounts store
+        // TotpSecret = "" and TotpConfirmed = false, so TotpConfirmed alone already blocks
+        // them — but if that pairing is ever broken (a crafted 'import', DB tampering, a
+        // future refactor), Base32Encoding.ToBytes("") throws and a valid password would
+        // surface as a 500 instead of a clean denial. Treat an empty secret as invalid.
+        if (user != null && user.TotpConfirmed && !string.IsNullOrWhiteSpace(user.TotpSecret)
+            && BCrypt.Net.BCrypt.Verify(password, user.PasswordHash))
         {
             var totp = new Totp(Base32Encoding.ToBytes(user.TotpSecret));
             if (totp.VerifyTotp(totpCode, out _, new VerificationWindow(1, 1)))
@@ -551,6 +563,7 @@ app.MapPost("/setup", async (HttpContext context, IAntiforgery antiforgery) =>
     string? authedUsername = null;
     bool setupInvalid = false;
     bool setupBadPassword = false;
+    bool setupNoSecret = false;
     {
         var users = LoadUsers(DbPath, Entropy);
         var user = users.FirstOrDefault(u => u.ProvisioningToken == token && u.Username.Equals(username, StringComparison.OrdinalIgnoreCase));
@@ -562,6 +575,12 @@ app.MapPost("/setup", async (HttpContext context, IAntiforgery antiforgery) =>
         else if (!BCrypt.Net.BCrypt.Verify(password, user.PasswordHash))
         {
             setupBadPassword = true;
+        }
+        else if (string.IsNullOrWhiteSpace(user.TotpSecret))
+        {
+            // No secret to enroll — the account was provisioned in passkey-only mode.
+            // Refuse rather than burn the token and confirm an unusable empty secret.
+            setupNoSecret = true;
         }
         else
         {
@@ -580,6 +599,12 @@ app.MapPost("/setup", async (HttpContext context, IAntiforgery antiforgery) =>
     {
         AuditLogger.Warn("Provisioning - Invalid password");
         await SendDenyResponse(context, "Invalid password.");
+        return;
+    }
+    if (setupNoSecret)
+    {
+        AuditLogger.Warn("Provisioning - account has no TOTP secret (provisioned in passkey-only mode)");
+        await SendDenyResponse(context, "This account has no authenticator secret. Use your passkey setup link instead.");
         return;
     }
 
