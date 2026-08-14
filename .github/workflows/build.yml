@@ -1,0 +1,70 @@
+name: build
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  schedule:
+    # Advisories are published against code that hasn't changed, so re-run weekly
+    # rather than only on push.
+    - cron: '0 6 * * 1'
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both targets are supported, so both must keep compiling. MFAService has
+        # separate Windows (PowerShell/NetSecurity) and Linux (iptables) code paths.
+        os: [ windows-latest, ubuntu-latest ]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Restore
+        run: dotnet restore MFA.slnx
+
+      - name: Build
+        run: dotnet build MFA.slnx -c Release --no-restore
+
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Restore
+        run: dotnet restore MFA.slnx
+
+      # Fails the build on any known advisory, including transitive ones.
+      #
+      # This gate exists because of a real incident: MFAWeb pins
+      # Microsoft.IdentityModel.* to 6.34.0 purely to lift Fido2 3.0.1's dependency
+      # chain above 6.17.0, which carries GHSA-59j7-ghrg-fj52. The pins look unused,
+      # so they invite deletion -- and deleting them silently reintroduces the
+      # advisory. This step catches that, and any future drift, automatically.
+      - name: Fail on vulnerable packages
+        run: |
+          set -o pipefail
+          dotnet list MFA.slnx package --vulnerable --include-transitive 2>&1 | tee audit.txt
+          if grep -qiE '^\s*>' audit.txt; then
+            echo "::error::Vulnerable package(s) detected - see the listing above."
+            exit 1
+          fi
+          echo "No vulnerable packages."
+
+      # Informational only: the 6.x IdentityModel line and LettuceEncrypt are both
+      # marked Legacy, and are accepted trade-offs documented in SECURITY.md.
+      - name: Report deprecated packages
+        continue-on-error: true
+        run: dotnet list MFA.slnx package --deprecated

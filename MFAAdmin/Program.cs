@@ -976,6 +976,13 @@ namespace MFAAdmin
             Console.WriteLine("                ACTIVE FIREWALL RULES                      ");
             Console.WriteLine("===========================================================\n");
 
+            // Surface the auth posture here too. MFAWeb reads RequirePasskey from its own
+            // appsettings.json, so a mismatch between the two components is otherwise silent
+            // and only visible by comparing startup logs on two different machines.
+            Console.WriteLine(RequirePasskey
+                ? "Auth mode: PASSKEY-ONLY (RequirePasskey=true). Verify MFAWeb's config matches.\n"
+                : "Auth mode: TOTP ENABLED (RequirePasskey=false). Verify MFAWeb's config matches.\n");
+
             if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
             {
                 // WINDOWS LOGIC: Query PowerShell for our custom tagged rules
