@@ -935,7 +935,9 @@ public class DatabaseLockService : BackgroundService
         {
             return op switch
             {
+#if ALLOW_TOTP
                 "BURN_TOTP_TOKEN"     when parts.Length == 2 => BurnTotpToken(parts[1].Trim()),
+#endif
                 "SET_PASSKEY_TOKEN"   when parts.Length == 4 => SetPasskeyToken(parts[1].Trim(), parts[2].Trim(), parts[3].Trim()),
                 "RENEW_PASSKEY_TOKEN" when parts.Length == 2 => RenewPasskeyToken(parts[1].Trim()),
                 "UPDATE_SIGN_COUNT"   when parts.Length == 3 => UpdateSignCount(parts[1].Trim(), parts[2].Trim()),
@@ -961,6 +963,10 @@ public class DatabaseLockService : BackgroundService
             Encoding.UTF8.GetBytes(a), Encoding.UTF8.GetBytes(b));
     }
 
+    // Only reachable from MFAWeb's /setup route, which is itself compiled out without the flag.
+    // Dropping it here too keeps the privileged IPC parser to exactly the verbs a passkey-only
+    // deployment can actually use.
+#if ALLOW_TOTP
     private static string BurnTotpToken(string token)
     {
         using var lk = AcquireDbLock();
@@ -978,6 +984,7 @@ public class DatabaseLockService : BackgroundService
         ServiceLogger.Log($"[DB] TOTP provisioning token burned for '{user.Username}'");
         return "SUCCESS";
     }
+#endif  // ALLOW_TOTP
 
     // Atomically burns the old passkey provisioning token (e.g. from the email link) and
     // issues a fresh short-lived one.  Called immediately after password verification so the

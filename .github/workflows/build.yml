@@ -11,14 +11,18 @@ on:
 
 jobs:
   build:
-    name: Build (${{ matrix.os }})
+    name: Build (${{ matrix.os }}, AllowTotp=${{ matrix.allow_totp }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        # Both targets are supported, so both must keep compiling. MFAService has
+        # Both OS targets are supported, so both must keep compiling. MFAService has
         # separate Windows (PowerShell/NetSecurity) and Linux (iptables) code paths.
         os: [ windows-latest, ubuntu-latest ]
+        # TOTP is conditionally compiled. The default build must stay green, and so
+        # must the opt-in one -- code behind #if ALLOW_TOTP is invisible to the
+        # default build, so without this matrix leg it could rot unnoticed.
+        allow_totp: [ 'false', 'true' ]
 
     steps:
       - uses: actions/checkout@v4
@@ -31,7 +35,7 @@ jobs:
         run: dotnet restore MFA.slnx
 
       - name: Build
-        run: dotnet build MFA.slnx -c Release --no-restore
+        run: dotnet build MFA.slnx -c Release --no-restore -p:AllowTotp=${{ matrix.allow_totp }}
 
   audit:
     name: Dependency audit

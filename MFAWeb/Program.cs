@@ -259,19 +259,16 @@ if (dpapiEntropyStr.Trim().Length < 16)
     throw new InvalidOperationException("DpapiEntropy must be at least 16 characters. Generate a unique random string for this deployment (e.g. 32 random bytes, base64-encoded).");
 byte[] Entropy = Encoding.UTF8.GetBytes(dpapiEntropyStr);
 
-// Passkey-only mode. Defaults to TRUE: TOTP is a phishable, replayable second factor, and
-// leaving it enabled means the account is only as strong as its weakest enrolled method.
-// When true the TOTP login form and the TOTP enrollment pages are refused outright — not
-// merely hidden — and MFAAdmin (which reads the same key) mints no TOTP secret at all.
-bool requirePasskey = app.Configuration.GetValue<bool?>("RequirePasskey") ?? true;
-// Log BOTH modes. The weaker one especially: an operator needs to be able to confirm the
-// posture from this log alone, and a mismatch with MFAAdmin's copy of the key is otherwise
-// silent (the two components read separate appsettings.json files).
-if (requirePasskey)
-    AuditLogger.Log("TOTP is not enabled (RequirePasskey=true). Passkey-only: TOTP login and enrollment are disabled.");
-else
-    AuditLogger.Warn("TOTP is ENABLED (RequirePasskey=false). Password + authenticator login is accepted. " +
-                     "Ensure MFAAdmin's RequirePasskey matches.");
+// TOTP support is a COMPILE-TIME decision (-p:AllowTotp=true), not a runtime setting.
+// Without the flag there is no TOTP login route, no TOTP enrollment route, and no TOTP form
+// on the login page — the weaker method is absent from the binary rather than switched off,
+// so it cannot be re-enabled by editing config or by a mistake in a conditional.
+#if ALLOW_TOTP
+AuditLogger.Warn("TOTP is ENABLED (built with AllowTotp). Password + authenticator login is accepted " +
+                 "alongside passkeys. Ensure MFAAdmin was built with the same flag.");
+#else
+AuditLogger.Log("TOTP is not enabled (built without AllowTotp). Passkey-only.");
+#endif
 
 // --- Serve the Login UI ---
 app.MapGet("/", async (HttpContext context, IAntiforgery antiforgery) =>
@@ -292,6 +289,29 @@ app.MapGet("/", async (HttpContext context, IAntiforgery antiforgery) =>
     }
 
     var csrfTokens = antiforgery.GetAndStoreTokens(context);
+
+    // Built without AllowTotp this is the empty string, so no TOTP form is emitted at all --
+    // and there is no /auth route for one to post to either.
+#if ALLOW_TOTP
+    string totpFormHtml = $@"
+                <div class='try-another'>
+                    <button type='button' id='toggleTotpBtn' class='try-another-btn'>Try another way&hellip;</button>
+                </div>
+
+                <div class='totp-section' id='totpSection'>
+                    <form id='authForm' action='/auth' method='post'>
+                        <input type='hidden' name='{csrfTokens.FormFieldName}' value='{csrfTokens.RequestToken}'/>
+                        <input type='email' id='totpUsernameField' name='username' placeholder='Email Address' required autocomplete='username' />
+                        <input type='password' name='password' placeholder='Password' required />
+                        <input type='text' name='totp' placeholder='6-Digit Authenticator Code'
+                               required autocomplete='one-time-code' maxlength='6' />
+                        <button type='submit'>Authorize My IP</button>
+                    </form>
+                </div>";
+#else
+    string totpFormHtml = "";
+#endif
+
     context.Response.ContentType = "text/html";
     await context.Response.WriteAsync($@"
         <!DOCTYPE html>
@@ -327,21 +347,7 @@ app.MapGet("/", async (HttpContext context, IAntiforgery antiforgery) =>
                 <button type='button' id='passkeyBtn'>Sign in with Passkey</button>
                 <div class='passkey-error' id='passkeyError'></div>
 
-                {(requirePasskey ? "" : $@"
-                <div class='try-another'>
-                    <button type='button' id='toggleTotpBtn' class='try-another-btn'>Try another way&hellip;</button>
-                </div>
-
-                <div class='totp-section' id='totpSection'>
-                    <form id='authForm' action='/auth' method='post'>
-                        <input type='hidden' name='{csrfTokens.FormFieldName}' value='{csrfTokens.RequestToken}'/>
-                        <input type='email' id='totpUsernameField' name='username' placeholder='Email Address' required autocomplete='username' />
-                        <input type='password' name='password' placeholder='Password' required />
-                        <input type='text' name='totp' placeholder='6-Digit Authenticator Code'
-                               required autocomplete='one-time-code' maxlength='6' />
-                        <button type='submit'>Authorize My IP</button>
-                    </form>
-                </div>")}
+                {totpFormHtml}
 
                 <div class='disclaimer'>Authorized Use Only</div>
             </div>
@@ -351,17 +357,15 @@ app.MapGet("/", async (HttpContext context, IAntiforgery antiforgery) =>
 }).RequireRateLimiting("LoginRateLimit");
 
 // --- Handle the Login POST ---
+// ===========================================================================
+// TOTP ROUTES — compiled in ONLY with -p:AllowTotp=true.
+// Without that flag these endpoints do not exist: /auth, /setup/{token} and
+// /setup return 404, because there is no handler rather than a handler that
+// declines. Nothing to misconfigure and nothing to bypass.
+// ===========================================================================
+#if ALLOW_TOTP
 app.MapPost("/auth", async (HttpContext context, IAntiforgery antiforgery, IConfiguration config) =>
 {
-    // Passkey-only: refuse at the endpoint, not just by hiding the form. Anyone can POST here.
-    if (requirePasskey)
-    {
-        AuditLogger.Warn("[SECURITY] Rejected /auth - TOTP login is disabled (RequirePasskey).");
-        context.Response.StatusCode = 403;
-        await context.Response.WriteAsync("Password + authenticator login is disabled. Sign in with your passkey.");
-        return;
-    }
-
     try { await antiforgery.ValidateRequestAsync(context); }
     catch { context.Response.StatusCode = 400; await context.Response.WriteAsync("Invalid request."); return; }
 
@@ -490,13 +494,6 @@ app.MapGet("/setup/{token}", async (HttpContext context, string token, IAntiforg
 {
     AuditLogger.Debug("TOTP setup page requested");   // never log the provisioning token
 
-    if (requirePasskey)
-    {
-        AuditLogger.Warn("[SECURITY] Rejected /setup - TOTP enrollment is disabled (RequirePasskey).");
-        await SendDenyResponse(context, "Authenticator app enrollment is disabled. Use your passkey setup link instead.");
-        return;
-    }
-
     string? provisionUsername = null;
     {
         var users = LoadUsers(DbPath, Entropy);
@@ -548,14 +545,6 @@ app.MapGet("/setup/{token}", async (HttpContext context, string token, IAntiforg
 app.MapPost("/setup", async (HttpContext context, IAntiforgery antiforgery) =>
 {
     // Passkey-only: refuse at the endpoint, not just by hiding the page.
-    if (requirePasskey)
-    {
-        AuditLogger.Warn("[SECURITY] Rejected /setup POST - TOTP enrollment is disabled (RequirePasskey).");
-        context.Response.StatusCode = 403;
-        await context.Response.WriteAsync("Authenticator app enrollment is disabled.");
-        return;
-    }
-
     try { await antiforgery.ValidateRequestAsync(context); }
     catch { context.Response.StatusCode = 400; await context.Response.WriteAsync("Invalid request."); return; }
 
@@ -666,6 +655,7 @@ app.MapPost("/setup", async (HttpContext context, IAntiforgery antiforgery) =>
             </body>
             </html>");
 }).RequireRateLimiting("LoginRateLimit");
+#endif  // ALLOW_TOTP — end of the TOTP route block
 
 // -----------------------------------------------------------------------
 // PASSKEY PROVISIONING: Password gate (for admin-issued setup links)
