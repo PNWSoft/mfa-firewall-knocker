@@ -55,9 +55,11 @@ deliberately no in-process ACME client — see the note at the top of the TLS bl
   binding: it does a CN-only `FindBySubjectName` with `AllowInvalid:false` and **crashes Kestrel
   at startup** the moment the cert expires or the CA issues an empty-CN / SAN-only replacement.
   - This is about the *Subject* binding specifically. On **Linux** the certificate legitimately
-    comes from `Kestrel:...:Certificate:{Path,KeyPath}` (PEM), and the store-scanning selector is
-    **not** installed there — see the platform guard in `Program.cs`. Installing it on Linux
-    silently overrode the configured PEM with nothing and broke TLS entirely.
+    comes from `Kestrel:...:Certificate:{Path,KeyPath}` (PEM). The **store-scanning** selector must
+    not be installed there — it can only return null and silently overrode a good PEM with nothing,
+    breaking TLS entirely. A separate **PEM** selector is installed instead (see the platform guard
+    in `Program.cs`): it re-reads on mtime change, keeps the last good cert on a failed read, and
+    populates `CertStatus`, giving Linux the same restart-free renewal and banner as Windows.
 - `SelectBestCertificate(hostname, store, location)` scans `LocalMachine\My`, matches the hostname
   against **CN *and* SAN** (`X509Certificate2.MatchesHostname`), keeps only currently-valid certs
   with a private key, and picks the **newest expiry**.
@@ -83,8 +85,14 @@ deliberately no in-process ACME client — see the note at the top of the TLS bl
 ### Renewal notes
 - **Windows:** any ACME client that installs into `LocalMachine\My` works. HTTP-01 needs port 80
   free on the host; where it isn't, **TLS-ALPN-01 on 443** or **DNS-01** are the alternatives.
-- **Linux:** certbot `--standalone` works because MFAWeb never binds port 80. Kestrel loads the
-  PEM at startup, so renewal needs a deploy hook that restarts MFAWeb (see INSTALL.md).
+- **Linux:** certbot `--standalone` works because MFAWeb never binds port 80 — so never give
+  certbot a `--pre-hook` that stops MFAWeb (it would be pure downtime, and certbot persists the
+  hook into the renewal config). MFAWeb re-loads the PEM once a minute and swaps on a thumbprint
+  change, so renewal is picked up **without a restart**; verified against a forced renewal with
+  the served certificate changing under a constant PID. The deploy hook re-applies the group
+  grant and is belt-and-braces, not load-bearing.
+- The `mfaweb` unit uses `Wants=mfaservice.service`, **not** `Requires=`. `Requires=` propagates
+  *stop*: restarting MFAService would take MFAWeb down and leave it down.
 - **The service account must have read access to the certificate's private key**, or the cert
   selects fine but the TLS handshake fails (SChannel can't open the key → the client sees an EOF).
   Grant it on every renewal — most ACME clients have a flag for this (win-acme:

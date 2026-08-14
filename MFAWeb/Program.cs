@@ -117,7 +117,6 @@ if (!OperatingSystem.IsWindows())
     {
         X509Certificate2? pemCached = null;
         DateTime pemNextCheck = DateTime.MinValue;
-        DateTime pemLastWrite = DateTime.MinValue;
         object pemLock = new();
 
         X509Certificate2? LoadPem()
@@ -146,23 +145,31 @@ if (!OperatingSystem.IsWindows())
                 if (pemCached is not null && DateTime.Now < pemNextCheck) return pemCached;
                 pemNextCheck = DateTime.Now.AddMinutes(1);
 
-                try
-                {
-                    // Re-read only when the file actually changed (certbot rewrites the symlink
-                    // target on renewal), so the steady state costs one stat per minute.
-                    DateTime written = File.GetLastWriteTimeUtc(pemCertPath!);
-                    if (pemCached is not null && written == pemLastWrite) return pemCached;
-                    pemLastWrite = written;
-                }
-                catch { /* fall through and attempt a load */ }
-
+                // Re-read the file once a minute and compare thumbprints. An earlier version
+                // tried to skip the read unless the file's mtime changed, but the configured
+                // path is normally a symlink (certbot's live/ -> archive/) and stat'ing the link
+                // does not reliably reflect a rewritten target, so renewals were missed. Parsing
+                // a PEM once a minute costs nothing; the mtime shortcut bought nothing and was
+                // wrong. Verified on Ubuntu 24.04 against a certbot layout.
                 var fresh = LoadPem();
                 if (fresh is not null)
                 {
-                    if (pemCached is not null)
-                        AuditLogger.Log($"[CERT] Reloaded PEM certificate; now expires {fresh.NotAfter:yyyy-MM-dd}.");
-                    pemCached = fresh;
-                    CertStatus.Update(pemCached, pemWarnDays);
+                    bool changed = pemCached is null || fresh.Thumbprint != pemCached.Thumbprint;
+                    if (changed && pemCached is not null)
+                        AuditLogger.Log($"[CERT] Reloaded PEM certificate: now '{fresh.Subject}', " +
+                                        $"expires {fresh.NotAfter:yyyy-MM-dd} (thumbprint {fresh.Thumbprint}).");
+
+                    if (changed)
+                    {
+                        var old = pemCached;
+                        pemCached = fresh;
+                        CertStatus.Update(pemCached, pemWarnDays);
+                        old?.Dispose();
+                    }
+                    else
+                    {
+                        fresh.Dispose();   // unchanged; keep the instance already in use
+                    }
                 }
                 else if (pemCached is not null)
                 {
