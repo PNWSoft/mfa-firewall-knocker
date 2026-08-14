@@ -1158,16 +1158,9 @@ namespace MFAAdmin
             Console.WriteLine("\n[WARNING] This removes every MFA-granted firewall rule.");
             Console.WriteLine("Users will have to re-authenticate before they can open access again.");
             Console.WriteLine();
-            Console.WriteLine("It does NOT terminate connections that are already established:");
-            Console.WriteLine("  - existing flows keep matching the conntrack RELATED,ESTABLISHED rule.");
-            Console.WriteLine("    A WireGuard session refreshes that entry with every keepalive, so it");
-            Console.WriteLine("    will not lapse on its own.");
-            Console.WriteLine("  - anyone reaching the port through a different rule (a permanently open");
-            Console.WriteLine("    port, a trusted interface, a separate allow) is unaffected.");
-            Console.WriteLine();
-            Console.WriteLine("To cut a live session you must also drop its conntrack entry, e.g.");
-            Console.WriteLine("    conntrack -D -s <ip> -p udp --dport <port>");
-            Console.WriteLine("and confirm no other rule still permits that source.");
+            Console.WriteLine("This closes the firewall to new connections. It does not necessarily end");
+            Console.WriteLine("sessions that are already connected, and any client reaching the port");
+            Console.WriteLine("through a separate rule is unaffected.");
             Console.Write("\nAre you sure you want to continue? (Y/N): ");
 
             var confirm = Console.ReadLine()?.Trim().ToUpper() ?? "";
@@ -1240,16 +1233,11 @@ namespace MFAAdmin
                 {
                     "An administrator removed all MFA-granted firewall rules via the Admin Tool.",
                     "",
-                    "New connections matching those rules are now blocked.",
+                    "The firewall is now closed to new connections on those rules.",
                     "",
-                    "Connections that were ALREADY ESTABLISHED were NOT terminated. They continue to",
-                    "match the conntrack RELATED,ESTABLISHED rule, and a WireGuard session refreshes",
-                    "that entry with every keepalive, so it will not lapse on its own. Any client",
-                    "reaching the port through a different rule - a permanently open port, a trusted",
-                    "interface, or a separate allow - is unaffected by this action.",
-                    "",
-                    "To cut a live session, also drop its conntrack entry and confirm no other rule",
-                    "still permits that source.",
+                    "This does not necessarily end sessions that are already connected, and any",
+                    "client reaching the port through a separate rule is unaffected. If a session",
+                    "must actually be cut off, confirm that separately.",
                 }));
             }
             catch (Exception ex)
