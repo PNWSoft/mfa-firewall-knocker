@@ -35,7 +35,10 @@ exposed to the network and re-checks every policy decision rather than trusting 
 
 ## Features
 
-- **WebAuthn / FIDO2 passkeys** and **TOTP** (authenticator app) as first-class login methods
+- **WebAuthn / FIDO2 passkeys** and **TOTP** (authenticator app) as first-class login methods.
+  Passkeys are restricted to **platform authenticators with user verification** — see
+  [Passkey requirements](#passkey-requirements) below, which is stricter than most WebAuthn
+  deployments and will reject a YubiKey
 - **Per-IP, auto-expiring** firewall rules — nothing is left open
 - **Public-IP-only enforcement** — requests from RFC-1918, CGNAT, loopback, and link-local ranges
   are rejected, on both sides of the privilege boundary
@@ -59,6 +62,31 @@ exposed to the network and re-checks every policy decision rather than trusting 
 | **MFAWeb** | Internet-facing ASP.NET Core app. Authenticates users, then asks MFAService to open the firewall. | gMSA (Windows) / dedicated user (Linux) |
 | **MFAService** | Privileged background service. Owns the user database and issues firewall commands. Never exposed to the internet. | LocalSystem (Windows) / root (Linux) |
 | **MFAAdmin** | Command-line tool for provisioning and managing users. | Administrator (Windows) / root (Linux) |
+
+## Passkey requirements
+
+The WebAuthn configuration is deliberately strict. As written it requires a **platform
+authenticator with user verification** — the built-in kind, unlocked by biometric or device PIN:
+
+| Setting | Value | Consequence |
+|---------|-------|-------------|
+| `AuthenticatorAttachment` | `Platform` | Only built-in authenticators: Windows Hello, Touch ID / Face ID, Android biometric. **Roaming security keys — YubiKey, Titan, SoloKeys — are rejected at registration.** |
+| `UserVerification` | `Required` | Biometric or device PIN on **every** registration and **every** login. A tap-only key is not enough. Enforced server-side on each assertion. |
+| `RequireResidentKey` | `false` | Non-discoverable credential: the user types their email address first. No usernameless "just tap" login. |
+| `attestationPreference` | `None` | The server does not verify authenticator make or model. |
+
+Set in `MFAWeb/Program.cs` (registration options and assertion options).
+
+Practical consequences to plan for:
+
+- **A passkey is bound to one device.** A user with a laptop and a phone needs one registered
+  per device. Losing the device means an admin must run `MFAAdmin reprovision <email>`.
+- **Machines without a platform authenticator cannot register a passkey at all** — an older
+  desktop with no Hello-capable hardware falls back to TOTP.
+- **If you want security-key support**, change `AuthenticatorAttachment` to
+  `CrossPlatform`, or drop the property entirely to allow both. Keep
+  `UserVerification = Required` if you do — a PIN-less key would weaken the second factor to
+  mere possession.
 
 ## Requirements
 

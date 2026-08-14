@@ -125,5 +125,14 @@ challenge needs port 80 and it stores certs in a directory rather than the Windo
   IP checks). Do not put a reverse proxy in front of it.
 - `HttpsCert:Subject`/`Store`/`Location` must be identical in MFAWeb and MFAService.
 - LettuceEncrypt is pinned at **1.3.3** (1.3.4 does not exist on NuGet).
+- **Passkeys are platform-authenticator-only with user verification required.** Registration
+  options set `AuthenticatorAttachment = Platform`, `UserVerification = Required`,
+  `RequireResidentKey = false`, `attestation = None`; assertion options also require UV. So
+  roaming security keys are rejected at registration, credentials are non-discoverable (the
+  user types their email first), and every ceremony needs a biometric or device PIN. UV is
+  enforced server-side on each assertion; `Platform` is only browser-enforced at registration
+  (attestation is `None`, so authenticator type is not verified afterward). Relaxing
+  `AuthenticatorAttachment` to `CrossPlatform` enables security keys — do **not** relax
+  `UserVerification` at the same time, or the second factor degrades to mere possession.
 - The login page falls back to the bundled `wwwroot/knocker.png` when `LogoUrl` is empty. The CSP
   `img-src` directive is widened to the logo's origin only when `LogoUrl` is an absolute URL.
