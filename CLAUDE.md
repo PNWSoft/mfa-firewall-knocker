@@ -137,6 +137,17 @@ challenge needs port 80 and it stores certs in a directory rather than the Windo
   IP checks). Do not put a reverse proxy in front of it.
 - `HttpsCert:Subject`/`Store`/`Location` must be identical in MFAWeb and MFAService.
 - LettuceEncrypt is pinned at **1.3.3** (1.3.4 does not exist on NuGet).
+- **IPC uses raw byte I/O on both transports — never `StreamWriter`/`StreamReader`.** A
+  `StreamWriter` over `Encoding.UTF8` prepends a BOM to its first write, and both IPC readers
+  parse raw bytes, so the BOM lands inside the first field and every request fails with
+  `ERROR: Invalid IP address`. This was live on the Unix socket path and invisible on Windows
+  (which already used raw bytes) until a real Linux deployment surfaced it. Both sides now use
+  `Encoding.UTF8.GetBytes` (no BOM) and defensively strip a leading `EF BB BF` on read. If you
+  reintroduce a `StreamWriter` here, use `new UTF8Encoding(false)`.
+- **Both hosts call `AddSystemd()` as well as `AddWindowsService()`.** The documented systemd
+  units declare `Type=notify`; without `AddSystemd()` the service never sends `READY=1`, so
+  systemd waits out the full start timeout and marks the unit failed. Each call is a no-op off
+  its own platform. Don't remove either.
 - **`Microsoft.IdentityModel.JsonWebTokens` / `System.IdentityModel.Tokens.Jwt` 6.34.0 in
   MFAWeb are unused by our code on purpose.** They are transitive version overrides: Fido2
   3.0.1 otherwise resolves them to 6.17.0, which carries GHSA-59j7-ghrg-fj52. Deleting them

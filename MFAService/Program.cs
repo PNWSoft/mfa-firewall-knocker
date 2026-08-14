@@ -39,6 +39,10 @@ builder.Services.AddWindowsService(options =>
 {
     options.ServiceName = "MFA Service";
 });
+// Required for systemd units declaring Type=notify. Without it the service never sends
+// READY=1, so systemd waits out its full start timeout and then marks the unit failed --
+// the documented Linux install could not work. Both calls are no-ops off their own platform.
+builder.Services.AddSystemd();
 builder.Services.AddHostedService<FirewallWorkerService>();
 builder.Services.AddHostedService<DatabaseLockService>();
 builder.Services.AddHostedService<CertificateMonitorService>();
@@ -240,8 +244,10 @@ public class FirewallWorkerService : BackgroundService
         listener.Bind(new UnixDomainSocketEndPoint(socketPath));
         listener.Listen(backlog: 10);
 
-        // 0660: owner (root) rw, group (www-data) rw, others none.
-        // Add MFAWeb's service account to the www-data group at deployment time.
+        // 0660: owner rw, group rw, others none. The socket is created by this process, so it
+        // ends up root:root -- there is no chgrp here. To let MFAWeb connect, give MFAService a
+        // supplementary group that the MFAWeb account also belongs to (see INSTALL.md,
+        // "Socket Permissions"). Verified on Ubuntu 24.04: srw-rw---- root root.
         File.SetUnixFileMode(socketPath,
             UnixFileMode.UserRead  | UnixFileMode.UserWrite |
             UnixFileMode.GroupRead | UnixFileMode.GroupWrite);
@@ -330,8 +336,6 @@ public class FirewallWorkerService : BackgroundService
 
         try
         {
-            var writer = new StreamWriter(stream, Encoding.UTF8, leaveOpen: true) { AutoFlush = true };
-
             const int MaxRequestBytes = 1024;
             var buffer = new List<byte>(256);
             var singleByte = new byte[1];
@@ -345,13 +349,26 @@ public class FirewallWorkerService : BackgroundService
             if (buffer.Count >= MaxRequestBytes)
             {
                 ServiceLogger.Log("[IPC] Request exceeded maximum size - rejected.");
-                await writer.WriteLineAsync("ERROR: Request too large".AsMemory(), ct);
+                await stream.WriteAsync(Encoding.UTF8.GetBytes("ERROR: Request too large\n"), ct);
+                await stream.FlushAsync(ct);
                 return;
             }
 
+            // Strip a leading UTF-8 BOM. A StreamWriter constructed with Encoding.UTF8 emits one
+            // before the first write, and reading raw bytes (unlike StreamReader) does not
+            // silently discard it -- the BOM would land inside the first field and every IP would
+            // fail to parse. Defensive: the writers no longer emit one, but an older or
+            // third-party client may.
+            if (buffer.Count >= 3 && buffer[0] == 0xEF && buffer[1] == 0xBB && buffer[2] == 0xBF)
+                buffer.RemoveRange(0, 3);
+
             string request  = Encoding.UTF8.GetString(buffer.ToArray());
             string response = ProcessFirewallRequest(request);
-            await writer.WriteLineAsync(response.AsMemory(), ct);
+
+            // Raw bytes, matching the Windows pipe handler: Encoding.UTF8.GetBytes does not
+            // prepend a BOM, whereas a StreamWriter over Encoding.UTF8 does.
+            await stream.WriteAsync(Encoding.UTF8.GetBytes(response + "\n"), ct);
+            await stream.FlushAsync(ct);
         }
         catch (OperationCanceledException) when (!ct.IsCancellationRequested)
         {
