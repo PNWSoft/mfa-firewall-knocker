@@ -100,6 +100,28 @@ if (builder.Configuration.GetValue<bool>("UseLettuceEncrypt"))
         kestrel.ListenAnyIP(80);
     });
 }
+else if (!OperatingSystem.IsWindows())
+{
+    // --- Linux/macOS: the certificate comes from Kestrel's own configuration ---
+    // (Kestrel:Endpoints:Https:Certificate:{Path,KeyPath} -- see INSTALL.md Option A.)
+    //
+    // Do NOT install a ServerCertificateSelector here. ConfigureHttpsDefaults applies to
+    // config-bound endpoints too, and a selector takes precedence over the certificate
+    // Kestrel loaded from configuration. The store-scanning selector below can only ever
+    // return null off Windows ("Unix LocalMachine X509Store is limited to the Root and
+    // CertificateAuthority stores"), so installing it silently replaced a perfectly good
+    // PEM certificate with nothing and every TLS handshake failed. Verified on Ubuntu 24.04.
+    bool haveConfiguredCert = !string.IsNullOrWhiteSpace(
+        builder.Configuration["Kestrel:Endpoints:Https:Certificate:Path"]);
+
+    if (haveConfiguredCert)
+        AuditLogger.Log("[CERT] Using the certificate from Kestrel configuration (PEM). " +
+                        "Renewals require a restart -- see INSTALL.md for the certbot deploy hook.");
+    else
+        AuditLogger.Error("[CERT] No Kestrel:Endpoints:Https:Certificate:Path is configured and the " +
+                          "Windows certificate store does not exist on this platform. HTTPS will fail. " +
+                          "Set Certificate:Path/KeyPath, or enable UseLettuceEncrypt.");
+}
 else
 {
     // --- HTTPS via a certificate from the Windows certificate store ---
