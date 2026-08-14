@@ -605,6 +605,17 @@ MFAAdmin import <file.json>    Import users from a previously exported file
 2. The user receives an email with two links:
    - **Passkey setup** (recommended) — registers a FIDO2 passkey on their device
    - **Authenticator app setup** — scans a QR code for TOTP
+
+> **Passkey registration requires a built-in authenticator with biometric or PIN unlock.**
+> The WebAuthn options specify `AuthenticatorAttachment = Platform` and
+> `UserVerification = Required`, so Windows Hello, Touch ID / Face ID, and Android biometric
+> work, while **roaming security keys such as YubiKeys are rejected**. The credential is
+> non-discoverable (`RequireResidentKey = false`), so users type their email address before
+> authenticating, and the passkey is bound to the single device it was created on — a user
+> who works from two machines needs a passkey registered on each. A user whose machine has
+> no platform authenticator can only use TOTP. To allow security keys, change
+> `AuthenticatorAttachment` to `CrossPlatform` (or remove it to permit both) in
+> `MFAWeb/Program.cs`, keeping `UserVerification = Required`.
 3. Links expire after **60 minutes**. Use `MFAAdmin reprovision` to resend.
 4. The user visits MFAWeb and authenticates with their passkey or TOTP code to open
    the firewall for their current IP.
