@@ -101,6 +101,23 @@ deliberately no in-process ACME client — see the note at the top of the TLS bl
 - **MFAAdmin:** `DpapiEntropy` (required), `SiteName`, `RulePrefix`, `BouncerUrl`,
   `AllowedDomains`, `FirewallService:GmsaAccount`, `Smtp:*`.
 
+## Design principle: prefer deletion to configuration
+
+For a security tool, **removing a capability beats adding a switch to disable it.** A switch can
+be mis-set, mis-defaulted, or drift between components; an absent code path cannot, and a
+reviewer never has to reason about it. Several decisions here follow from that and should not be
+casually reversed:
+
+- TOTP is compiled out, not config-disabled (`-p:AllowTotp=true` to include it).
+- LettuceEncrypt was deleted rather than repaired: it removed four dependencies and made the
+  cleartext port-80 listener *unreachable* instead of merely fixed.
+- `RequirePasskey` as a runtime setting was abandoned mid-implementation once it became clear it
+  needed a new IPC verb, a cached accessor, a refresh loop, and a widened named-pipe ACL just to
+  keep two components in agreement.
+
+When a feature is unused, untested, or only reachable via a flag nobody sets, deleting it is
+usually the security fix. Adding surface needs to earn its place.
+
 ## Security invariants (do not regress)
 
 - **Passkey registration requires password proof.** A user's `PasskeyRegistrationReady` flag gates
