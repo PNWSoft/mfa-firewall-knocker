@@ -69,7 +69,10 @@ deliberately no in-process ACME client — see the note at the top of the TLS bl
   by design).
 
 ### MFAService — expiry email watchdog
-- `CertificateMonitorService` (a `BackgroundService`, Windows-only) scans the store every
+- `CertificateMonitorService` runs on **both** platforms: it scans the Windows store, or stats
+  `HttpsCert:PemPath` on Linux. It used to return immediately off Windows, which meant a Linux
+  deployment got no warning at all before a certificate lapsed.
+- On Windows it scans the store every
   `CertAlert:CheckIntervalHours` for the newest cert matching the hostname (including expired, so it
   can report it), and **emails `Smtp:NotifyAddress`** when the cert is missing / expired / within
   `WarnDays`. Throttled to once per 24h; resets when healthy.
@@ -95,7 +98,8 @@ deliberately no in-process ACME client — see the note at the top of the TLS bl
   `CertAlert:WarnDays`, `AccountAlert:{Threshold,WindowMinutes,SendEmail}`, `Smtp:*` (for account
   alerts). Linux additionally uses `Kestrel:Endpoints:Https:Certificate:{Path,KeyPath}`.
 - **MFAService:** `DpapiEntropy` (required), `BouncerConfig:{AllowedPorts,ExpirationHours,RulePrefix}`,
-  `FirewallService:GmsaAccount`, `HttpsCert:{Subject,Store,Location}` (must match MFAWeb),
+  `FirewallService:GmsaAccount`, `HttpsCert:{Subject,Store,Location}` (must match MFAWeb;
+  `HttpsCert:PemPath` instead on Linux, or there are no expiry alerts there),
   `CertAlert:{WarnDays,CheckIntervalHours}`,
   `Smtp:{Host,Port,UseSsl,Username,Password,FromAddress,NotifyAddress}`.
 - **MFAAdmin:** `DpapiEntropy` (required), `SiteName`, `RulePrefix`, `BouncerUrl`,

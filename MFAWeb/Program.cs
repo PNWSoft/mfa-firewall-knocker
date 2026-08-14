@@ -85,25 +85,104 @@ builder.Services.AddHsts(options =>
 // into the most exposed component. Do not reintroduce an in-process ACME client.
 if (!OperatingSystem.IsWindows())
 {
-    // --- Linux/macOS: the certificate comes from Kestrel's own configuration ---
-    // (Kestrel:Endpoints:Https:Certificate:{Path,KeyPath} -- see INSTALL.md Option A.)
+    // --- Linux/macOS: PEM certificate, reloaded from disk without a restart ---
     //
-    // Do NOT install a ServerCertificateSelector here. ConfigureHttpsDefaults applies to
-    // config-bound endpoints too, and a selector takes precedence over the certificate
-    // Kestrel loaded from configuration. The store-scanning selector below can only ever
-    // return null off Windows ("Unix LocalMachine X509Store is limited to the Root and
-    // CertificateAuthority stores"), so installing it silently replaced a perfectly good
-    // PEM certificate with nothing and every TLS handshake failed. Verified on Ubuntu 24.04.
-    bool haveConfiguredCert = !string.IsNullOrWhiteSpace(
-        builder.Configuration["Kestrel:Endpoints:Https:Certificate:Path"]);
+    // The certificate lives at Kestrel:Endpoints:Https:Certificate:{Path,KeyPath}. Kestrel
+    // would load that once at startup, which is a trap for a passkey gate: certbot renews on
+    // schedule, but MFAWeb keeps serving the OLD certificate until something restarts it. When
+    // it finally expires, browsers refuse the secure context, WebAuthn will not run, and in a
+    // passkey-only build there is no other way in -- if SSH is itself gated, that is a remote
+    // lockout caused by a *successful* renewal.
+    //
+    // So mirror the Windows behaviour: a selector that re-reads the file, keeps the last good
+    // certificate if a read fails, and never hard-fails at startup. certbot's live/ directory
+    // is a symlink to the current version, so re-reading the same path is all that is needed.
+    //
+    // NOTE: a selector overrides the certificate Kestrel loaded from configuration. That is
+    // fine here because we load the same files ourselves. Do NOT install the Windows
+    // store-scanning selector on this platform -- it can only return null ("Unix LocalMachine
+    // X509Store is limited to the Root and CertificateAuthority stores") and that silently
+    // replaced a perfectly good PEM with nothing, breaking TLS entirely. Verified on Ubuntu 24.04.
+    string? pemCertPath = builder.Configuration["Kestrel:Endpoints:Https:Certificate:Path"];
+    string? pemKeyPath  = builder.Configuration["Kestrel:Endpoints:Https:Certificate:KeyPath"];
+    int pemWarnDays     = builder.Configuration.GetValue<int>("CertAlert:WarnDays", 20);
 
-    if (haveConfiguredCert)
-        AuditLogger.Log("[CERT] Using the certificate from Kestrel configuration (PEM). " +
-                        "Renewals require a restart -- see INSTALL.md for the certbot deploy hook.");
+    if (string.IsNullOrWhiteSpace(pemCertPath) || string.IsNullOrWhiteSpace(pemKeyPath))
+    {
+        AuditLogger.Error("[CERT] Kestrel:Endpoints:Https:Certificate:Path and :KeyPath are not both " +
+                          "configured, and there is no Windows certificate store on this platform. " +
+                          "HTTPS will fail. See INSTALL.md.");
+    }
     else
-        AuditLogger.Error("[CERT] No Kestrel:Endpoints:Https:Certificate:Path is configured and the " +
-                          "Windows certificate store does not exist on this platform. HTTPS will fail. " +
-                          "Set Kestrel:Endpoints:Https:Certificate:Path and :KeyPath - see INSTALL.md.");
+    {
+        X509Certificate2? pemCached = null;
+        DateTime pemNextCheck = DateTime.MinValue;
+        DateTime pemLastWrite = DateTime.MinValue;
+        object pemLock = new();
+
+        X509Certificate2? LoadPem()
+        {
+            try
+            {
+                // Ephemeral key material; fine for Kestrel on Unix.
+                var fresh = X509Certificate2.CreateFromPemFile(pemCertPath!, pemKeyPath!);
+                if (DateTime.Now > fresh.NotAfter)
+                    AuditLogger.Error($"[CERT] PEM certificate for '{fresh.Subject}' EXPIRED on " +
+                                      $"{fresh.NotAfter:yyyy-MM-dd}. Passkey sign-in will fail: browsers " +
+                                      "refuse WebAuthn on an invalid certificate. Renew immediately.");
+                return fresh;
+            }
+            catch (Exception ex)
+            {
+                AuditLogger.Error($"[CERT] Could not load PEM certificate: {ex.Message}");
+                return null;
+            }
+        }
+
+        X509Certificate2? GetCurrentPem()
+        {
+            lock (pemLock)
+            {
+                if (pemCached is not null && DateTime.Now < pemNextCheck) return pemCached;
+                pemNextCheck = DateTime.Now.AddMinutes(1);
+
+                try
+                {
+                    // Re-read only when the file actually changed (certbot rewrites the symlink
+                    // target on renewal), so the steady state costs one stat per minute.
+                    DateTime written = File.GetLastWriteTimeUtc(pemCertPath!);
+                    if (pemCached is not null && written == pemLastWrite) return pemCached;
+                    pemLastWrite = written;
+                }
+                catch { /* fall through and attempt a load */ }
+
+                var fresh = LoadPem();
+                if (fresh is not null)
+                {
+                    if (pemCached is not null)
+                        AuditLogger.Log($"[CERT] Reloaded PEM certificate; now expires {fresh.NotAfter:yyyy-MM-dd}.");
+                    pemCached = fresh;
+                    CertStatus.Update(pemCached, pemWarnDays);
+                }
+                else if (pemCached is not null)
+                {
+                    // Keep serving the last good certificate rather than dropping TLS.
+                    AuditLogger.Warn("[CERT] Reload failed; continuing with the previously loaded certificate.");
+                }
+                return pemCached;
+            }
+        }
+
+        var initial = GetCurrentPem();
+        if (initial is null)
+            AuditLogger.Error("[CERT] No usable PEM certificate at startup. HTTPS will fail until one exists.");
+        else
+            AuditLogger.Log($"[CERT] PEM certificate loaded for '{initial.Subject}', expires " +
+                            $"{initial.NotAfter:yyyy-MM-dd}. Renewals are picked up without a restart.");
+
+        builder.WebHost.ConfigureKestrel(kestrel =>
+            kestrel.ConfigureHttpsDefaults(https => https.ServerCertificateSelector = (_, _) => GetCurrentPem()));
+    }
 }
 else
 {

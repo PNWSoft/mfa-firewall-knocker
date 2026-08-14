@@ -1165,20 +1165,90 @@ public class CertificateMonitorService : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        // The cert store is a Windows concept; on Linux TLS is handled by files/ACME.
-        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-            return;
+        // The certificate store is a Windows concept. On Linux the certificate is a PEM file,
+        // so watch that instead -- this alert must work on BOTH platforms. An expired cert on a
+        // passkey-only deployment is a lockout, not an inconvenience: browsers refuse WebAuthn
+        // on an invalid certificate, so nobody can authenticate and nobody can open the
+        // firewall. Silently having no expiry warning on Linux was the worst of the three gaps.
+        bool onWindows = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
+        string? pemPath = _config["HttpsCert:PemPath"];
 
-        ServiceLogger.Log($"[CERT] Monitor started for '{_hostname}' in {_storeLocation}/{_storeName}; " +
-            $"warn at {_warnDays} day(s), checking every {_checkInterval.TotalHours:0}h.");
+        if (!onWindows && string.IsNullOrWhiteSpace(pemPath))
+        {
+            ServiceLogger.Warn("[CERT] Monitor disabled: set HttpsCert:PemPath to the certificate " +
+                               "MFAWeb serves (e.g. /etc/letsencrypt/live/<domain>/fullchain.pem) " +
+                               "to receive expiry warnings on this platform.");
+            return;
+        }
+
+        ServiceLogger.Log(onWindows
+            ? $"[CERT] Monitor started for '{_hostname}' in {_storeLocation}/{_storeName}; " +
+              $"warn at {_warnDays} day(s), checking every {_checkInterval.TotalHours:0}h."
+            : $"[CERT] Monitor started for '{pemPath}'; warn at {_warnDays} day(s), " +
+              $"checking every {_checkInterval.TotalHours:0}h.");
 
         while (!stoppingToken.IsCancellationRequested)
         {
-            try { CheckOnce(); }
+            try
+            {
+                if (onWindows) CheckOnce();
+                else           CheckPemOnce(pemPath!);
+            }
             catch (Exception ex) { ServiceLogger.Error($"[CERT] Check failed: {ex.Message}"); }
 
             try { await Task.Delay(_checkInterval, stoppingToken); }
             catch (TaskCanceledException) { break; }
+        }
+    }
+
+    // Linux/macOS equivalent of CheckOnce: inspect the PEM file MFAWeb actually serves.
+    private void CheckPemOnce(string pemPath)
+    {
+        if (!File.Exists(pemPath))
+        {
+            ServiceLogger.Warn($"[CERT] Certificate file '{pemPath}' does not exist.");
+            MaybeEmail($"[MFA] TLS certificate MISSING for {_hostname}",
+                $"The certificate file '{pemPath}' does not exist on this server.\n" +
+                "MFAWeb cannot serve HTTPS, so passkey sign-in is impossible and no firewall\n" +
+                "access can be granted until a valid certificate is in place.");
+            return;
+        }
+
+        X509Certificate2 cert;
+        try { cert = X509CertificateLoader.LoadCertificateFromFile(pemPath); }
+        catch (Exception ex)
+        {
+            ServiceLogger.Error($"[CERT] Could not read '{pemPath}': {ex.Message}");
+            MaybeEmail($"[MFA] TLS certificate UNREADABLE for {_hostname}",
+                $"The certificate file '{pemPath}' could not be parsed: {ex.Message}");
+            return;
+        }
+
+        using (cert)
+        {
+            int days = (int)Math.Floor((cert.NotAfter - DateTime.Now).TotalDays);
+            if (days < 0)
+            {
+                ServiceLogger.Warn($"[CERT] Certificate '{pemPath}' EXPIRED {-days} day(s) ago ({cert.NotAfter:yyyy-MM-dd}).");
+                MaybeEmail($"[MFA] TLS certificate EXPIRED for {_hostname}",
+                    $"The certificate at '{pemPath}' expired on {cert.NotAfter:yyyy-MM-dd HH:mm}.\n\n" +
+                    "Passkey sign-in is now IMPOSSIBLE: browsers refuse WebAuthn on an invalid\n" +
+                    "certificate, so no user can authenticate and no firewall rule can be opened.\n" +
+                    "Renew immediately.");
+            }
+            else if (days <= _warnDays)
+            {
+                ServiceLogger.Warn($"[CERT] Certificate '{pemPath}' expires in {days} day(s) ({cert.NotAfter:yyyy-MM-dd}).");
+                MaybeEmail($"[MFA] TLS certificate expires in {days} day(s) for {_hostname}",
+                    $"The certificate at '{pemPath}' expires on {cert.NotAfter:yyyy-MM-dd HH:mm} ({days} day(s)).\n\n" +
+                    "If it lapses, passkey sign-in stops working entirely and no firewall access\n" +
+                    "can be granted. Confirm the ACME client is renewing on schedule.");
+            }
+            else
+            {
+                ServiceLogger.Debug($"[CERT] '{pemPath}' healthy; expires {cert.NotAfter:yyyy-MM-dd} ({days} days).");
+                _lastEmailUtc = DateTime.MinValue; // reset throttle so the next problem alerts immediately
+            }
         }
     }
 
