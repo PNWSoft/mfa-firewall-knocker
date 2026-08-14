@@ -226,6 +226,43 @@ A few that are easy to get wrong:
 > appear to come from the proxy — collapsing rate limiting and opening the firewall for the wrong
 > address. Bind it directly to the public interface.
 
+## Do not make this your only way in
+
+**No single system should be the sole path to a network — including this one.** Treat the gate
+as one access route among several, never the only one. A redundant design isn't paranoia here;
+it's the difference between an incident and an outage you cannot remotely fix.
+
+The failure mode is specific and worth understanding, because it is not obvious:
+
+> **An expired TLS certificate locks everyone out completely.** WebAuthn requires a secure
+> context, so a browser will refuse to run the passkey ceremony on an invalid certificate — and
+> it won't let the user click through. In a passkey-only build there is no second factor to fall
+> back to. Nobody authenticates, so nobody opens a firewall rule. If SSH to that host is itself
+> gated, you have no way in to fix the certificate that is causing the problem.
+
+The same shape applies to any single dependency: the service crashing, a bad config push, the
+host rebooting into a broken state, a DNS or upstream network failure, or the gate's own
+database becoming unreadable.
+
+Practical redundancy, roughly in order of value:
+
+- **Run more than one gate, on independent hosts**, each with its own certificate, its own DNS
+  name, and its own firewall. Independence is the point — two gates sharing a host, a cert, or
+  an upstream link fail together.
+- **Keep an out-of-band console** — IPMI/iDRAC/iLO, a cloud provider's serial console, or a
+  hypervisor console — that does not depend on the gate or on SSH.
+- **Keep a break-glass path** that is normally disabled and separately monitored: a bastion
+  reachable from one fixed address, or a rule you can enable from the console.
+- **Monitor the certificate from outside**, not only from the box. MFAService emails on
+  approaching expiry on both platforms, but that alert travels over the same infrastructure that
+  may be failing.
+- **Test recovery before you need it.** Deliberately break the gate on a maintenance window and
+  confirm you can still get in.
+
+MFAWeb reloads its certificate without a restart on both platforms, and MFAService warns by
+email before expiry, precisely because this failure mode is severe. Those reduce the likelihood.
+They do not remove the need for a second way in.
+
 ## Security notes
 
 - The user database stores **TOTP secrets in recoverable form** (they have to be, to validate
