@@ -209,6 +209,11 @@ var _built = _asm.GetCustomAttributes<AssemblyMetadataAttribute>()
 AuditLogger.Log($"MFAWeb v{_ver} (built {_built} UTC) starting...");
 
 string siteName = app.Configuration["SiteName"] ?? "MFA Secure Access";
+// HTML-escaped form for interpolation into the inline markup below. Operator-controlled
+// config rather than user input, and the CSP would block injected script anyway, but this
+// page is hand-assembled from strings so escaping every interpolated value is the habit
+// worth keeping. Use `siteName` (unescaped) for non-HTML contexts such as the TOTP issuer.
+string siteNameHtml = System.Net.WebUtility.HtmlEncode(siteName);
 string logoUrl = app.Configuration["LogoUrl"] ?? "";
 string imgSrcDirective = string.IsNullOrEmpty(logoUrl) || !Uri.TryCreate(logoUrl, UriKind.Absolute, out var logoUri)
     ? "img-src 'self'; "
@@ -293,7 +298,7 @@ app.MapGet("/", async (HttpContext context, IAntiforgery antiforgery) =>
         <html>
         <head>
             <meta name='viewport' content='width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=0' />
-            <title>{siteName}</title>
+            <title>{siteNameHtml}</title>
             <link rel='icon' type='image/x-icon' href='/favicon.ico' />
             <style>
                 body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #121212; color: #fff; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }}
@@ -495,7 +500,7 @@ app.MapGet("/setup/{token}", async (HttpContext context, string token, IAntiforg
     string? provisionUsername = null;
     {
         var users = LoadUsers(DbPath, Entropy);
-        var user = users.FirstOrDefault(u => u.ProvisioningToken == token);
+        var user = users.FirstOrDefault(u => TokenEquals(u.ProvisioningToken, token));
         if (user != null && user.ProvisioningExpiresUtc != null && DateTime.UtcNow <= user.ProvisioningExpiresUtc)
             provisionUsername = user.Username;
     }
@@ -514,7 +519,7 @@ app.MapGet("/setup/{token}", async (HttpContext context, string token, IAntiforg
         <html>
         <head>
             <meta name='viewport' content='width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=0' />
-            <title>{siteName} - Setup 2FA</title>
+            <title>{siteNameHtml} - Setup 2FA</title>
             <style>
                 body {{ font-family: 'Segoe UI', sans-serif; background: #121212; color: #fff; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }}
                 .login-box {{ background: #1e1e1e; padding: 40px; border-radius: 8px; box-shadow: 0 8px 24px rgba(0,0,0,0.5); width: 90%; max-width: 320px; box-sizing: border-box; text-align: center; }}
@@ -530,7 +535,7 @@ app.MapGet("/setup/{token}", async (HttpContext context, string token, IAntiforg
                 <form action='/setup' method='post'>
                     <input type='hidden' name='{csrfTokens.FormFieldName}' value='{csrfTokens.RequestToken}'/>
                     <input type='hidden' name='token' value='{token}' />
-                    <input type='hidden' name='username' value='{provisionUsername}' />
+                    <input type='hidden' name='username' value='{System.Net.WebUtility.HtmlEncode(provisionUsername)}' />
                     <input type='password' name='password' placeholder='Enter your password' required />
                     <button type='submit'>Reveal Secret</button>
                 </form>
@@ -567,7 +572,7 @@ app.MapPost("/setup", async (HttpContext context, IAntiforgery antiforgery) =>
     bool setupNoSecret = false;
     {
         var users = LoadUsers(DbPath, Entropy);
-        var user = users.FirstOrDefault(u => u.ProvisioningToken == token && u.Username.Equals(username, StringComparison.OrdinalIgnoreCase));
+        var user = users.FirstOrDefault(u => TokenEquals(u.ProvisioningToken, token) && u.Username.Equals(username, StringComparison.OrdinalIgnoreCase));
 
         if (user == null || user.ProvisioningExpiresUtc == null || DateTime.UtcNow > user.ProvisioningExpiresUtc)
         {
@@ -632,7 +637,7 @@ app.MapPost("/setup", async (HttpContext context, IAntiforgery antiforgery) =>
             <html>
             <head>
                 <meta name='viewport' content='width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=0' />
-                <title>{siteName} - MFA Secret</title>
+                <title>{siteNameHtml} - MFA Secret</title>
                 <style>
                     body {{ font-family: monospace; background: #121212; color: #fff; text-align: center; padding-top: 50px; margin: 0; }}
                     .container {{ background: #1e1e1e; padding: 40px; border-radius: 8px; display: inline-block; border: 1px solid #333; width: 90%; max-width: 400px; box-sizing: border-box; margin: 20px auto; }}
@@ -674,7 +679,7 @@ app.MapGet("/setup-passkey/{token}", async (HttpContext context, string token, I
     string? passkeyProvisionUsername = null;
     {
         var users = LoadUsers(DbPath, Entropy);
-        var user = users.FirstOrDefault(u => u.PasskeyProvisioningToken == token);
+        var user = users.FirstOrDefault(u => TokenEquals(u.PasskeyProvisioningToken, token));
         if (user != null && user.PasskeyProvisioningExpiresUtc != null && DateTime.UtcNow <= user.PasskeyProvisioningExpiresUtc)
             passkeyProvisionUsername = user.Username;
     }
@@ -693,7 +698,7 @@ app.MapGet("/setup-passkey/{token}", async (HttpContext context, string token, I
         <html>
         <head>
             <meta name='viewport' content='width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=0' />
-            <title>{siteName} - Register Passkey</title>
+            <title>{siteNameHtml} - Register Passkey</title>
             <style>
                 body {{ font-family: 'Segoe UI', sans-serif; background: #121212; color: #fff; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }}
                 .login-box {{ background: #1e1e1e; padding: 40px; border-radius: 8px; box-shadow: 0 8px 24px rgba(0,0,0,0.5); width: 90%; max-width: 320px; box-sizing: border-box; text-align: center; }}
@@ -709,7 +714,7 @@ app.MapGet("/setup-passkey/{token}", async (HttpContext context, string token, I
                 <form action='/setup-passkey' method='post'>
                     <input type='hidden' name='{csrfTokens.FormFieldName}' value='{csrfTokens.RequestToken}'/>
                     <input type='hidden' name='token' value='{token}' />
-                    <input type='hidden' name='username' value='{passkeyProvisionUsername}' />
+                    <input type='hidden' name='username' value='{System.Net.WebUtility.HtmlEncode(passkeyProvisionUsername)}' />
                     <input type='password' name='password' placeholder='Enter your password' required autocomplete='current-password' />
                     <button type='submit'>Continue</button>
                 </form>
@@ -732,7 +737,7 @@ app.MapPost("/setup-passkey", async (HttpContext context, IAntiforgery antiforge
     bool pkBadPassword = false;
     {
         var users = LoadUsers(DbPath, Entropy);
-        var user = users.FirstOrDefault(u => u.PasskeyProvisioningToken == token
+        var user = users.FirstOrDefault(u => TokenEquals(u.PasskeyProvisioningToken, token)
                                          && u.Username.Equals(username, StringComparison.OrdinalIgnoreCase));
 
         if (user == null || user.PasskeyProvisioningExpiresUtc == null || DateTime.UtcNow > user.PasskeyProvisioningExpiresUtc)
@@ -773,7 +778,7 @@ app.MapPost("/setup-passkey", async (HttpContext context, IAntiforgery antiforge
         <html>
         <head>
             <meta name='viewport' content='width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=0' />
-            <title>{siteName} - Register Passkey</title>
+            <title>{siteNameHtml} - Register Passkey</title>
             <style>
                 body {{ font-family: 'Segoe UI', sans-serif; background: #121212; color: #fff; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }}
                 .box {{ background: #1e1e1e; padding: 40px; border-radius: 8px; box-shadow: 0 8px 24px rgba(0,0,0,0.5); width: 90%; max-width: 360px; box-sizing: border-box; text-align: center; }}
@@ -1031,7 +1036,7 @@ app.MapGet("/register-passkey/{token}", async (HttpContext context, string token
     bool regLinkValid = false;
     {
         var users = LoadUsers(DbPath, Entropy);
-        var user = users.FirstOrDefault(u => u.PasskeyProvisioningToken == token);
+        var user = users.FirstOrDefault(u => TokenEquals(u.PasskeyProvisioningToken, token));
         regLinkValid = user != null && user.PasskeyProvisioningExpiresUtc != null && DateTime.UtcNow <= user.PasskeyProvisioningExpiresUtc
                        && user.PasskeyRegistrationReady;
     }
@@ -1048,7 +1053,7 @@ app.MapGet("/register-passkey/{token}", async (HttpContext context, string token
         <html>
         <head>
             <meta name='viewport' content='width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=0' />
-            <title>{siteName} - Register Passkey</title>
+            <title>{siteNameHtml} - Register Passkey</title>
             <style>
                 body {{ font-family: 'Segoe UI', sans-serif; background: #121212; color: #fff; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }}
                 .box {{ background: #1e1e1e; padding: 40px; border-radius: 8px; box-shadow: 0 8px 24px rgba(0,0,0,0.5); width: 90%; max-width: 360px; box-sizing: border-box; text-align: center; }}
@@ -1090,7 +1095,7 @@ app.MapPost("/passkey/register/begin", async (HttpContext context) =>
     List<PublicKeyCredentialDescriptor>? existingCreds = null;
     {
         var users = LoadUsers(DbPath, Entropy);
-        var user = users.FirstOrDefault(u => u.PasskeyProvisioningToken == token);
+        var user = users.FirstOrDefault(u => TokenEquals(u.PasskeyProvisioningToken, token));
 
         if (user == null || user.PasskeyProvisioningExpiresUtc == null || DateTime.UtcNow > user.PasskeyProvisioningExpiresUtc
             || !user.PasskeyRegistrationReady)
@@ -1175,7 +1180,7 @@ app.MapPost("/passkey/register/complete", async (HttpContext context) =>
     HashSet<string>? existingCredIds = null;
     {
         var users = LoadUsers(DbPath, Entropy);
-        var user = users.FirstOrDefault(u => u.PasskeyProvisioningToken == token);
+        var user = users.FirstOrDefault(u => TokenEquals(u.PasskeyProvisioningToken, token));
 
         if (user == null || user.PasskeyProvisioningExpiresUtc == null || DateTime.UtcNow > user.PasskeyProvisioningExpiresUtc
             || !user.PasskeyRegistrationReady)
@@ -1333,6 +1338,17 @@ static List<UserEntry> LoadUsers(string dbPath, byte[] entropy)
         AuditLogger.Error($"[CRITICAL ERROR] Failed to load database: {ex.Message}");
         return new List<UserEntry>();
     }
+}
+
+// Constant-time comparison for provisioning tokens. These are 256 bits of CSPRNG output and
+// short-lived, so a practical remote timing attack is not realistic -- but secrets compared
+// with '==' short-circuit on the first differing byte, and this costs nothing. Length is not
+// secret (all tokens are the same length), so an early length mismatch is fine.
+static bool TokenEquals(string? a, string? b)
+{
+    if (a is null || b is null) return false;
+    return System.Security.Cryptography.CryptographicOperations.FixedTimeEquals(
+        Encoding.UTF8.GetBytes(a), Encoding.UTF8.GetBytes(b));
 }
 
 static byte[] FromBase64Url(string b64url)

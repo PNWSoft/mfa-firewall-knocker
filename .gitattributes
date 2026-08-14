@@ -1,0 +1,18 @@
+# Normalize line endings. This project is built and deployed on both Windows and Linux;
+# without this, contributors on either platform produce whole-file diffs on first save.
+* text=auto eol=lf
+
+# Windows-only tooling that genuinely wants CRLF
+*.ps1     text eol=crlf
+*.cmd     text eol=crlf
+*.bat     text eol=crlf
+*.pubxml  text eol=crlf
+*.sln     text eol=crlf
+*.slnx    text eol=crlf
+
+# Binary — never touch
+*.ico     binary
+*.png     binary
+*.jpg     binary
+*.pfx     binary
+*.snk     binary

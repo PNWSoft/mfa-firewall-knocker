@@ -262,11 +262,21 @@ public class FirewallWorkerService : BackgroundService
         }
     }
 
+    // A local IPC client has no legitimate reason to take longer than this to send one short
+    // line. Without a deadline, a client that connects and sends nothing pins its handler until
+    // service shutdown; enough of those exhaust the named-pipe instance limit and MFAWeb can no
+    // longer reach the service at all. Scoped to the READ only -- request processing shells out
+    // to PowerShell and may legitimately be slower.
+    private static readonly TimeSpan IpcReadTimeout = TimeSpan.FromSeconds(15);
+
     [SupportedOSPlatform("windows")]
     private async Task HandlePipeConnectionAsync(NamedPipeServerStream pipe, CancellationToken ct)
     {
         using (pipe)
         {
+            using var readCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            readCts.CancelAfter(IpcReadTimeout);
+
             try
             {
                 ServiceLogger.Debug("[IPC] Handler reading request...");
@@ -277,7 +287,7 @@ public class FirewallWorkerService : BackgroundService
                 var singleByte = new byte[1];
                 while (buffer.Count < MaxRequestBytes)
                 {
-                    int n = await pipe.ReadAsync(singleByte, ct);
+                    int n = await pipe.ReadAsync(singleByte, readCts.Token);
                     if (n == 0 || singleByte[0] == (byte)'\n') break;
                     if (singleByte[0] != (byte)'\r') buffer.Add(singleByte[0]);
                 }
@@ -299,6 +309,10 @@ public class FirewallWorkerService : BackgroundService
                 await pipe.WriteAsync(responseBytes, ct);
                 await pipe.FlushAsync(ct);
             }
+            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+            {
+                ServiceLogger.Warn($"[IPC] Connection closed - no complete request within {IpcReadTimeout.TotalSeconds:0}s.");
+            }
             catch (Exception ex) { ServiceLogger.Warn($"[IPC] Pipe handler error: {ex.GetType().Name}: {ex.Message}"); }
         }
     }
@@ -306,14 +320,42 @@ public class FirewallWorkerService : BackgroundService
     private async Task HandleUnixConnectionAsync(Socket socket, CancellationToken ct)
     {
         using var stream = new NetworkStream(socket, ownsSocket: true);
+
+        // Bound the read in BOTH size and time, matching the Windows pipe handler. The previous
+        // StreamReader.ReadLineAsync had no size cap, so a client could stream unbounded data
+        // with no newline and grow the buffer without limit; and with no deadline a connection
+        // that sends nothing pinned the handler until service shutdown.
+        using var readCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        readCts.CancelAfter(IpcReadTimeout);
+
         try
         {
-            var reader = new StreamReader(stream, Encoding.UTF8, leaveOpen: true);
             var writer = new StreamWriter(stream, Encoding.UTF8, leaveOpen: true) { AutoFlush = true };
 
-            string? request = await reader.ReadLineAsync(ct);
+            const int MaxRequestBytes = 1024;
+            var buffer = new List<byte>(256);
+            var singleByte = new byte[1];
+            while (buffer.Count < MaxRequestBytes)
+            {
+                int n = await stream.ReadAsync(singleByte, readCts.Token);
+                if (n == 0 || singleByte[0] == (byte)'\n') break;
+                if (singleByte[0] != (byte)'\r') buffer.Add(singleByte[0]);
+            }
+
+            if (buffer.Count >= MaxRequestBytes)
+            {
+                ServiceLogger.Log("[IPC] Request exceeded maximum size - rejected.");
+                await writer.WriteLineAsync("ERROR: Request too large".AsMemory(), ct);
+                return;
+            }
+
+            string request  = Encoding.UTF8.GetString(buffer.ToArray());
             string response = ProcessFirewallRequest(request);
             await writer.WriteLineAsync(response.AsMemory(), ct);
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            ServiceLogger.Warn($"[IPC] Connection closed - no complete request within {IpcReadTimeout.TotalSeconds:0}s.");
         }
         catch (Exception ex) { ServiceLogger.Log($"[IPC] Unix handler error: {ex.Message}"); }
     }
@@ -908,13 +950,24 @@ public class DatabaseLockService : BackgroundService
         }
     }
 
+    // Constant-time comparison for provisioning tokens. These are 256 bits of CSPRNG output and
+    // short-lived, so a practical timing attack is not realistic -- but this is the authoritative
+    // side of the privilege boundary, and comparing secrets with '==' short-circuits on the first
+    // differing byte. Length is not secret (all tokens are the same length).
+    private static bool TokenEquals(string? a, string? b)
+    {
+        if (a is null || b is null) return false;
+        return CryptographicOperations.FixedTimeEquals(
+            Encoding.UTF8.GetBytes(a), Encoding.UTF8.GetBytes(b));
+    }
+
     private static string BurnTotpToken(string token)
     {
         using var lk = AcquireDbLock();
         if (lk == null) return "ERROR: DB lock timeout";
 
         var users = LoadUsers();
-        var user = users.FirstOrDefault(u => u.ProvisioningToken == token);
+        var user = users.FirstOrDefault(u => TokenEquals(u.ProvisioningToken, token));
         if (user == null || user.ProvisioningExpiresUtc == null || DateTime.UtcNow > user.ProvisioningExpiresUtc)
             return "ERROR: Token not found or expired";
 
@@ -935,7 +988,7 @@ public class DatabaseLockService : BackgroundService
         if (lk == null) return "ERROR: DB lock timeout";
 
         var users = LoadUsers();
-        var user = users.FirstOrDefault(u => u.PasskeyProvisioningToken == oldToken);
+        var user = users.FirstOrDefault(u => TokenEquals(u.PasskeyProvisioningToken, oldToken));
         if (user == null || user.PasskeyProvisioningExpiresUtc == null || DateTime.UtcNow > user.PasskeyProvisioningExpiresUtc)
             return "ERROR: Token not found or expired";
         if (user.PasskeyCredentials.Count > 0)
@@ -1004,7 +1057,7 @@ public class DatabaseLockService : BackgroundService
         if (lk == null) return "ERROR: DB lock timeout";
 
         var users = LoadUsers();
-        var user = users.FirstOrDefault(u => u.PasskeyProvisioningToken == provToken);
+        var user = users.FirstOrDefault(u => TokenEquals(u.PasskeyProvisioningToken, provToken));
         if (user == null || user.PasskeyProvisioningExpiresUtc == null || DateTime.UtcNow > user.PasskeyProvisioningExpiresUtc)
             return "ERROR: Provisioning token not found or expired";
         // Authoritative gate: an emailed provisioning token is not registration-ready
