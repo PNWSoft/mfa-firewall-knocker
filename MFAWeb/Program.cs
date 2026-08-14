@@ -1,4 +1,4 @@
-﻿// Copyright (c) 2026 Pacific Northwest Software, Inc.
+// Copyright (c) 2026 Pacific Northwest Software, Inc.
 // This source code is licensed under the MIT license found in the
 // LICENSE file in the root directory of this source tree.
 
@@ -60,6 +60,8 @@ builder.Services.AddRateLimiter(options =>
     });
 });
 builder.Services.AddAntiforgery();
+// Required for systemd units declaring Type=notify -- see the note in MFAService.
+builder.Services.AddSystemd();
 builder.Services.AddWindowsService(options =>
 {
     options.ServiceName = "MFA Firewall Knocker";
@@ -1561,11 +1563,30 @@ public static class IpcFirewallClient
         await socket.ConnectAsync(new UnixDomainSocketEndPoint(UnixSocketPath), cts.Token);
 
         using var stream = new NetworkStream(socket, ownsSocket: false);
-        var writer = new StreamWriter(stream, Encoding.UTF8, leaveOpen: true) { AutoFlush = true };
-        var reader = new StreamReader(stream, Encoding.UTF8, leaveOpen: true);
 
-        await writer.WriteLineAsync(request.AsMemory(), cts.Token);
-        return await reader.ReadLineAsync(cts.Token);
+        // Direct byte I/O, matching SendViaPipeAsync. A StreamWriter over Encoding.UTF8 prepends
+        // a BOM to the first write; the service reads raw bytes, so that BOM ends up inside the
+        // first field and every request fails to parse ("ERROR: Invalid IP address"). The old
+        // StreamReader on the service side used to strip it silently, which hid the problem.
+        byte[] requestBytes = Encoding.UTF8.GetBytes(request + "\n");
+        await stream.WriteAsync(requestBytes, cts.Token);
+        await stream.FlushAsync(cts.Token);
+
+        const int MaxResponseBytes = 1024;
+        var buffer = new List<byte>(256);
+        var singleByte = new byte[1];
+        while (buffer.Count < MaxResponseBytes)
+        {
+            int n = await stream.ReadAsync(singleByte, cts.Token);
+            if (n == 0 || singleByte[0] == (byte)'\n') break;
+            if (singleByte[0] != (byte)'\r') buffer.Add(singleByte[0]);
+        }
+
+        // Tolerate a BOM from an older service build.
+        if (buffer.Count >= 3 && buffer[0] == 0xEF && buffer[1] == 0xBB && buffer[2] == 0xBF)
+            buffer.RemoveRange(0, 3);
+
+        return buffer.Count == 0 ? null : Encoding.UTF8.GetString(buffer.ToArray());
     }
 }
 // Tracks the currently-served TLS certificate's expiry so the post-login page
