@@ -78,7 +78,7 @@ All three components read from their own `appsettings.json`. Copy the
 | `AppUrl` | Full public URL of MFAWeb. Must match the TLS certificate's domain. Used for WebAuthn origin validation — any mismatch will break passkey login. |
 | `SiteName` | Displayed in page titles, the TOTP issuer name, and provisioning emails. |
 | `LogoUrl` | Optional URL of a logo image shown on the login page. Leave empty to use the bundled knocker logo (`wwwroot/knocker.png`). If set to an external URL, that origin is added to the `img-src` CSP directive automatically. |
-| `DpapiEntropy` | **Required.** A deployment-specific value mixed into the DPAPI key derivation on Windows. It prevents other processes on the same machine from reading the database without knowing this value — keep it consistent across all three components. Startup fails if it is missing, under 16 characters, or still the placeholder from `appsettings.example.json` (that placeholder is published in the public repository and protects nothing). On Linux it is unused for encryption (the database is plain JSON) but is still validated at startup. Generate with: `[Convert]::ToBase64String([System.Security.Cryptography.RandomNumberGenerator]::GetBytes(32))` |
+| `DpapiEntropy` | **Required.** A deployment-specific value mixed into the DPAPI key derivation on Windows. It prevents other processes on the same machine from reading the database without knowing this value — keep it consistent across all three components. Startup fails if it is missing, under 16 characters, or still the placeholder from `appsettings.example.json` (that placeholder is published in the public repository and protects nothing). On Linux it is unused for encryption (the database is plain JSON) but is still validated at startup. See [step 3](#3-configure-appsettingsjson-and-restrict-permissions) for how to generate one. |
 | `RateLimitPerWindow` | Maximum requests per IP per 5-minute window across all endpoints. Default: 20. |
 | `AllowedDomains` | Email address domains permitted to use the system. Enforced in both MFAWeb (login form rejects other domains) and MFAAdmin (`add` refuses to provision an account outside these domains). |
 | `UseLettuceEncrypt` | Set to `true` to obtain a TLS certificate automatically from Let's Encrypt. See [TLS Options](#tls-options). |
@@ -178,10 +178,13 @@ Copy the publish outputs to their installation directories, for example:
 In each installation directory, copy `appsettings.example.json` to `appsettings.json`
 and fill in the values. The `DpapiEntropy` value must be identical in all three files.
 
-Generate a strong entropy string with a cryptographic RNG:
+Generate a strong entropy string with a cryptographic RNG (works on both Windows
+PowerShell 5.1 and PowerShell 7):
 
 ```powershell
-[Convert]::ToBase64String([System.Security.Cryptography.RandomNumberGenerator]::GetBytes(32))
+$b = New-Object byte[] 32
+[System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($b)
+[Convert]::ToBase64String($b)
 ```
 
 > The components refuse to start if `DpapiEntropy` is missing, shorter than 16 characters,
@@ -199,26 +202,39 @@ hashes of every user.
 Restrict the data directory and each `appsettings.json` to SYSTEM, Administrators, and the
 gMSA only:
 
+> **Note the single quotes** around every grant that names the gMSA. The account name ends
+> in `$`, and inside a *double*-quoted PowerShell string `$:` is parsed as a variable
+> reference — the command fails to parse. Single quotes keep it literal.
+
 ```powershell
-# Data directory (created here so the ACL exists before MFAAdmin writes users.dat)
-New-Item -ItemType Directory -Force -Path "C:\ProgramData\MFAAuth" | Out-Null
+# Create both directories up front so the ACLs exist before anything writes to them
+New-Item -ItemType Directory -Force -Path "C:\ProgramData\MFAAuth"      | Out-Null
+New-Item -ItemType Directory -Force -Path "C:\ProgramData\MFAAuth\Logs" | Out-Null
 
+# Data directory: MFAService (LocalSystem) is the only writer of users.dat.
+# MFAWeb only ever reads it, so the gMSA gets read access and nothing more.
 icacls "C:\ProgramData\MFAAuth" /inheritance:r `
-    /grant "SYSTEM:(OI)(CI)F" `
-    /grant "Administrators:(OI)(CI)F" `
-    /grant "YOURDOMAIN\MFA_Service$:(OI)(CI)M"
+    /grant 'SYSTEM:(OI)(CI)F' `
+    /grant 'Administrators:(OI)(CI)F' `
+    /grant 'YOURDOMAIN\MFA_Service$:(OI)(CI)R'
 
-# Each appsettings.json holds DpapiEntropy and SMTP credentials
+# MFAWeb writes its own log files, so the gMSA needs Modify on Logs specifically.
+icacls "C:\ProgramData\MFAAuth\Logs" /grant 'YOURDOMAIN\MFA_Service$:(OI)(CI)M'
+
+# Each appsettings.json holds DpapiEntropy and SMTP credentials.
 foreach ($f in @(
     "C:\Services\MFAService\appsettings.json",
     "C:\Services\MFAWeb\appsettings.json",
     "C:\Tools\MFAAdmin\appsettings.json")) {
-    icacls $f /inheritance:r `
-        /grant "SYSTEM:F" `
-        /grant "Administrators:F" `
-        /grant "YOURDOMAIN\MFA_Service$:R"
+    icacls $f /inheritance:r /grant 'SYSTEM:F' /grant 'Administrators:F'
 }
+
+# Only MFAWeb runs as the gMSA, so only its config needs the extra grant.
+icacls "C:\Services\MFAWeb\appsettings.json" /grant 'YOURDOMAIN\MFA_Service$:R'
 ```
+
+> If you enable LettuceEncrypt, also grant the gMSA Modify on its `CertificateDirectory`
+> (`C:\ProgramData\MFAAuth\Certs` by default) — it writes renewed certificates there.
 
 Verify that `Users` and `Authenticated Users` are absent from the result:
 
@@ -234,17 +250,22 @@ icacls "C:\Services\MFAWeb\appsettings.json"
 
 ### 4. Install MFAService as a Windows Service
 
+MFAService runs as **LocalSystem** — do not give it the gMSA. It needs local administrative
+rights to run `New-NetFirewallRule`/`Remove-NetFirewallRule`, and the named-pipe ACL depends
+on the server (SYSTEM) and the client (the gMSA) being *different* identities. `New-Service`
+defaults to LocalSystem, so simply omit `-Credential`:
+
 ```powershell
 New-Service `
     -Name "MFAFirewallService" `
     -BinaryPathName "C:\Services\MFAService\MFAService.exe" `
     -DisplayName "MFA Firewall Service" `
-    -StartupType Automatic `
-    -Credential "YOURDOMAIN\MFA_Service$"
-
-# Grant the gMSA the "Log on as a service" right
-# (easiest via Local Security Policy → User Rights Assignment)
+    -StartupType Automatic
 ```
+
+> If firewall rules fail to open, **do not** "fix" it by adding the gMSA to local
+> Administrators — that collapses the privilege boundary this design exists to create.
+> Check that MFAService is running as LocalSystem instead.
 
 ### 5. Install MFAWeb as a Windows Service
 
@@ -313,6 +334,16 @@ Start-Service MFAWebService
 ```
 
 Check the logs at `C:\ProgramData\MFAAuth\Logs\` to verify startup.
+
+> If a service fails to start and writes **no** log file, the failure happened during
+> configuration validation, before file logging was available. Look in the Windows
+> **Application** event log instead — a missing, too-short, or still-placeholder
+> `DpapiEntropy` is reported there:
+>
+> ```powershell
+> Get-EventLog -LogName Application -Newest 20 -EntryType Error |
+>     Where-Object { $_.Message -match 'MFA' } | Format-List TimeGenerated, Message
+> ```
 
 ---
 
