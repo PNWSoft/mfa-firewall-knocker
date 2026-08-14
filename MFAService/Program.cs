@@ -150,7 +150,7 @@ public class FirewallWorkerService : BackgroundService
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            ServiceLogger.Log($"[WORKER] Fatal error — service stopping: {ex}");
+            ServiceLogger.Log($"[WORKER] Fatal error - service stopping: {ex}");
             throw;
         }
         ServiceLogger.Log("[WORKER] Firewall Worker Service stopped.");
@@ -283,7 +283,7 @@ public class FirewallWorkerService : BackgroundService
                 }
                 if (buffer.Count >= MaxRequestBytes)
                 {
-                    ServiceLogger.Log("[IPC] Request exceeded maximum size — rejected.");
+                    ServiceLogger.Log("[IPC] Request exceeded maximum size - rejected.");
                     byte[] rejection = Encoding.UTF8.GetBytes("ERROR: Request too large\n");
                     await pipe.WriteAsync(rejection, ct);
                     await pipe.FlushAsync(ct);
@@ -994,7 +994,7 @@ public class DatabaseLockService : BackgroundService
         catch (AbandonedMutexException)
         {
             // A prior process crashed while holding the lock; Windows transferred ownership to us.
-            ServiceLogger.Warn("[DB LOCK] Mutex was abandoned by a prior process — ownership transferred, proceeding.");
+            ServiceLogger.Warn("[DB LOCK] Mutex was abandoned by a prior process - ownership transferred, proceeding.");
         }
         return new DbLock(_dbMutex);
     }
@@ -1128,7 +1128,7 @@ public class CertificateMonitorService : BackgroundService
         var notify = _config["Smtp:NotifyAddress"];
         if (string.IsNullOrWhiteSpace(host) || string.IsNullOrWhiteSpace(from) || string.IsNullOrWhiteSpace(notify))
         {
-            ServiceLogger.Warn("[CERT] Smtp Host/FromAddress/NotifyAddress not fully configured — cannot send certificate alert.");
+            ServiceLogger.Warn("[CERT] Smtp Host/FromAddress/NotifyAddress not fully configured - cannot send certificate alert.");
             return false;
         }
 

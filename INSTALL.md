@@ -59,6 +59,7 @@ All three components read from their own `appsettings.json`. Copy the
   "SiteName":          "My Organization Secure Access",
   "LogoUrl":           "",
   "DpapiEntropy":      "REPLACE-WITH-A-UNIQUE-RANDOM-STRING",
+  "RequirePasskey":    true,
   "RateLimitPerWindow": 20,
   "AllowedDomains":    [ "your-domain.com" ],
   "UseLettuceEncrypt": false,
@@ -80,6 +81,7 @@ All three components read from their own `appsettings.json`. Copy the
 | `LogoUrl` | Optional URL of a logo image shown on the login page. Leave empty to use the bundled knocker logo (`wwwroot/knocker.png`). If set to an external URL, that origin is added to the `img-src` CSP directive automatically. |
 | `DpapiEntropy` | **Required.** A deployment-specific value mixed into the DPAPI key derivation on Windows. It prevents other processes on the same machine from reading the database without knowing this value — keep it consistent across all three components. Startup fails if it is missing, under 16 characters, or still the placeholder from `appsettings.example.json` (that placeholder is published in the public repository and protects nothing). On Linux it is unused for encryption (the database is plain JSON) but is still validated at startup. See [step 3](#3-configure-appsettingsjson-and-restrict-permissions) for how to generate one. |
 | `RateLimitPerWindow` | Maximum requests per IP per 5-minute window across all endpoints. Default: 20. |
+| `RequirePasskey` | **Default `true`.** Passkey-only mode. When true, the password + authenticator login endpoint (`/auth`) and the TOTP enrollment pages (`/setup`) return 403 regardless of credentials, and no TOTP secret is ever stored. **Must be set identically in MFAAdmin's `appsettings.json`.** Set to `false` only if some users have no platform authenticator (no Windows Hello / Touch ID / Face ID), since passkey registration fails on those machines. |
 | `AllowedDomains` | Email address domains permitted to use the system. Enforced in both MFAWeb (login form rejects other domains) and MFAAdmin (`add` refuses to provision an account outside these domains). |
 | `UseLettuceEncrypt` | Set to `true` to obtain a TLS certificate automatically from Let's Encrypt. See [TLS Options](#tls-options). |
 | `FirewallService:GmsaAccount` | The gMSA account name that MFAWeb runs as (Windows only). Used to set the named pipe ACL so only that account can send IPC requests. |
@@ -114,6 +116,7 @@ All three components read from their own `appsettings.json`. Copy the
   "AllowedDomains": [ "your-domain.com" ],
   "SiteName":       "My Organization",
   "DpapiEntropy":   "REPLACE-WITH-A-UNIQUE-RANDOM-STRING",
+  "RequirePasskey": true,
   "BouncerUrl":     "https://your.domain.com:8443",
   "RulePrefix":     "MFA_Temp_",
   "FirewallService": {
@@ -129,6 +132,7 @@ All three components read from their own `appsettings.json`. Copy the
 
 | Key | Description |
 |-----|-------------|
+| `RequirePasskey` | **Default `true`.** Must match MFAWeb's value. When true, `add` and `reprovision` mint no TOTP secret and the provisioning email omits the authenticator-app link. |
 | `BouncerUrl` | Base URL of MFAWeb. Used to generate the provisioning links sent in welcome emails. |
 | `RulePrefix` | Must match `BouncerConfig:RulePrefix` in MFAService. Used by `diag` and `reset` commands. |
 
@@ -597,23 +601,48 @@ MFAAdmin diag                  Show active firewall rules and user database info
 MFAAdmin reset                 Remove all MFA-managed firewall rules
 MFAAdmin export <file.json>    Export user database to a JSON file (unencrypted)
 MFAAdmin import <file.json>    Import users from a previously exported file
+MFAAdmin purge-totp            Clear stored TOTP secrets (see Passkey-Only Mode below)
 ```
+
+### Passkey-Only Mode
+
+`RequirePasskey` defaults to `true` and must be set identically in **MFAWeb's and MFAAdmin's**
+`appsettings.json`. With it enabled, `add` and `reprovision` mint no TOTP secret and the
+provisioning email contains only the passkey link.
+
+If you switch an existing deployment from TOTP to passkey-only, enabling the flag stops new
+secrets being minted but does **not** remove secrets already in `users.dat`. Run:
+
+```
+MFAAdmin purge-totp
+```
+
+This clears the stored secret for every account that has a passkey enrolled. It deliberately
+**skips accounts with no passkey** — clearing those would leave the user unable to authenticate
+at all — and prints the list so you can have them enroll a passkey, or `reprovision` them, and
+then re-run it.
 
 ### New User Workflow
 
 1. Run `MFAAdmin add user@your-domain.com`
-2. The user receives an email with two links:
-   - **Passkey setup** (recommended) — registers a FIDO2 passkey on their device
-   - **Authenticator app setup** — scans a QR code for TOTP
+2. The user receives an email with a **Passkey setup** link. If `RequirePasskey` is `false`,
+   the email also contains an **Authenticator app setup** link for TOTP.
 
 > **Passkey registration requires a built-in authenticator with biometric or PIN unlock.**
 > The WebAuthn options specify `AuthenticatorAttachment = Platform` and
 > `UserVerification = Required`, so Windows Hello, Touch ID / Face ID, and Android biometric
 > work, while **roaming security keys such as YubiKeys are rejected**. The credential is
 > non-discoverable (`RequireResidentKey = false`), so users type their email address before
-> authenticating, and the passkey is bound to the single device it was created on — a user
-> who works from two machines needs a passkey registered on each. A user whose machine has
-> no platform authenticator can only use TOTP. To allow security keys, change
+> authenticating.
+>
+> Apple passkeys sync via iCloud Keychain and Google's via Google Password Manager, so the
+> credential follows the user across devices in the same ecosystem; Windows Hello passkeys
+> have historically been device-bound. Plan recovery around the pessimistic case —
+> `MFAAdmin reprovision <email>`.
+>
+> **A machine with no platform authenticator cannot register a passkey at all**, and with the
+> default `RequirePasskey: true` that user has no way in. Set `RequirePasskey` to `false` in
+> both MFAWeb's and MFAAdmin's config to allow TOTP. To allow security keys instead, change
 > `AuthenticatorAttachment` to `CrossPlatform` (or remove it to permit both) in
 > `MFAWeb/Program.cs`, keeping `UserVerification = Required`.
 3. Links expire after **60 minutes**. Use `MFAAdmin reprovision` to resend.

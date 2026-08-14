@@ -9,9 +9,11 @@ An MFA gate that opens firewall ports on demand after strong auth.
 - **MFAWeb** — internet-facing ASP.NET Core minimal API (runs as a gMSA on Windows, a dedicated
   unprivileged user on Linux). WebAuthn/passkey + TOTP login. Read-only to the user database;
   all writes go out over IPC. Serves HTTPS on `:8443` by default.
-- **MFAService** — privileged service (LocalSystem on Windows, root on Linux). Sole writer of
-  `users.dat`; opens/sweeps firewall rules; hosts the IPC server. Also the always-on watchdog for
-  infrastructure concerns (cert expiry alerts).
+- **MFAService** — privileged service (LocalSystem on Windows, root on Linux). The only writer of
+  `users.dat` **on the request path**; opens/sweeps firewall rules; hosts the IPC server. Also the
+  always-on watchdog for infrastructure concerns (cert expiry alerts). (MFAAdmin also writes the
+  DB directly when an administrator runs it, under the same mutex — the invariant that matters is
+  that **MFAWeb never writes**, not that MFAService is the only writer in the whole system.)
 - **MFAAdmin** — elevated console tool for provisioning users.
 
 Data flow: `MFAWeb → named pipe (Windows) / Unix socket (Linux) → MFAService`. IPC protocol:
@@ -80,7 +82,8 @@ challenge needs port 80 and it stores certs in a directory rather than the Windo
 
 ## Config keys
 
-- **MFAWeb:** `AppUrl`, `SiteName`, `LogoUrl`, `DpapiEntropy` (required), `RateLimitPerWindow`,
+- **MFAWeb:** `AppUrl`, `SiteName`, `LogoUrl`, `DpapiEntropy` (required), `RequirePasskey`
+  (default **true**), `RateLimitPerWindow`,
   `AllowedDomains`, `Kestrel:Endpoints:Https:Url`, `HttpsCert:{Subject,Store,Location}`,
   `CertAlert:WarnDays`, `AccountAlert:{Threshold,WindowMinutes,SendEmail}`, `Smtp:*` (for account
   alerts), `UseLettuceEncrypt` (+ `LettuceEncrypt:*` when true).
@@ -88,8 +91,8 @@ challenge needs port 80 and it stores certs in a directory rather than the Windo
   `FirewallService:GmsaAccount`, `HttpsCert:{Subject,Store,Location}` (must match MFAWeb),
   `CertAlert:{WarnDays,CheckIntervalHours}`,
   `Smtp:{Host,Port,UseSsl,Username,Password,FromAddress,NotifyAddress}`.
-- **MFAAdmin:** `DpapiEntropy` (required), `SiteName`, `RulePrefix`, `BouncerUrl`, `AllowedDomains`,
-  `FirewallService:GmsaAccount`, `Smtp:*`.
+- **MFAAdmin:** `DpapiEntropy` (required), `RequirePasskey` (default **true**, must match MFAWeb),
+  `SiteName`, `RulePrefix`, `BouncerUrl`, `AllowedDomains`, `FirewallService:GmsaAccount`, `Smtp:*`.
 
 ## Security invariants (do not regress)
 
@@ -103,6 +106,11 @@ challenge needs port 80 and it stores certs in a directory rather than the Windo
   `PasskeyProvisioningToken` without this flag — that reintroduces the emailed-link bypass. The
   field lives in all three `UserEntry` classes and must stay in sync (shared `users.dat` schema →
   deploy all three together).
+- **`RequirePasskey` is enforced at the endpoint, not in the UI.** It defaults to **true**. When
+  on, `/auth`, `/setup/{token}`, and `/setup` return 403/deny *before* validating anything —
+  hiding the TOTP form on the login page is cosmetic and anyone can POST directly. MFAAdmin reads
+  the same key and mints no TOTP secret, so `users.dat` holds no recoverable shared secret. The
+  key must be identical in MFAWeb and MFAAdmin. Never "simplify" this to a UI-only toggle.
 - **The privilege boundary re-validates, it does not trust MFAWeb.** MFAService independently
   re-checks `IsPublicIpAddress` before opening a firewall rule and strictly validates every IPC
   request. Keep policy checks (public-IP-only, input validation) on the privileged side even though

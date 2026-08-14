@@ -125,7 +125,12 @@ function handleTotpSubmit(e) {
 
 document.addEventListener('DOMContentLoaded', function () {
     document.getElementById('passkeyBtn').addEventListener('click', signInWithPasskey);
-    document.getElementById('toggleTotpBtn').addEventListener('click', toggleTotp);
+
+    // Absent when the server runs passkey-only (RequirePasskey), so guard it.
+    const toggleBtn = document.getElementById('toggleTotpBtn');
+    if (toggleBtn) {
+        toggleBtn.addEventListener('click', toggleTotp);
+    }
 
     const authForm = document.getElementById('authForm');
     if (authForm) {
