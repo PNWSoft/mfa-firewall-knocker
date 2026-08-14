@@ -19,7 +19,6 @@
 
   <ItemGroup>
     <PackageReference Include="BCrypt.Net-Next" Version="4.1.0" />
-    <PackageReference Include="LettuceEncrypt" Version="1.3.3" />
     <PackageReference Include="Fido2" Version="3.0.1" />
     <!-- These two are NOT used directly by our code. They are deliberate transitive version
          overrides. Fido2 3.0.1 resolves Microsoft.IdentityModel.* to 6.17.0, which carries

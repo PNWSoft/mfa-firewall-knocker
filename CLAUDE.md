@@ -7,7 +7,8 @@ Guidance for working in this repository.
 An MFA gate that opens firewall ports on demand after strong auth.
 
 - **MFAWeb** — internet-facing ASP.NET Core minimal API (runs as a gMSA on Windows, a dedicated
-  unprivileged user on Linux). WebAuthn/passkey + TOTP login. Read-only to the user database;
+  unprivileged user on Linux). WebAuthn/passkey login; TOTP only in an `AllowTotp` build.
+  Read-only to the user database;
   all writes go out over IPC. Serves HTTPS on `:8443` by default.
 - **MFAService** — privileged service (LocalSystem on Windows, root on Linux). The only writer of
   `users.dat` **on the request path**; opens/sweeps firewall rules; hosts the IPC server. Also the
@@ -33,27 +34,30 @@ Firewall backends: PowerShell `NetSecurity` on Windows, `iptables` on Linux. If 
     **framework-dependent** single-file; MFAWeb's is a self-contained multi-file folder. For
     deployment, INSTALL.md passes `-r win-x64 --self-contained` explicitly rather than relying
     on the profiles, which is why the MFAAdmin profile's `SelfContained=false` doesn't bite.
-- **Incremental deploys:** copying only `MFAWeb.dll` is not enough when dependencies change (e.g.
-  the LettuceEncrypt chain: `LettuceEncrypt.dll`, `Certes.dll`, `BouncyCastle.Crypto.dll`,
-  `McMaster.AspNetCore.Kestrel.Certificates.dll`, plus `MFAWeb.deps.json`). Copy the whole publish
-  directory but exclude `appsettings.json` so the DLL set + `deps.json` stay consistent and server
+- **Incremental deploys:** copying only `MFAWeb.dll` is not enough when the dependency set
+  changes — `MFAWeb.deps.json` must stay consistent with the DLLs beside it. Copy the whole
+  publish directory but exclude `appsettings.json` so the DLL set + `deps.json` stay consistent and server
   config isn't clobbered — e.g. `robocopy <publish> <dest> /E /XF appsettings.json`.
 - `appsettings.json` for all three is **gitignored** — it holds secrets (`DpapiEntropy`, SMTP
   credentials). `appsettings.example.json` are the templates; copy and fill them in per deployment.
 - All three share the `users.dat` schema, so **deploy all three together** when `UserEntry` changes.
 
-## TLS certificate handling (store-cert path, `UseLettuceEncrypt=false`)
+## TLS certificate handling
 
-This is the primary path. LettuceEncrypt is wired in as an optional alternative, but its HTTP-01
-challenge needs port 80 and it stores certs in a directory rather than the Windows store.
+MFAWeb is HTTPS-only and binds no cleartext listener. Certificates come from an external ACME
+client: the Windows store (win-acme) on Windows, PEM files from certbot on Linux. There is
+deliberately no in-process ACME client — see the note at the top of the TLS block in
+`MFAWeb/Program.cs` for why the LettuceEncrypt integration was removed.
 
-### MFAWeb — resilient selection + banner
-- Kestrel's HTTPS endpoint in `appsettings.json` declares only the **URL**
-  (`Kestrel:Endpoints:Https:Url`). The certificate is chosen in code, **not** bound by subject in
-  config.
-  - Rationale: a `Kestrel:...:Certificate` subject binding does a CN-only `FindBySubjectName` with
-    `AllowInvalid:false`, which **crashes Kestrel at startup** the moment the cert expires or when
-    the CA issues an empty-CN / SAN-only replacement.
+### MFAWeb — resilient selection + banner (Windows)
+- On Windows the HTTPS endpoint declares only the **URL** (`Kestrel:Endpoints:Https:Url`) and the
+  certificate is chosen in code from the store. Never add a `Kestrel:...:Certificate:Subject`
+  binding: it does a CN-only `FindBySubjectName` with `AllowInvalid:false` and **crashes Kestrel
+  at startup** the moment the cert expires or the CA issues an empty-CN / SAN-only replacement.
+  - This is about the *Subject* binding specifically. On **Linux** the certificate legitimately
+    comes from `Kestrel:...:Certificate:{Path,KeyPath}` (PEM), and the store-scanning selector is
+    **not** installed there — see the platform guard in `Program.cs`. Installing it on Linux
+    silently overrode the configured PEM with nothing and broke TLS entirely.
 - `SelectBestCertificate(hostname, store, location)` scans `LocalMachine\My`, matches the hostname
   against **CN *and* SAN** (`X509Certificate2.MatchesHostname`), keeps only currently-valid certs
   with a private key, and picks the **newest expiry**.
@@ -74,8 +78,10 @@ challenge needs port 80 and it stores certs in a directory rather than the Windo
   HTTPS. Uses BCL `System.Net.Mail`, so no MailKit dependency is pulled into MFAWeb/MFAService.
 
 ### Renewal notes
-- Any ACME client that installs into `LocalMachine\My` works. If port 80 is unavailable on the host,
-  **TLS-ALPN-01 on port 443** or **DNS-01** are the workable challenge types; HTTP-01 is not.
+- **Windows:** any ACME client that installs into `LocalMachine\My` works. HTTP-01 needs port 80
+  free on the host; where it isn't, **TLS-ALPN-01 on 443** or **DNS-01** are the alternatives.
+- **Linux:** certbot `--standalone` works because MFAWeb never binds port 80. Kestrel loads the
+  PEM at startup, so renewal needs a deploy hook that restarts MFAWeb (see INSTALL.md).
 - **The service account must have read access to the certificate's private key**, or the cert
   selects fine but the TLS handshake fails (SChannel can't open the key → the client sees an EOF).
   Grant it on every renewal — most ACME clients have a flag for this (win-acme:
@@ -87,7 +93,7 @@ challenge needs port 80 and it stores certs in a directory rather than the Windo
 - **MFAWeb:** `AppUrl`, `SiteName`, `LogoUrl`, `DpapiEntropy` (required), `RateLimitPerWindow`,
   `AllowedDomains`, `Kestrel:Endpoints:Https:Url`, `HttpsCert:{Subject,Store,Location}`,
   `CertAlert:WarnDays`, `AccountAlert:{Threshold,WindowMinutes,SendEmail}`, `Smtp:*` (for account
-  alerts), `UseLettuceEncrypt` (+ `LettuceEncrypt:*` when true).
+  alerts). Linux additionally uses `Kestrel:Endpoints:Https:Certificate:{Path,KeyPath}`.
 - **MFAService:** `DpapiEntropy` (required), `BouncerConfig:{AllowedPorts,ExpirationHours,RulePrefix}`,
   `FirewallService:GmsaAccount`, `HttpsCert:{Subject,Store,Location}` (must match MFAWeb),
   `CertAlert:{WarnDays,CheckIntervalHours}`,
@@ -136,7 +142,6 @@ challenge needs port 80 and it stores certs in a directory rather than the Windo
 - MFAWeb intentionally ignores `X-Forwarded-For`; it uses the TCP connection address (rate limiting,
   IP checks). Do not put a reverse proxy in front of it.
 - `HttpsCert:Subject`/`Store`/`Location` must be identical in MFAWeb and MFAService.
-- LettuceEncrypt is pinned at **1.3.3** (1.3.4 does not exist on NuGet).
 - **IPC uses raw byte I/O on both transports — never `StreamWriter`/`StreamReader`.** A
   `StreamWriter` over `Encoding.UTF8` prepends a BOM to its first write, and both IPC readers
   parse raw bytes, so the BOM lands inside the first field and every request fails with

@@ -61,7 +61,6 @@ All three components read from their own `appsettings.json`. Copy the
   "DpapiEntropy":      "REPLACE-WITH-A-UNIQUE-RANDOM-STRING",
   "RateLimitPerWindow": 20,
   "AllowedDomains":    [ "your-domain.com" ],
-  "UseLettuceEncrypt": false,
   "FirewallService": {
     "GmsaAccount": "YOURDOMAIN\\MFA_Service$"
   },
@@ -81,7 +80,6 @@ All three components read from their own `appsettings.json`. Copy the
 | `DpapiEntropy` | **Required.** A deployment-specific value mixed into the DPAPI key derivation on Windows. It prevents other processes on the same machine from reading the database without knowing this value — keep it consistent across all three components. Startup fails if it is missing, under 16 characters, or still the placeholder from `appsettings.example.json` (that placeholder is published in the public repository and protects nothing). On Linux it is unused for encryption (the database is plain JSON) but is still validated at startup. See [step 3](#3-configure-appsettingsjson-and-restrict-permissions) for how to generate one. |
 | `RateLimitPerWindow` | Maximum requests per IP per 5-minute window across all endpoints. Default: 20. |
 | `AllowedDomains` | Email address domains permitted to use the system. Enforced in both MFAWeb (login form rejects other domains) and MFAAdmin (`add` refuses to provision an account outside these domains). |
-| `UseLettuceEncrypt` | Set to `true` to obtain a TLS certificate automatically from Let's Encrypt. See [TLS Options](#tls-options). |
 | `FirewallService:GmsaAccount` | The gMSA account name that MFAWeb runs as (Windows only). Used to set the named pipe ACL so only that account can send IPC requests. |
 
 ### MFAService — `appsettings.json`
@@ -233,8 +231,6 @@ foreach ($f in @(
 icacls "C:\Services\MFAWeb\appsettings.json" /grant 'YOURDOMAIN\MFA_Service$:R'
 ```
 
-> If you enable LettuceEncrypt, also grant the gMSA Modify on its `CertificateDirectory`
-> (`C:\ProgramData\MFAAuth\Certs` by default) — it writes renewed certificates there.
 
 Verify that `Users` and `Authenticated Users` are absent from the result:
 
@@ -538,13 +534,38 @@ iptables -S INPUT | grep MFA_Temp
 
 ## TLS Options
 
-### Option A: Manual Certificate (Windows cert store or PEM file)
+MFAWeb serves **HTTPS only** and never binds a cleartext listener. Certificates are obtained by
+a dedicated ACME client, not by MFAWeb itself — the internet-facing service is deliberately not
+also an ACME client.
 
-**Windows:** Import to `LocalMachine\My` and set `HttpsCert:Subject` in `appsettings.json`
-(see Step 6 of Windows installation above). Leave the `Https` endpoint declaring only its
-`Url` — the certificate is chosen in code, not bound by Kestrel config.
+### Windows — certificate from the Windows store
 
-**Linux:** Provide a PEM certificate and key, then configure Kestrel in `appsettings.json`:
+Install into `LocalMachine\My` (win-acme, Certify, or an internal CA) and set
+`HttpsCert:{Subject,Store,Location}`. Do **not** add a `Kestrel:...:Certificate` block.
+
+MFAWeb selects the certificate at runtime: it matches the hostname against CN **and** SAN, keeps
+only currently-valid certificates with a private key, picks the newest expiry, and re-checks once
+a minute. A renewal is picked up **without a restart**, and an expired certificate degrades to a
+post-login warning banner rather than crashing Kestrel at startup.
+
+> **The service account needs read access to the private key.** Otherwise the certificate selects
+> correctly and the TLS handshake still fails — SChannel cannot open the key and the client sees
+> an EOF. Re-apply on every renewal; win-acme does this with `--acl-read "DOMAIN\MFA_Service$"`.
+
+### Linux — PEM files from certbot
+
+The Windows certificate store does not exist on Linux, so `HttpsCert` is ignored there and the
+certificate comes from Kestrel configuration.
+
+```bash
+sudo apt-get install -y certbot
+
+# MFAWeb does not listen on :80, so certbot --standalone can use it for the HTTP-01 challenge.
+# Port 80 must be open in the firewall and reachable from the internet.
+sudo certbot certonly --standalone --non-interactive --agree-tos     -m admin@your-domain.com -d your.domain.com
+```
+
+Point Kestrel at the result in MFAWeb's `appsettings.json`:
 
 ```json
 "Kestrel": {
@@ -552,42 +573,44 @@ iptables -S INPUT | grep MFA_Temp
     "Https": {
       "Url": "https://*:8443",
       "Certificate": {
-        "Path": "/etc/ssl/certs/your-cert.pem",
-        "KeyPath": "/etc/ssl/private/your-cert.key"
+        "Path":    "/etc/letsencrypt/live/your.domain.com/fullchain.pem",
+        "KeyPath": "/etc/letsencrypt/live/your.domain.com/privkey.pem"
       }
     }
   }
 }
 ```
 
-### Option B: Let's Encrypt (LettuceEncrypt)
+MFAWeb runs unprivileged, so it needs read access to the key. Grant it via the shared group:
 
-Automatic certificate provisioning using the ACME HTTP-01 challenge. Requires:
-- Port **80** reachable from the internet (for the ACME challenge)
-- Port **443** for HTTPS (Let's Encrypt will not issue certs for non-standard ports)
-
-Set `AppUrl` to `https://your.domain.com` (port 443) and update `appsettings.json`:
-
-```json
-"Kestrel": {
-  "Endpoints": {
-    "Https": { "Url": "https://*:443" }
-  }
-},
-"UseLettuceEncrypt": true,
-"LettuceEncrypt": {
-  "AcceptTermsOfService": true,
-  "DomainNames": [ "your.domain.com" ],
-  "EmailAddress": "admin@your-domain.com",
-  "UseStagingServer": true,
-  "CertificateDirectory": "C:\\ProgramData\\MFAAuth\\Certs"
-}
+```bash
+sudo chgrp -R mfaipc /etc/letsencrypt/live /etc/letsencrypt/archive
+sudo chmod -R g+rX  /etc/letsencrypt/live /etc/letsencrypt/archive
+sudo -u mfaweb test -r /etc/letsencrypt/live/your.domain.com/privkey.pem && echo OK
 ```
 
-> Set `UseStagingServer: true` on first deployment to verify everything works without
-> consuming Let's Encrypt production rate limits. Switch to `false` once confirmed.
+**Kestrel loads the PEM at startup**, so unlike the Windows path a renewal does *not* take effect
+on its own. Add a certbot deploy hook:
 
-Certificates are stored in `CertificateDirectory` and renewed automatically.
+```bash
+sudo tee /etc/letsencrypt/renewal-hooks/deploy/10-restart-mfaweb.sh >/dev/null <<'HOOK'
+#!/bin/sh
+chgrp -R mfaipc /etc/letsencrypt/live /etc/letsencrypt/archive 2>/dev/null || true
+chmod -R g+rX  /etc/letsencrypt/live /etc/letsencrypt/archive 2>/dev/null || true
+systemctl restart mfaweb.service
+HOOK
+sudo chmod +x /etc/letsencrypt/renewal-hooks/deploy/10-restart-mfaweb.sh
+```
+
+Verify from outside the network — `ssl_verify_result` must be `0`:
+
+```bash
+curl -s -o /dev/null -w "%{http_code} verify=%{ssl_verify_result}
+" https://your.domain.com:8443/
+```
+
+> **Port 80 and cleartext.** MFAWeb never serves anything on port 80. Keep 80 open in the
+> firewall only so certbot can bind it briefly during renewal; nothing else listens there.
 
 ---
 
