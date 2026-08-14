@@ -8,10 +8,33 @@
 
 Exposing SSH, RDP, or any admin port to the internet means exposing it to everyone. Closing it means
 you can't reach it either. This is the middle path: the port stays **closed by default**, and a
-user who proves who they are with a passkey or TOTP code gets a firewall rule opened **for their
+user who proves who they are with a passkey gets a firewall rule opened **for their
 source IP only**, which **expires automatically**.
 
 It's port knocking, except the knock is WebAuthn instead of a magic packet sequence.
+
+## Why this exists
+
+SSH and WireGuard both authenticate a *key*. Neither has any way to express the questions an
+organisation actually needs answered:
+
+> Should this key still be trusted? Is it still on the device we issued it to? Who used it,
+> from where, and when? How do I take it back from one person without disrupting everyone else?
+
+Those questions have no representation in either protocol — possession of the key **is** the
+authorisation, indefinitely. It's why a copied WireGuard profile or a leaked `id_ed25519` is
+such a bad day, and why trying to detect misuse after the fact tends to be guesswork.
+
+The usual answer is to put a **control plane** in front: something that ties access to a real
+identity, forces re-authentication, and can revoke. The mature options are largely proprietary
+SaaS, and handing a third party the keys to your network is its own decision to make.
+
+This is a small, self-hosted, open-source control plane for infrastructure you already run.
+Access stops being a standing grant and becomes a short-lived, per-IP, automatically-expiring
+firewall rule that exists only because someone just proved who they were with a
+phishing-resistant credential — and every grant is logged. It sits *in front of* SSH,
+WireGuard, RDP, or anything else guarded by a port, without replacing them or asking you to
+migrate anything.
 
 ## How it works
 
@@ -143,13 +166,19 @@ cd mfa-firewall-knocker
 cp MFAWeb/appsettings.example.json     MFAWeb/appsettings.json
 cp MFAService/appsettings.example.json MFAService/appsettings.json
 cp MFAAdmin/appsettings.example.json   MFAAdmin/appsettings.json
-# ...then edit each one: AppUrl, AllowedDomains, DpapiEntropy, Smtp, HttpsCert
+# ...then edit each one. At minimum: AppUrl, AllowedDomains, HttpsCert, Smtp, and a
+# DpapiEntropy that is IDENTICAL in all three (startup refuses the placeholder value).
 
-dotnet build MFAWeb/MFAWeb.csproj -c Release
-dotnet publish MFAService/MFAService.csproj -c Release -p:PublishProfile=FolderProfile
+# Build all three
+dotnet build MFA.slnx -c Release
+
+# Or publish for deployment (Windows, self-contained)
+dotnet publish MFAWeb/MFAWeb.csproj         -c Release -r win-x64 --self-contained
+dotnet publish MFAService/MFAService.csproj -c Release -r win-x64 --self-contained
+dotnet publish MFAAdmin/MFAAdmin.csproj     -c Release -r win-x64 --self-contained
 ```
 
-Then add your first user:
+Then add your first user, running MFAAdmin elevated (Administrator on Windows, root on Linux):
 
 ```
 MFAAdmin add you@your-domain.com
@@ -196,8 +225,9 @@ A few that are easy to get wrong:
 - This software is provided as-is under the MIT license, with no warranty. It manipulates firewall
   rules on a privileged host. **Review the code and test in a non-production environment first.**
 
-If you find a security issue, please open an issue describing the impact without a working exploit,
-or contact the maintainer privately.
+Please report security issues privately — see [SECURITY.md](SECURITY.md), which also lists what
+is explicitly **out of scope** (no account lockout, username enumeration, and the trust boundary
+around a compromised MFAWeb are deliberate design decisions) and the current **known issues**.
 
 ## Contributing
 

@@ -19,9 +19,10 @@ using System.Security.AccessControl;
 using System.Security.Cryptography;
 using System.Security.Principal;
 using System.Text;
+using System.Globalization;
 using System.Reflection;
 using System.Text.Json;
-using static Org.BouncyCastle.Math.EC.ECCurve;
+using System.Text.RegularExpressions;
 
 namespace MFAAdmin
 {
@@ -837,19 +838,64 @@ namespace MFAAdmin
 
         static void SaveUsers(List<UserEntry> users)
         {
+            // Clear ReadOnly here rather than relying on every caller to call UnlockDatabase()
+            // first -- DeleteUser did not, and MFAService re-applies ReadOnly after each of its
+            // writes, so that path failed against a live database. File.Replace throws on a
+            // ReadOnly destination, so this is now a hard requirement, not a nicety.
+            UnlockDatabase();
+
             string json = JsonSerializer.Serialize(users, new JsonSerializerOptions { WriteIndented = true });
 
-            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+            // Windows: DPAPI machine key. Linux: plain text (admin tool runs as root).
+            byte[] payload = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
+                ? ProtectedData.Protect(Encoding.UTF8.GetBytes(json), Entropy, DataProtectionScope.LocalMachine)
+                : Encoding.UTF8.GetBytes(json);
+
+            // Temp file + flush + atomic swap, matching MFAService.SaveUsers. Writing over the
+            // live file means a crash mid-write leaves users.dat truncated, LoadUsers then fails
+            // to decrypt and returns an empty list, and every user is locked out with nothing on
+            // disk to recover from. File.Replace keeps the prior contents as .bak.
+            string tempPath   = DbPath + ".tmp";
+            string backupPath = DbPath + ".bak";
+
+            try
             {
-                // Windows: Encrypt using DPAPI Machine Key
-                byte[] jsonBytes = Encoding.UTF8.GetBytes(json);
-                byte[] encryptedBytes = ProtectedData.Protect(jsonBytes, Entropy, DataProtectionScope.LocalMachine);
-                File.WriteAllBytes(DbPath, encryptedBytes);
+                using (var fs = new FileStream(tempPath, FileMode.Create, FileAccess.Write, FileShare.None))
+                {
+                    fs.Write(payload, 0, payload.Length);
+                    fs.Flush(flushToDisk: true);
+                }
+
+                // Tighten before the swap so users.dat never exists with a permissive umask mode.
+                if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                    File.SetUnixFileMode(tempPath, UnixFileMode.UserRead | UnixFileMode.UserWrite |
+                                                   UnixFileMode.GroupRead);   // 640
+
+                if (File.Exists(DbPath))
+                {
+                    File.Replace(tempPath, DbPath, backupPath, ignoreMetadataErrors: true);
+                    if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                        File.SetUnixFileMode(backupPath, UnixFileMode.UserRead | UnixFileMode.UserWrite |
+                                                         UnixFileMode.GroupRead);   // 640
+                }
+                else
+                {
+                    File.Move(tempPath, DbPath);
+                }
             }
-            else
+            finally
             {
-                // Linux: Plain text (Requires sudo to execute the Admin Tool)
-                File.WriteAllText(DbPath, json);
+                // A failed write leaves users.dat.tmp holding a full copy of the database.
+                // Remove it rather than leaving credential material lying around.
+                try
+                {
+                    if (File.Exists(tempPath)) File.Delete(tempPath);
+                }
+                catch (Exception ex)
+                {
+                    // Never let cleanup mask the original exception.
+                    AdminLogger.Warn($"[WARN] Could not remove {tempPath}: {ex.Message}");
+                }
             }
         }
 
@@ -969,17 +1015,26 @@ namespace MFAAdmin
                         string user = "Unknown";
                         string expires = "Unknown";
 
-                        // Parse the Description: "User: user@example.com | Expires: 2026-03-24 18:00 UTC"
-                        if (desc.Contains("|"))
+                        // MFAService writes the description as:
+                        //   "User: someone@example.com Exp: 2026-03-24 18:00 UTC"
+                        // (see OpenFirewallPort). Parse that exact shape -- an earlier version
+                        // of this parser split on '|', a format the service never produced, so
+                        // every row rendered as "Unknown".
+                        var descMatch = Regex.Match(desc, @"User:\s*(?<user>\S+)\s+Exp:\s*(?<exp>.+?)\s*$");
+                        if (descMatch.Success)
                         {
-                            var descParts = desc.Split('|');
-                            user = descParts[0].Replace("User:", "").Trim();
+                            user = descMatch.Groups["user"].Value.Trim();
 
-                            string expireString = descParts[1].Replace("Expires:", "").Trim();
-                            if (DateTime.TryParse(expireString, out DateTime expireUtc))
-                            {
-                                expires = expireUtc.ToLocalTime().ToString("MM/dd/yyyy HH:mm");
-                            }
+                            string expireString = descMatch.Groups["exp"].Value.Trim();
+                            string noTz = expireString.EndsWith(" UTC", StringComparison.OrdinalIgnoreCase)
+                                ? expireString.Substring(0, expireString.Length - 4)
+                                : expireString;
+
+                            expires = DateTime.TryParse(noTz, CultureInfo.InvariantCulture,
+                                          DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal,
+                                          out DateTime expireUtc)
+                                ? expireUtc.ToLocalTime().ToString("MM/dd/yyyy HH:mm")
+                                : expireString;
                         }
 
                         Console.WriteLine($"{ip,-15} | {port,-6} | {user,-25} | {expires,-20}");
@@ -992,29 +1047,43 @@ namespace MFAAdmin
             }
             else
             {
-                // LINUX LOGIC: Query ipset for active countdown timers
-                // Note: The Linux kernel 'ipset' does not store strings like 'Username', so we only get IP and Time Remaining.
-                Console.WriteLine("Querying Linux kernel ipset for active sessions...\n");
+                // LINUX: read the iptables rules MFAService actually writes. An earlier version
+                // queried 'ipset list', which this service never populates, so diag always
+                // showed nothing regardless of how many sessions were open.
+                // The Linux rule comment carries only "<RulePrefix><ip>_<port> exp:<epoch>" --
+                // no username -- so that column is unavailable here, unlike on Windows.
+                Console.WriteLine("Querying iptables for active MFA sessions...\n");
 
-                var psi = new ProcessStartInfo("sudo", "ipset list")
+                string rules = RunBash("iptables -S INPUT 2>/dev/null", out _);
+                var mine = rules.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                                .Where(l => l.Contains(RulePrefix))
+                                .ToList();
+
+                if (mine.Count == 0)
                 {
-                    RedirectStandardOutput = true,
-                    UseShellExecute = false,
-                    CreateNoWindow = true
-                };
-
-                using var proc = Process.Start(psi);
-                string output = proc.StandardOutput.ReadToEnd();
-                proc.WaitForExit();
-
-                if (string.IsNullOrWhiteSpace(output))
-                {
-                    Console.WriteLine("No active ipsets found.");
+                    Console.WriteLine("No active MFA firewall rules found.");
                 }
                 else
                 {
-                    // Just print the raw ipset output, as it is already highly readable for sysadmins
-                    Console.WriteLine(output);
+                    Console.WriteLine($"{"IP Address",-18} | {"Port",-6} | {"Expires",-20}");
+                    Console.WriteLine(new string('-', 52));
+
+                    foreach (string line in mine)
+                    {
+                        string ip   = Regex.Match(line, @"-s\s+([^\s/]+)").Groups[1].Value;
+                        string port = Regex.Match(line, @"--dport\s+(\d+)").Groups[1].Value;
+
+                        string expires = "Unknown";
+                        var exp = Regex.Match(line, @"exp:(\d+)");
+                        if (exp.Success && long.TryParse(exp.Groups[1].Value, out long epoch))
+                            expires = DateTimeOffset.FromUnixTimeSeconds(epoch)
+                                        .ToLocalTime().ToString("MM/dd/yyyy HH:mm");
+
+                        Console.WriteLine($"{(ip.Length   == 0 ? "?" : ip),-18} | " +
+                                          $"{(port.Length == 0 ? "?" : port),-6} | {expires,-20}");
+                    }
+
+                    Console.WriteLine($"\n{mine.Count} active rule(s). Usernames are not recorded in iptables comments.");
                 }
             }
             Console.WriteLine();
@@ -1028,6 +1097,35 @@ namespace MFAAdmin
             return principal.IsInRole(WindowsBuiltInRole.Administrator);
         }
 #pragma warning restore CA1416
+
+        // Runs a bash command and returns trimmed stdout, with the exit code so callers can
+        // tell a real failure from empty output. ArgumentList avoids shell-quoting pitfalls.
+        // Mirrors MFAService.RunBash. Linux paths only.
+        static string RunBash(string script, out int exitCode)
+        {
+            exitCode = -1;
+
+            var psi = new ProcessStartInfo("/bin/bash");
+            psi.ArgumentList.Add("-c");
+            psi.ArgumentList.Add(script);
+            psi.CreateNoWindow         = true;
+            psi.UseShellExecute        = false;
+            psi.RedirectStandardOutput = true;
+            psi.RedirectStandardError  = true;
+
+            using var proc = Process.Start(psi);
+            if (proc == null) return string.Empty;
+
+            string output = proc.StandardOutput.ReadToEnd().Trim();
+            string error  = proc.StandardError.ReadToEnd().Trim();
+            proc.WaitForExit();
+            exitCode = proc.ExitCode;
+
+            if (!string.IsNullOrWhiteSpace(error))
+                AdminLogger.Debug($"[BASH] {error}");
+
+            return output;
+        }
 
         static void ResetFirewall()
         {
@@ -1065,19 +1163,39 @@ namespace MFAAdmin
                 }
                 else
                 {
-                    // LINUX: Find all ipsets starting with 'auth_' and flush their contents
-                    string bashCommand = "-c \"for set in $(sudo ipset list -n | grep '^auth_'); do sudo ipset flush $set; done\"";
+                    // LINUX: MFAService writes plain iptables rules tagged with RulePrefix -- it
+                    // never creates ipsets. An earlier version of this flushed 'auth_*' ipsets and
+                    // reported success unconditionally, so emergency revocation silently removed
+                    // nothing while telling the operator access was closed.
+                    //
+                    // Mirror MFAService's sweeper: enumerate 'iptables -S INPUT' and delete each
+                    // matching rule by replaying it with -D instead of -A. Then RE-READ the chain
+                    // and report what actually happened rather than assuming it worked.
+                    string rules = RunBash("iptables -S INPUT 2>/dev/null", out _);
+                    int attempted = 0, failed = 0;
 
-                    var psi = new ProcessStartInfo("bash", bashCommand)
+                    foreach (string line in rules.Split('\n', StringSplitOptions.RemoveEmptyEntries))
                     {
-                        CreateNoWindow = true,
-                        UseShellExecute = false
-                    };
+                        if (!line.Contains(RulePrefix)) continue;
+                        if (!line.TrimStart().StartsWith("-A INPUT")) continue;
 
-                    using var proc = Process.Start(psi);
-                    proc.WaitForExit();
+                        attempted++;
+                        RunBash("iptables " + line.TrimStart().Replace("-A INPUT", "-D INPUT"), out int rc);
+                        if (rc != 0) failed++;
+                    }
 
-                    AdminLogger.Log("[SUCCESS] All active Linux WireGuard ipsets have been flushed.");
+                    string after = RunBash("iptables -S INPUT 2>/dev/null", out _);
+                    int remaining = after.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                                         .Count(l => l.Contains(RulePrefix));
+
+                    if (remaining > 0)
+                        AdminLogger.Error(
+                            $"[ERROR] {remaining} MFA-managed iptables rule(s) REMAIN after reset ({failed} delete(s) failed). " +
+                            "Access is still open. Remove them manually: iptables -S INPUT | grep " + RulePrefix);
+                    else if (attempted == 0)
+                        AdminLogger.Log("[INFO] No MFA-managed iptables rules were present. Nothing to remove.");
+                    else
+                        AdminLogger.Log($"[SUCCESS] Removed {attempted} MFA-managed iptables rule(s); chain verified clear.");
                 }
 
                 // Optional: Send an Audit Email that a global reset was triggered
