@@ -1155,9 +1155,19 @@ namespace MFAAdmin
 
         static void ResetFirewall()
         {
-            Console.WriteLine("\n[WARNING] This will remove all firewall access.");
-            Console.WriteLine("You may need to re-authenticate to the MFA system to regain access.");
-            Console.WriteLine("Make sure you have a valid setup.");
+            Console.WriteLine("\n[WARNING] This removes every MFA-granted firewall rule.");
+            Console.WriteLine("Users will have to re-authenticate before they can open access again.");
+            Console.WriteLine();
+            Console.WriteLine("It does NOT terminate connections that are already established:");
+            Console.WriteLine("  - existing flows keep matching the conntrack RELATED,ESTABLISHED rule.");
+            Console.WriteLine("    A WireGuard session refreshes that entry with every keepalive, so it");
+            Console.WriteLine("    will not lapse on its own.");
+            Console.WriteLine("  - anyone reaching the port through a different rule (a permanently open");
+            Console.WriteLine("    port, a trusted interface, a separate allow) is unaffected.");
+            Console.WriteLine();
+            Console.WriteLine("To cut a live session you must also drop its conntrack entry, e.g.");
+            Console.WriteLine("    conntrack -D -s <ip> -p udp --dport <port>");
+            Console.WriteLine("and confirm no other rule still permits that source.");
             Console.Write("\nAre you sure you want to continue? (Y/N): ");
 
             var confirm = Console.ReadLine()?.Trim().ToUpper() ?? "";
@@ -1185,7 +1195,8 @@ namespace MFAAdmin
                     using var proc = Process.Start(psi);
                     proc?.WaitForExit();
 
-                    AdminLogger.Log("[SUCCESS] All temporary Windows SSH firewall rules have been cleared.");
+                    AdminLogger.Log($"[SUCCESS] Removed Windows firewall rules matching '{RulePrefix}*'. " +
+                        "Established connections are not terminated by this.");
                 }
                 else
                 {
@@ -1225,7 +1236,21 @@ namespace MFAAdmin
                 }
 
                 // Optional: Send an Audit Email that a global reset was triggered
-                AuditNotify("GLOBAL FIREWALL RESET", "An administrator manually flushed all temporary firewall rules via the Admin Tool. All active sessions were terminated.");
+                AuditNotify("GLOBAL FIREWALL RESET", string.Join(Environment.NewLine, new[]
+                {
+                    "An administrator removed all MFA-granted firewall rules via the Admin Tool.",
+                    "",
+                    "New connections matching those rules are now blocked.",
+                    "",
+                    "Connections that were ALREADY ESTABLISHED were NOT terminated. They continue to",
+                    "match the conntrack RELATED,ESTABLISHED rule, and a WireGuard session refreshes",
+                    "that entry with every keepalive, so it will not lapse on its own. Any client",
+                    "reaching the port through a different rule - a permanently open port, a trusted",
+                    "interface, or a separate allow - is unaffected by this action.",
+                    "",
+                    "To cut a live session, also drop its conntrack entry and confirm no other rule",
+                    "still permits that source.",
+                }));
             }
             catch (Exception ex)
             {
