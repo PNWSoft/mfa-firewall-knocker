@@ -267,6 +267,30 @@ MFAWeb reloads its certificate without a restart on both platforms, and MFAServi
 email before expiry, precisely because this failure mode is severe. Those reduce the likelihood.
 They do not remove the need for a second way in.
 
+## Revoking access does not end active sessions
+
+Rules disappear two ways: they expire, or an admin runs `MFAAdmin reset`. Both **close the
+firewall to new connections**. Neither reliably ends a session that is already connected.
+
+Whether an established session survives depends on your platform, your firewall, and what is
+listening behind the port — and a client reaching that port through some *other* rule (a
+permanently open port, a trusted interface, a separate allow) is unaffected either way.
+
+**Prepare a termination procedure before you need it, and treat it as your responsibility.**
+Only you can decide what it should do, because the right action is environment-specific:
+dropping connection-tracking state, restarting or reconfiguring the service behind the port,
+killing the user's processes or login sessions, revoking a credential at the application layer,
+or some combination. What ends a WireGuard tunnel is not what ends an SSH session, an RDP
+session, or a database connection.
+
+This project deliberately does not attempt it. Guessing wrong while running as root or
+LocalSystem is worse than doing nothing, and a tool that *claimed* to cut sessions but quietly
+didn't would be the most dangerous option of the three.
+
+So: write the script, test it against a real session, and keep it somewhere you can reach during
+an incident — ideally the same out-of-band path you keep for lockout recovery. Then, when you
+revoke, you know whether you have closed the door or actually removed the person.
+
 ## Security notes
 
 - The user database stores **TOTP secrets in recoverable form** (they have to be, to validate
