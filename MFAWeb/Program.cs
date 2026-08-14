@@ -29,7 +29,6 @@ using System.Net.Sockets;
 using System.Text.RegularExpressions;
 using Microsoft.AspNetCore.Antiforgery;
 using System.Reflection;
-using LettuceEncrypt;
 
 Directory.SetCurrentDirectory(AppContext.BaseDirectory);
 
@@ -72,35 +71,19 @@ builder.Services.AddHsts(options =>
     options.IncludeSubDomains = true;
 });
 
-// --- LettuceEncrypt: Automatic TLS via Let's Encrypt (optional) ---
-// When enabled, remove the Certificate block from the Kestrel section in
-// appsettings.json — LettuceEncrypt supplies the certificate dynamically.
-// Let's Encrypt requires port 80 to be internet-reachable for HTTP-01 challenges.
-if (builder.Configuration.GetValue<bool>("UseLettuceEncrypt"))
-{
-    string certDir = builder.Configuration["LettuceEncrypt:CertificateDirectory"]
-        ?? (RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
-            ? @"C:\ProgramData\MFAAuth\Certs"
-            : "/etc/mfa-auth/certs");
-
-    builder.Services.AddLettuceEncrypt()
-        .PersistDataToDirectory(new DirectoryInfo(certDir), null);
-
-    builder.WebHost.ConfigureKestrel(kestrel =>
-    {
-        int httpsPort = new Uri(builder.Configuration["AppUrl"] ?? "https://localhost:443").Port;
-        kestrel.ListenAnyIP(httpsPort, listenOptions =>
-        {
-            listenOptions.UseHttps(https =>
-            {
-                https.UseLettuceEncrypt(kestrel.ApplicationServices);
-            });
-        });
-        // Port 80 must be reachable from the internet for the HTTP-01 ACME challenge
-        kestrel.ListenAnyIP(80);
-    });
-}
-else if (!OperatingSystem.IsWindows())
+// --- TLS ---
+// MFAWeb is HTTPS-only and binds no cleartext listener at all. Certificates are obtained
+// out of band by a dedicated ACME client (certbot on Linux, win-acme on Windows) rather
+// than by this process, so the internet-facing service is not also an ACME client.
+//
+// A built-in LettuceEncrypt path used to live here. It was removed because it never worked:
+// on Linux it reported "Timeout during connect (likely firewall problem)" for every HTTP-01
+// attempt while certbot obtained a certificate for the same host, port and challenge type
+// minutes later; on Windows it was never used at all, since port 80 was already taken. It
+// also bound port 80 and served the ENTIRE application in cleartext there, not just the
+// ACME challenge, and it pulled four packages (one NuGet-deprecated, one legacy BouncyCastle)
+// into the most exposed component. Do not reintroduce an in-process ACME client.
+if (!OperatingSystem.IsWindows())
 {
     // --- Linux/macOS: the certificate comes from Kestrel's own configuration ---
     // (Kestrel:Endpoints:Https:Certificate:{Path,KeyPath} -- see INSTALL.md Option A.)
@@ -120,7 +103,7 @@ else if (!OperatingSystem.IsWindows())
     else
         AuditLogger.Error("[CERT] No Kestrel:Endpoints:Https:Certificate:Path is configured and the " +
                           "Windows certificate store does not exist on this platform. HTTPS will fail. " +
-                          "Set Certificate:Path/KeyPath, or enable UseLettuceEncrypt.");
+                          "Set Kestrel:Endpoints:Https:Certificate:Path and :KeyPath - see INSTALL.md.");
 }
 else
 {

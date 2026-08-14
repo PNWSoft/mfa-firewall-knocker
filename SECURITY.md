@@ -62,11 +62,5 @@ Tracked, understood, and not currently considered exploitable:
   lift the graph out of the vulnerable range. `dotnet list package --vulnerable` is clean;
   `--deprecated` reports the 6.x line as Legacy. The real fix is upgrading to Fido2 4.x,
   which needs the passkey ceremonies re-tested against real authenticators first.
-- **`LettuceEncrypt` 1.3.3 is marked Legacy** by NuGet. It is an optional, off-by-default
-  alternative to the Windows certificate-store path and is not used in the primary
-  configuration.
 - **The public-IP filter does not individually reject** multicast, reserved, broadcast, or
   TEST-NET ranges. None of these can be a live TCP source address, so there is no impact.
-- **On Linux, `MFAWeb` still runs the Windows certificate-store scan** at startup when
-  LettuceEncrypt is disabled, logging a spurious "no certificate found" warning even when a
-  Kestrel PEM certificate is correctly bound and serving. Cosmetic.
