@@ -351,8 +351,10 @@ namespace MFAAdmin
                     PasswordHash = passwordHash,
                     TotpSecret = base32Secret,
                     TotpConfirmed = false,
-                    ProvisioningToken = provisioningToken,
-                    ProvisioningExpiresUtc = expiresUtc,
+                    // Only meaningful when TOTP is compiled in. Minting one otherwise leaves a
+                    // token nothing can ever redeem or clear (BurnTotpToken is compiled out too).
+                    ProvisioningToken = TotpEnabled ? provisioningToken : null,
+                    ProvisioningExpiresUtc = TotpEnabled ? expiresUtc : (DateTime?)null,
                     PasskeyProvisioningToken = passkeyToken,
                     PasskeyProvisioningExpiresUtc = expiresUtc,
                     PasskeyRegistrationReady = false   // emailed token must pass the password gate first
@@ -553,8 +555,8 @@ namespace MFAAdmin
                 user.PasswordHash              = newPasswordHash;
                 user.TotpSecret                = newBase32Secret;
                 user.TotpConfirmed             = false;
-                user.ProvisioningToken         = newTotpToken;
-                user.ProvisioningExpiresUtc    = expiresUtc;
+                user.ProvisioningToken         = TotpEnabled ? newTotpToken : null;
+                user.ProvisioningExpiresUtc    = TotpEnabled ? expiresUtc : (DateTime?)null;
                 user.PasskeyCredentials        = new();
                 user.PasskeyProvisioningToken  = newPasskeyToken;
                 user.PasskeyProvisioningExpiresUtc = expiresUtc;
@@ -693,47 +695,44 @@ namespace MFAAdmin
 
             foreach (var u in users)
             {
-                string status;
+                // Passkey state is independent of TOTP state, so report it unconditionally.
+                // The previous version hard-coded "N/A" here whenever a TOTP provisioning token
+                // existed, which hid real registrations. In a passkey-only build that was
+                // permanent: BurnTotpToken (the only thing that clears ProvisioningToken) is
+                // compiled out, so every enrolled user showed "Setup Link EXPIRED / N/A" forever.
                 string passkeyStatus;
-
-                // If a TOTP provisioning token exists, the user hasn't scanned their QR code yet
-                if (!string.IsNullOrEmpty(u.ProvisioningToken))
+                if (u.PasskeyCredentials.Count > 0)
                 {
-                    if (u.ProvisioningExpiresUtc.HasValue && DateTime.UtcNow > u.ProvisioningExpiresUtc.Value)
-                    {
-                        status = "Setup Link EXPIRED";
-                    }
-                    else
-                    {
-                        status = $"Pending Setup (Expires: {u.ProvisioningExpiresUtc?.ToLocalTime():MM/dd HH:mm})";
-                    }
-                    passkeyStatus = "N/A";
+                    passkeyStatus = $"{u.PasskeyCredentials.Count} registered";
+                }
+                else if (!string.IsNullOrEmpty(u.PasskeyProvisioningToken))
+                {
+                    passkeyStatus = u.PasskeyProvisioningExpiresUtc.HasValue
+                                    && DateTime.UtcNow > u.PasskeyProvisioningExpiresUtc.Value
+                        ? "Setup link EXPIRED"
+                        : $"Pending (Exp: {u.PasskeyProvisioningExpiresUtc?.ToLocalTime():MM/dd HH:mm})";
                 }
                 else
                 {
-                    // TOTP setup is complete
-                    status = "Active / Provisioned";
-
-                    if (u.PasskeyCredentials.Count > 0)
-                    {
-                        passkeyStatus = $"{u.PasskeyCredentials.Count} registered";
-                    }
-                    else if (!string.IsNullOrEmpty(u.PasskeyProvisioningToken))
-                    {
-                        if (u.PasskeyProvisioningExpiresUtc.HasValue && DateTime.UtcNow > u.PasskeyProvisioningExpiresUtc.Value)
-                        {
-                            passkeyStatus = "Setup Link EXPIRED";
-                        }
-                        else
-                        {
-                            passkeyStatus = $"Pending (Exp: {u.PasskeyProvisioningExpiresUtc?.ToLocalTime():MM/dd HH:mm})";
-                        }
-                    }
-                    else
-                    {
-                        passkeyStatus = "None";
-                    }
+                    passkeyStatus = "None";
                 }
+
+                string status;
+#if ALLOW_TOTP
+                if (!string.IsNullOrEmpty(u.ProvisioningToken))
+                {
+                    status = u.ProvisioningExpiresUtc.HasValue && DateTime.UtcNow > u.ProvisioningExpiresUtc.Value
+                        ? "TOTP setup link EXPIRED"
+                        : $"TOTP pending (Exp: {u.ProvisioningExpiresUtc?.ToLocalTime():MM/dd HH:mm})";
+                }
+                else
+                {
+                    status = u.TotpConfirmed ? "Active / TOTP + passkey" : "Active / passkey only";
+                }
+#else
+                // Passkey-only build: enrollment is entirely a function of passkey state.
+                status = u.PasskeyCredentials.Count > 0 ? "Active" : "Awaiting passkey registration";
+#endif
 
                 Console.WriteLine($"{u.Username,-30} | {status,-38} | {passkeyStatus,-20}");
             }
