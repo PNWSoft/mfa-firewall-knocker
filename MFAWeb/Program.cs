@@ -240,9 +240,17 @@ string DbPath = app.Configuration["DbPath"] ?? (RuntimeInformation.IsOSPlatform(
     ? @"C:\ProgramData\MFAAuth\users.dat"
     : @"/etc/mfa-auth/users.json");
 
+// DpapiEntropy must be a real per-deployment secret. DPAPI here is LocalMachine scope,
+// so this value is the only thing stopping another process on the same host from
+// decrypting users.dat — and the placeholder in appsettings.example.json is published
+// in the public source repository. Refuse to start rather than run with a known value.
 string? dpapiEntropyStr = app.Configuration["DpapiEntropy"];
 if (string.IsNullOrWhiteSpace(dpapiEntropyStr))
     throw new InvalidOperationException("DpapiEntropy must be configured in appsettings.json. Set it to a unique random string for your deployment.");
+if (dpapiEntropyStr.Contains("REPLACE-WITH", StringComparison.OrdinalIgnoreCase))
+    throw new InvalidOperationException("DpapiEntropy is still set to the placeholder from appsettings.example.json. That value is public and offers no protection. Generate a unique random string for this deployment.");
+if (dpapiEntropyStr.Trim().Length < 16)
+    throw new InvalidOperationException("DpapiEntropy must be at least 16 characters. Generate a unique random string for this deployment (e.g. 32 random bytes, base64-encoded).");
 byte[] Entropy = Encoding.UTF8.GetBytes(dpapiEntropyStr);
 
 // --- Serve the Login UI ---

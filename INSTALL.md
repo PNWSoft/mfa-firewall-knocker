@@ -77,8 +77,8 @@ All three components read from their own `appsettings.json`. Copy the
 |-----|-------------|
 | `AppUrl` | Full public URL of MFAWeb. Must match the TLS certificate's domain. Used for WebAuthn origin validation — any mismatch will break passkey login. |
 | `SiteName` | Displayed in page titles, the TOTP issuer name, and provisioning emails. |
-| `LogoUrl` | Optional URL of a logo image shown on the login page. Leave empty for no logo. If set to an external URL, that origin is added to the `img-src` CSP directive automatically. |
-| `DpapiEntropy` | **Required.** A deployment-specific value mixed into the DPAPI key derivation on Windows. It prevents other processes on the same machine from reading the database without knowing this value — keep it consistent across all three components and don't use the default. On Linux it is unused for encryption (the database is plain JSON) but is still validated at startup. Generate with: `[Convert]::ToBase64String((1..32 \| % { Get-Random -Max 256 }))` |
+| `LogoUrl` | Optional URL of a logo image shown on the login page. Leave empty to use the bundled knocker logo (`wwwroot/knocker.png`). If set to an external URL, that origin is added to the `img-src` CSP directive automatically. |
+| `DpapiEntropy` | **Required.** A deployment-specific value mixed into the DPAPI key derivation on Windows. It prevents other processes on the same machine from reading the database without knowing this value — keep it consistent across all three components. Startup fails if it is missing, under 16 characters, or still the placeholder from `appsettings.example.json` (that placeholder is published in the public repository and protects nothing). On Linux it is unused for encryption (the database is plain JSON) but is still validated at startup. Generate with: `[Convert]::ToBase64String([System.Security.Cryptography.RandomNumberGenerator]::GetBytes(32))` |
 | `RateLimitPerWindow` | Maximum requests per IP per 5-minute window across all endpoints. Default: 20. |
 | `AllowedDomains` | Email address domains permitted to use the system. Enforced in both MFAWeb (login form rejects other domains) and MFAAdmin (`add` refuses to provision an account outside these domains). |
 | `UseLettuceEncrypt` | Set to `true` to obtain a TLS certificate automatically from Let's Encrypt. See [TLS Options](#tls-options). |
@@ -173,16 +173,64 @@ Copy the publish outputs to their installation directories, for example:
 - `C:\Services\MFAWeb\`
 - `C:\Tools\MFAAdmin\`
 
-### 3. Configure appsettings.json
+### 3. Configure appsettings.json and Restrict Permissions
 
 In each installation directory, copy `appsettings.example.json` to `appsettings.json`
 and fill in the values. The `DpapiEntropy` value must be identical in all three files.
 
-Generate a strong entropy string:
+Generate a strong entropy string with a cryptographic RNG:
 
 ```powershell
-[Convert]::ToBase64String((1..32 | % { Get-Random -Maximum 256 }))
+[Convert]::ToBase64String([System.Security.Cryptography.RandomNumberGenerator]::GetBytes(32))
 ```
+
+> The components refuse to start if `DpapiEntropy` is missing, shorter than 16 characters,
+> or still set to the placeholder from `appsettings.example.json`.
+
+**Now restrict access to the secrets.** This step is mandatory, not optional.
+
+On Windows, DPAPI is used at `LocalMachine` scope, so `DpapiEntropy` is the only thing
+separating `users.dat` from any other process on the host. `C:\ProgramData` and newly
+created folders under `C:\` grant **Authenticated Users** read access by default — which
+would let any local non-admin read the entropy out of `appsettings.json`, read `users.dat`,
+and call `ProtectedData.Unprotect` to recover the **plaintext TOTP secrets** and password
+hashes of every user.
+
+Restrict the data directory and each `appsettings.json` to SYSTEM, Administrators, and the
+gMSA only:
+
+```powershell
+# Data directory (created here so the ACL exists before MFAAdmin writes users.dat)
+New-Item -ItemType Directory -Force -Path "C:\ProgramData\MFAAuth" | Out-Null
+
+icacls "C:\ProgramData\MFAAuth" /inheritance:r `
+    /grant "SYSTEM:(OI)(CI)F" `
+    /grant "Administrators:(OI)(CI)F" `
+    /grant "YOURDOMAIN\MFA_Service$:(OI)(CI)M"
+
+# Each appsettings.json holds DpapiEntropy and SMTP credentials
+foreach ($f in @(
+    "C:\Services\MFAService\appsettings.json",
+    "C:\Services\MFAWeb\appsettings.json",
+    "C:\Tools\MFAAdmin\appsettings.json")) {
+    icacls $f /inheritance:r `
+        /grant "SYSTEM:F" `
+        /grant "Administrators:F" `
+        /grant "YOURDOMAIN\MFA_Service$:R"
+}
+```
+
+Verify that `Users` and `Authenticated Users` are absent from the result:
+
+```powershell
+icacls "C:\ProgramData\MFAAuth"
+icacls "C:\Services\MFAWeb\appsettings.json"
+```
+
+> MFAAdmin runs elevated, so Administrators access is sufficient for it; it does not need
+> a separate grant. The read-only file attribute that `DatabaseLockService` sets on
+> `users.dat` is **not** an access control and is trivially cleared — the ACL above is what
+> actually protects the file.
 
 ### 4. Install MFAService as a Windows Service
 
@@ -230,8 +278,16 @@ $acl.AddAccessRule($rule)
 Set-Acl -Path "Cert:\LocalMachine\My\$($cert.Thumbprint)" -AclObject $acl
 ```
 
-Set the `Kestrel:Endpoints:Https:Certificate:Subject` in MFAWeb's `appsettings.json` to
-match the certificate's Subject name.
+Set `HttpsCert:Subject` in MFAWeb's `appsettings.json` to the certificate's hostname, and
+set the **same** `HttpsCert:Subject`/`Store`/`Location` values in MFAService's
+`appsettings.json` so its expiry watchdog monitors the certificate that is actually served.
+
+> **Do not add a `Kestrel:Endpoints:Https:Certificate` block.** MFAWeb deliberately selects
+> the certificate in code at request time (matching on CN *and* SAN, preferring the newest
+> valid one) so that a renewal is picked up without a restart and an expired certificate
+> degrades to a warning banner. Kestrel's built-in `Certificate:Subject` binding does a
+> CN-only lookup at startup and **crashes the service the moment that certificate expires**
+> or is replaced by a SAN-only one. The `Https` endpoint should declare only its `Url`.
 
 Alternatively, use [Let's Encrypt](#option-b-lets-encrypt--lettuce-encrypt) to skip
 manual certificate management.
@@ -446,8 +502,9 @@ iptables -S INPUT | grep MFA_Temp
 
 ### Option A: Manual Certificate (Windows cert store or PEM file)
 
-**Windows:** Import to `LocalMachine\My` and set `Kestrel:Endpoints:Https:Certificate:Subject`
-in `appsettings.json` (see Step 6 of Windows installation above).
+**Windows:** Import to `LocalMachine\My` and set `HttpsCert:Subject` in `appsettings.json`
+(see Step 6 of Windows installation above). Leave the `Https` endpoint declaring only its
+`Url` — the certificate is chosen in code, not bound by Kestrel config.
 
 **Linux:** Provide a PEM certificate and key, then configure Kestrel in `appsettings.json`:
 
