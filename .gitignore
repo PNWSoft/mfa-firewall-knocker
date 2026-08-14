@@ -1,0 +1,23 @@
+# Build outputs
+**/bin/
+**/obj/
+
+# Runtime configuration (contains secrets — copy from appsettings.example.json and fill in)
+MFAWeb/appsettings.json
+MFAService/appsettings.json
+MFAAdmin/appsettings.json
+
+# Log files
+*.log
+**/Logs/
+
+# Claude Code session data
+**/.claude/
+
+# Visual Studio
+.vs/
+*.user
+*.suo
+
+# Rider
+.idea/
