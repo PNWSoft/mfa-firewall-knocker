@@ -71,9 +71,11 @@ exposed to the network and re-checks every policy decision rather than trusting 
   instead
 - **Encrypted user store** — `users.dat` is DPAPI-encrypted on Windows and guarded by a
   cross-process mutex; MFAService is its only writer
-- **TLS cert resilience** — the certificate is selected at runtime from the store by CN *and* SAN,
-  picking the newest valid one. A renewal is picked up without a restart, and an expired cert
-  degrades to a warning banner instead of a startup crash
+- **TLS cert resilience on both platforms** — Windows selects from the certificate store by CN
+  *and* SAN, newest valid one wins; Linux re-reads the PEM every minute and hot-swaps when the
+  thumbprint changes. Either way a renewal is picked up **without a restart** (verified against a
+  real forced renewal), a failed read keeps the last good certificate rather than dropping TLS,
+  and an expired cert degrades to a warning banner instead of a startup crash
 - **Cert expiry email alerts** from the always-on privileged service, so the warning still arrives
   in the one failure mode that matters: when no usable cert exists and the web app can't serve HTTPS
 - **Ignores `X-Forwarded-For`** — the client IP always comes from the TCP connection, so it can't be
@@ -164,7 +166,8 @@ database, the other offers a login that always fails — but it is not useful ei
   Directory domain if you want to run MFAWeb under a gMSA
 - **Linux:** systemd, and `iptables` (see the note below)
 - An SMTP relay, for user provisioning emails and alerts
-- A TLS certificate for MFAWeb, or port 80 reachable if you want Let's Encrypt to handle it
+- A TLS certificate for MFAWeb. MFAWeb is not an ACME client; obtain it with certbot (Linux)
+  or win-acme (Windows). certbot `--standalone` needs port 80 reachable during issuance only.
 
 > **Linux firewall backends:** the built-in Linux path uses `iptables`. If your distro uses
 > `nftables`, `ufw`, or `firewalld`, adapt the two clearly-marked sections in `OpenFirewallPort` and
@@ -199,7 +202,8 @@ Then add your first user, running MFAAdmin elevated (Administrator on Windows, r
 MFAAdmin add you@your-domain.com
 ```
 
-They get an email with a passkey setup link and a TOTP QR code link, both valid for 60 minutes.
+They get an email with a passkey setup link, valid for 60 minutes. In a build made with
+`-p:AllowTotp=true` it also contains a TOTP setup link.
 
 **[INSTALL.md](INSTALL.md) is the real guide** — gMSA creation, service installation, systemd units,
 socket permissions, TLS options, and file permissions are all covered there. Read it before
