@@ -21,10 +21,18 @@
     <PackageReference Include="BCrypt.Net-Next" Version="4.1.0" />
     <PackageReference Include="LettuceEncrypt" Version="1.3.3" />
     <PackageReference Include="Fido2" Version="3.0.1" />
+    <!-- These two are NOT used directly by our code. They are deliberate transitive version
+         overrides. Fido2 3.0.1 resolves Microsoft.IdentityModel.* to 6.17.0, which carries
+         GHSA-59j7-ghrg-fj52 (moderate severity). Pinning 6.34.0 lifts the graph out of the
+         vulnerable range; deleting these references reintroduces the advisory, as verified
+         by 'dotnet list package' with the vulnerable flag. NuGet marks the whole 6.x line
+         Legacy, so this trades a deprecation notice for the absence of a known CVE, which
+         is the right way round. The real fix is upgrading Fido2 to 4.x, which requires
+         re-testing the passkey ceremonies and is tracked as a known issue.
+         Do not remove these as "unused" without checking the vulnerable list first. -->
     <PackageReference Include="Microsoft.IdentityModel.JsonWebTokens" Version="6.34.0" />
     <PackageReference Include="System.IdentityModel.Tokens.Jwt" Version="6.34.0" />
     <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" Version="10.0.5" />
-    <PackageReference Include="Microsoft.PowerShell.SDK" Version="7.6.0" />
     <PackageReference Include="Otp.NET" Version="1.4.1" />
     <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="10.0.5" />
   </ItemGroup>

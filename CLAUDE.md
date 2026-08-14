@@ -28,9 +28,11 @@ Firewall backends: PowerShell `NetSecurity` on Windows, `iptables` on Linux. If 
 
 - Build: `dotnet build <Project>/<Project>.csproj -c Debug`
 - Publish: `dotnet publish <Project>/<Project>.csproj -c Release -p:PublishProfile=FolderProfile`
-  - The bundled profiles target **win-x64, self-contained**. MFAService/MFAAdmin are single-file;
-    MFAWeb is a multi-file folder. `MFAAdmin/Properties/PublishProfiles/FolderProfile1.pubxml`
-    targets linux-x64.
+  - The bundled profiles target win-x64 (MFAAdmin's `FolderProfile1.pubxml` targets linux-x64).
+    MFAService's profile is **self-contained single-file**; MFAAdmin's profiles are
+    **framework-dependent** single-file; MFAWeb's is a self-contained multi-file folder. For
+    deployment, INSTALL.md passes `-r win-x64 --self-contained` explicitly rather than relying
+    on the profiles, which is why the MFAAdmin profile's `SelfContained=false` doesn't bite.
 - **Incremental deploys:** copying only `MFAWeb.dll` is not enough when dependencies change (e.g.
   the LettuceEncrypt chain: `LettuceEncrypt.dll`, `Certes.dll`, `BouncyCastle.Crypto.dll`,
   `McMaster.AspNetCore.Kestrel.Certificates.dll`, plus `MFAWeb.deps.json`). Copy the whole publish
@@ -133,6 +135,17 @@ challenge needs port 80 and it stores certs in a directory rather than the Windo
   IP checks). Do not put a reverse proxy in front of it.
 - `HttpsCert:Subject`/`Store`/`Location` must be identical in MFAWeb and MFAService.
 - LettuceEncrypt is pinned at **1.3.3** (1.3.4 does not exist on NuGet).
+- **`Microsoft.IdentityModel.JsonWebTokens` / `System.IdentityModel.Tokens.Jwt` 6.34.0 in
+  MFAWeb are unused by our code on purpose.** They are transitive version overrides: Fido2
+  3.0.1 otherwise resolves them to 6.17.0, which carries GHSA-59j7-ghrg-fj52. Deleting them
+  as "unused" reintroduces the advisory. Always run `dotnet list package --vulnerable
+  --include-transitive` after touching MFAWeb's dependencies. The real fix is Fido2 4.x,
+  which needs the passkey ceremonies re-tested.
+- `SaveUsers` in **both** MFAService and MFAAdmin writes to `users.dat.tmp`, flushes to disk,
+  then `File.Replace`s into place, leaving the previous contents as `users.dat.bak`. Don't
+  revert to writing the live file directly — a torn write makes `LoadUsers` fail to decrypt
+  and return an empty list, which locks out every user. `.bak` holds the same secrets as the
+  DB, so it must stay inside the ACL-restricted data directory.
 - **Passkeys are platform-authenticator-only with user verification required.** Registration
   options set `AuthenticatorAttachment = Platform`, `UserVerification = Required`,
   `RequireResidentKey = false`, `attestation = None`; assertion options also require UV. So

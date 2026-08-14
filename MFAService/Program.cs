@@ -811,25 +811,72 @@ public class DatabaseLockService : BackgroundService
         }
 
         string json = JsonSerializer.Serialize(users, new JsonSerializerOptions { WriteIndented = true });
-        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-        {
-            byte[] encrypted = ProtectedData.Protect(Encoding.UTF8.GetBytes(json), Entropy, DataProtectionScope.LocalMachine);
-            File.WriteAllBytes(DbPath, encrypted);
-        }
-        else
-        {
-            File.WriteAllText(DbPath, json);
-        }
+        byte[] payload = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
+            ? ProtectedData.Protect(Encoding.UTF8.GetBytes(json), Entropy, DataProtectionScope.LocalMachine)
+            : Encoding.UTF8.GetBytes(json);
 
-        // Re-apply ReadOnly now that the write is complete.
-        if (File.Exists(DbPath))
+        // Write to a temp file in the same directory, flush to disk, then swap it into place.
+        // Writing over the live file directly means a crash or power loss between truncate and
+        // completion leaves users.dat truncated -- LoadUsers then fails to decrypt, returns an
+        // empty list, and every user is locked out with no on-disk copy to recover from.
+        // File.Replace also leaves the previous good file behind as .bak.
+        string tempPath   = DbPath + ".tmp";
+        string backupPath = DbPath + ".bak";
+
+        try
         {
-            File.SetAttributes(DbPath, File.GetAttributes(DbPath) | FileAttributes.ReadOnly);
-            // On Linux also enforce 640 — WriteAllText/WriteAllBytes can create the file
-            // with a permissive umask if it didn't exist yet.
+            using (var fs = new FileStream(tempPath, FileMode.Create, FileAccess.Write, FileShare.None))
+            {
+                fs.Write(payload, 0, payload.Length);
+                fs.Flush(flushToDisk: true);
+            }
+
+            // Tighten the temp file BEFORE it becomes the live DB, so there is no window in
+            // which users.dat exists with a umask-derived permissive mode.
             if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-                File.SetUnixFileMode(DbPath, UnixFileMode.UserRead | UnixFileMode.UserWrite |
-                                             UnixFileMode.GroupRead);   // 640
+                File.SetUnixFileMode(tempPath, UnixFileMode.UserRead | UnixFileMode.UserWrite |
+                                               UnixFileMode.GroupRead);   // 640
+
+            if (File.Exists(DbPath))
+            {
+                // Atomic swap, keeping the prior contents as a backup.
+                File.Replace(tempPath, DbPath, backupPath, ignoreMetadataErrors: true);
+                if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                    File.SetUnixFileMode(backupPath, UnixFileMode.UserRead | UnixFileMode.UserWrite |
+                                                     UnixFileMode.GroupRead);   // 640
+            }
+            else
+            {
+                File.Move(tempPath, DbPath);
+            }
+        }
+        finally
+        {
+            // Runs on the failure path too, which is the point: ReadOnly was cleared at the top
+            // of this method, and if the write threw, the tail below would never run and the
+            // database would stay unguarded until the next *successful* write. On failure
+            // DbPath is still the previous good file (we only ever wrote the temp), so
+            // re-applying the attribute re-guards valid data.
+            try
+            {
+                // Drop any stale temp file - it holds a full copy of the database.
+                if (File.Exists(tempPath)) File.Delete(tempPath);
+
+                if (File.Exists(DbPath))
+                {
+                    File.SetAttributes(DbPath, File.GetAttributes(DbPath) | FileAttributes.ReadOnly);
+                    // On Linux also enforce 640 - a fresh file can otherwise land with a
+                    // permissive umask.
+                    if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                        File.SetUnixFileMode(DbPath, UnixFileMode.UserRead | UnixFileMode.UserWrite |
+                                                     UnixFileMode.GroupRead);   // 640
+                }
+            }
+            catch (Exception ex)
+            {
+                // Never let cleanup mask the original exception.
+                ServiceLogger.Warn($"[DB] Post-write cleanup was incomplete: {ex.Message}");
+            }
         }
     }
 

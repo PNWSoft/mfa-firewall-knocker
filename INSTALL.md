@@ -251,6 +251,13 @@ icacls "C:\Services\MFAWeb\appsettings.json"
 > a separate grant. The read-only file attribute that `DatabaseLockService` sets on
 > `users.dat` is **not** an access control and is trivially cleared — the ACL above is what
 > actually protects the file.
+>
+> Writes are atomic: the database is written to `users.dat.tmp`, flushed, then swapped into
+> place, leaving the previous copy as `users.dat.bak`. **`users.dat.bak` contains exactly the
+> same secrets as the live database.** It lives in the same directory and is covered by the
+> ACL above — keep it there. If you copy it elsewhere as a backup, protect the destination
+> the same way, and note that on Windows it is DPAPI-encrypted to *that machine*, so it is
+> only restorable on the same host with the same `DpapiEntropy`.
 
 ### 4. Install MFAService as a Windows Service
 
