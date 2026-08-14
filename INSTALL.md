@@ -441,7 +441,9 @@ WantedBy=multi-user.target
 [Unit]
 Description=MFA Web Service
 After=network.target mfa-service.service
-Requires=mfa-service.service
+Wants=mfa-service.service
+# Deliberately Wants=, not Requires=: Requires= propagates STOP, so restarting
+# MFAService would take MFAWeb down and leave it down.
 
 [Service]
 Type=notify
