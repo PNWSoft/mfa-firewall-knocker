@@ -178,7 +178,7 @@ public class FirewallWorkerService : BackgroundService
     [SupportedOSPlatform("windows")]
     private async Task RunWindowsPipeServerAsync(CancellationToken stoppingToken)
     {
-        string gmsaName = _config["FirewallService:GmsaAccount"];
+        string? gmsaName = _config["FirewallService:GmsaAccount"];
         if (string.IsNullOrEmpty(gmsaName))
         {
             throw new Exception("gMSA account name not found in configuration.");

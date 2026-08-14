@@ -161,10 +161,13 @@ if (!OperatingSystem.IsWindows())
 
                     if (changed)
                     {
-                        var old = pemCached;
+                        // Deliberately do NOT dispose the previous instance. The selector runs per
+                        // TLS handshake, so a connection may still be completing with the object we
+                        // just replaced; disposing frees its ephemeral private key and would fail
+                        // that handshake. Let GC reclaim it. Matches the Windows path, which also
+                        // never disposes the outgoing certificate.
                         pemCached = fresh;
                         CertStatus.Update(pemCached, pemWarnDays);
-                        old?.Dispose();
                     }
                     else
                     {

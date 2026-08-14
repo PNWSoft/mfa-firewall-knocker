@@ -36,7 +36,7 @@ Communication between MFAWeb and MFAService uses a **named pipe** (Windows) or *
 - .NET 10 Runtime (or Self-Contained publish)
 - `systemd`
 - An SMTP relay accessible from the server
-- A TLS certificate or Let's Encrypt support (see [TLS Options](#tls-options))
+- A TLS certificate, obtained with an external ACME client such as certbot (see [TLS Options](#tls-options))
 
 > **Linux firewall backend note:** MFAService has separate Windows (PowerShell /
 > `NetSecurity`) and Linux (`iptables`) code paths built in. The default Linux
@@ -103,7 +103,8 @@ All three components read from their own `appsettings.json`. Copy the
 | `DpapiEntropy` | Must match MFAWeb and MFAAdmin exactly. |
 | `BouncerConfig:AllowedPorts` | Ports opened for each authenticated IP, in `port/protocol` format. Examples: `"22/TCP"`, `"51820/UDP"`. |
 | `BouncerConfig:ExpirationHours` | How long firewall rules stay open. Rules are automatically removed by the sweeper when they expire. |
-| `BouncerConfig:RulePrefix` | Prefix applied to every Windows Firewall rule name. Must also match the value in MFAAdmin's config so the `diag` and `reset` commands can find the rules. |
+| `BouncerConfig:RulePrefix` | Prefix applied to every firewall rule name. Must also match the value in MFAAdmin's config so the `diag` and `reset` commands can find the rules. |
+| `HttpsCert:PemPath` | **Linux only, and required for expiry alerts there.** Full path to the certificate MFAWeb serves (e.g. `/etc/letsencrypt/live/your.domain.com/fullchain.pem`). There is no certificate store on Linux, so without this the expiry watchdog is silently disabled — and an expired certificate means no passkey sign-in at all. |
 
 ### MFAAdmin — `appsettings.json`
 
@@ -313,8 +314,7 @@ set the **same** `HttpsCert:Subject`/`Store`/`Location` values in MFAService's
 > CN-only lookup at startup and **crashes the service the moment that certificate expires**
 > or is replaced by a SAN-only one. The `Https` endpoint should declare only its `Url`.
 
-Alternatively, use [Let's Encrypt](#option-b-lets-encrypt--lettuce-encrypt) to skip
-manual certificate management.
+See [TLS Options](#tls-options) for obtaining the certificate with an external ACME client.
 
 ### 7. Open the Firewall Port
 
@@ -391,7 +391,9 @@ Set the same value for `DpapiEntropy` in all three config files. On Linux, DPAPI
 used — the user database is stored as plain JSON — but the value is still required by
 the application to start.
 
-Remove the `Kestrel:Certificate` block if using Let's Encrypt (see [TLS Options](#tls-options)).
+On Linux you **must** keep the `Kestrel:Endpoints:Https:Certificate` block and point `Path`
+and `KeyPath` at your PEM files — there is no Windows certificate store, so it is the only
+source of a certificate. See [TLS Options](#tls-options).
 
 ### 4. Set File Permissions
 

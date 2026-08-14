@@ -85,9 +85,9 @@ namespace MFAAdmin
 
     public class UserEntry
     {
-        public string Username { get; set; }
-        public string PasswordHash { get; set; }
-        public string TotpSecret { get; set; }
+        public string Username { get; set; } = string.Empty;
+        public string PasswordHash { get; set; } = string.Empty;
+        public string TotpSecret { get; set; } = string.Empty;
         // True once the user has visited the setup page and scanned their QR code.
         // MFAAdmin sets this to false on add/reprovision; BurnTotpToken sets it to true.
         public bool TotpConfirmed { get; set; } = false;
@@ -171,7 +171,7 @@ namespace MFAAdmin
         // DPAPI Entropy (Windows Only) — loaded from config in Main()
         private static byte[] Entropy = Array.Empty<byte>();
 
-        private static IConfigurationRoot Config;
+        private static IConfigurationRoot Config = null!;   // set first thing in Main
 
         static void Main(string[] args)
         {
@@ -307,7 +307,7 @@ namespace MFAAdmin
             if (string.IsNullOrEmpty(username))
             {
                 Console.Write("Enter User Email: ");
-                username = Console.ReadLine()?.Trim();
+                username = Console.ReadLine()?.Trim() ?? "";
             }
 
             if (string.IsNullOrEmpty(username)) return;
@@ -397,14 +397,27 @@ namespace MFAAdmin
 
             return RandomNumberGenerator.GetString(validChars, length);
         }
+        // Reads a required Smtp:* setting. Without this a missing key surfaced as an opaque
+        // null-reference from inside MailKit rather than naming the setting that was absent.
+        static string SmtpRequired(string key)
+        {
+            string? v = Config[$"Smtp:{key}"];
+            if (string.IsNullOrWhiteSpace(v))
+                throw new InvalidOperationException($"Smtp:{key} is not configured in appsettings.json.");
+            return v;
+        }
+
+        static int  SmtpPort()   => int.TryParse(Config["Smtp:Port"], out var p) ? p : 25;
+        static bool SmtpUseSsl() => bool.TryParse(Config["Smtp:UseSsl"], out var b) && b;
+
         static bool SendProvisioningEmail(string userEmail, string tempPassword, string totpUrl, string passkeyUrl)
         {
-            var host = Config["Smtp:Host"];
-            var port = int.Parse(Config["Smtp:Port"]);
-            var useSsl = bool.Parse(Config["Smtp:UseSsl"]);
+            var host = SmtpRequired("Host");
+            var port = SmtpPort();
+            var useSsl = SmtpUseSsl();
             var smtpUsername = Config["Smtp:Username"];
             var smtpPassword = Config["Smtp:Password"];
-            var fromAddress = Config["Smtp:FromAddress"];
+            var fromAddress = SmtpRequired("FromAddress");
 
             var message = new MimeMessage();
             message.From.Add(new MailboxAddress($"{SiteName} Support", fromAddress));
@@ -524,7 +537,7 @@ namespace MFAAdmin
             if (string.IsNullOrEmpty(username))
             {
                 Console.Write("Enter User Email to reprovision: ");
-                username = Console.ReadLine()?.Trim();
+                username = Console.ReadLine()?.Trim() ?? "";
             }
 
             if (string.IsNullOrEmpty(username)) return;
@@ -606,7 +619,7 @@ namespace MFAAdmin
             Console.WriteLine("  - Passkey public keys and credential IDs");
             Console.WriteLine($"\nOutput path: {Path.GetFullPath(outputPath)}");
             Console.Write("\nContinue? (Y/N): ");
-            var confirm = Console.ReadLine()?.Trim().ToUpper();
+            var confirm = Console.ReadLine()?.Trim().ToUpper() ?? "";
             if (confirm != "Y" && confirm != "YES")
             {
                 Console.WriteLine("Export cancelled.");
@@ -662,7 +675,7 @@ namespace MFAAdmin
             Console.WriteLine($"  Users in database: {existingCount}");
             Console.WriteLine("\n[WARNING] This will OVERWRITE the entire current database.");
             Console.Write("\nContinue? (Y/N): ");
-            var confirm = Console.ReadLine()?.Trim().ToUpper();
+            var confirm = Console.ReadLine()?.Trim().ToUpper() ?? "";
             if (confirm != "Y" && confirm != "YES")
             {
                 Console.WriteLine("Import cancelled.");
@@ -745,7 +758,7 @@ namespace MFAAdmin
             if (string.IsNullOrEmpty(username))
             {
                 Console.Write("Enter User Email to delete: ");
-                username = Console.ReadLine()?.Trim();
+                username = Console.ReadLine()?.Trim() ?? "";
             }
 
             if (string.IsNullOrEmpty(username))
@@ -910,13 +923,13 @@ namespace MFAAdmin
         static void AuditNotify(string action, string details)
         {
             // Read settings from appsettings.json
-            var host = Config["Smtp:Host"];
-            var port = int.Parse(Config["Smtp:Port"]);
-            var useSsl = bool.Parse(Config["Smtp:UseSsl"]);
+            var host = SmtpRequired("Host");
+            var port = SmtpPort();
+            var useSsl = SmtpUseSsl();
             var username = Config["Smtp:Username"];
             var password = Config["Smtp:Password"];
-            var fromAddress = Config["Smtp:FromAddress"];
-            var notifyAddress = Config["Smtp:NotifyAddress"];
+            var fromAddress = SmtpRequired("FromAddress");
+            var notifyAddress = SmtpRequired("NotifyAddress");
 
             var message = new MimeMessage();
             message.From.Add(new MailboxAddress($"{SiteName} Admin Tool", fromAddress));
@@ -1004,6 +1017,7 @@ namespace MFAAdmin
                 };
 
                 using var proc = Process.Start(psi);
+                if (proc is null) { Console.WriteLine("Could not start the query process."); return; }
                 string output = proc.StandardOutput.ReadToEnd();
                 proc.WaitForExit();
 
@@ -1146,7 +1160,7 @@ namespace MFAAdmin
             Console.WriteLine("Make sure you have a valid setup.");
             Console.Write("\nAre you sure you want to continue? (Y/N): ");
 
-            var confirm = Console.ReadLine()?.Trim().ToUpper();
+            var confirm = Console.ReadLine()?.Trim().ToUpper() ?? "";
             if (confirm != "Y" && confirm != "YES")
             {
                 Console.WriteLine("Reset aborted.");
@@ -1169,7 +1183,7 @@ namespace MFAAdmin
                     };
 
                     using var proc = Process.Start(psi);
-                    proc.WaitForExit();
+                    proc?.WaitForExit();
 
                     AdminLogger.Log("[SUCCESS] All temporary Windows SSH firewall rules have been cleared.");
                 }
