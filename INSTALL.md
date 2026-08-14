@@ -589,8 +589,17 @@ sudo chmod -R g+rX  /etc/letsencrypt/live /etc/letsencrypt/archive
 sudo -u mfaweb test -r /etc/letsencrypt/live/your.domain.com/privkey.pem && echo OK
 ```
 
-**Kestrel loads the PEM at startup**, so unlike the Windows path a renewal does *not* take effect
-on its own. Add a certbot deploy hook:
+MFAWeb re-reads the PEM once a minute and swaps it in when the thumbprint changes, so a renewal
+takes effect **without a restart and without downtime** — verified against a real forced renewal:
+the served certificate changed while the process ID stayed the same.
+
+**Do not add a `--pre-hook` that stops MFAWeb.** MFAWeb never binds port 80, so certbot
+`--standalone` does not conflict with it; stopping the service would be pure downtime, and
+certbot persists such hooks into `/etc/letsencrypt/renewal/<domain>.conf` where they silently
+run on every future renewal.
+
+The deploy hook below is still worth installing — it re-applies the group grant after certbot
+rewrites the files:
 
 ```bash
 sudo tee /etc/letsencrypt/renewal-hooks/deploy/10-restart-mfaweb.sh >/dev/null <<'HOOK'
