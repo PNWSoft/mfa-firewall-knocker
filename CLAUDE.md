@@ -160,6 +160,11 @@ usually the security fix. Adding surface needs to earn its place.
 - **Don't log secrets.** MFAService redacts `DB:` command arguments before logging (`RedactRequest`)
   and both loggers sanitize control characters. Don't log raw IPC requests, tokens, or credential
   material.
+- **Config values that reach a firewall command are bounded on the privileged side.**
+  `ExpirationHours` is clamped to 1-48 (`MaxExpirationHours`), the port must be 1-65535, and the
+  protocol must be TCP or UDP; anything else is skipped with a `[CONFIG]` warning. The upper cap
+  matters most: without it a slipped digit turns time-limited access into a standing grant that
+  the sweeper will not clear for weeks. Keep these checks in MFAService, not only in the docs.
 - Command construction into PowerShell/iptables relies on prior validation: IP via
   `IPAddress.TryParse`, port via `int.TryParse`, username single-quote-escaped **and** passed via
   `-EncodedCommand`. Preserve that validation-before-use ordering.

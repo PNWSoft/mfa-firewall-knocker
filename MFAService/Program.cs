@@ -136,6 +136,10 @@ public class FirewallWorkerService : BackgroundService
     private readonly IConfiguration _config;
     private static string _rulePrefix = "MFA_Temp_";
 
+    // Hard ceiling on BouncerConfig:ExpirationHours. Deliberate multi-day windows are still
+    // possible, but a misconfiguration cannot leave rules in the firewall indefinitely.
+    private const int MaxExpirationHours = 48;
+
     public FirewallWorkerService(IConfiguration config)
     {
         _config = config;
@@ -422,8 +426,24 @@ public class FirewallWorkerService : BackgroundService
         }
         if (!MailAddress.TryCreate(username, out _))
             return "ERROR: Invalid username";
+
+        // Bound the configured window in BOTH directions. Without an upper cap a slipped digit
+        // (12 -> 120, or 1200) silently produces rules that outlive any plausible session and
+        // that the sweeper will not remove for weeks -- quietly turning time-limited access into
+        // a standing grant, which defeats the point of the tool. Clamp and say so loudly.
         if (expirationHours < 1)
-            expirationHours = 1; // Fallback sanity check
+        {
+            ServiceLogger.Warn($"[CONFIG] BouncerConfig:ExpirationHours={expirationHours} is below the " +
+                               "minimum of 1; using 1.");
+            expirationHours = 1;
+        }
+        else if (expirationHours > MaxExpirationHours)
+        {
+            ServiceLogger.Warn($"[CONFIG] BouncerConfig:ExpirationHours={expirationHours} exceeds the " +
+                               $"{MaxExpirationHours}-hour maximum; clamping to {MaxExpirationHours}. " +
+                               "Check the configuration for a typo.");
+            expirationHours = MaxExpirationHours;
+        }
 
         try
         {
@@ -437,8 +457,23 @@ public class FirewallWorkerService : BackgroundService
                     continue;
                 }
 
-                if (!int.TryParse(ppParts[0].Trim(), out int port)) continue;
+                // Range-check the port. int.TryParse alone accepts 0, negatives and 99999, which
+                // then get handed to iptables/netsh to reject in a much less obvious way.
+                if (!int.TryParse(ppParts[0].Trim(), out int port) || port < 1 || port > 65535)
+                {
+                    ServiceLogger.Warn($"[CONFIG] Configured port in '{portProto}' is not in 1-65535. Skipping.");
+                    continue;
+                }
+
+                // Allow-list the protocol. It is interpolated into the iptables/PowerShell command,
+                // and although only root can write this config, an unvalidated value here is an
+                // avoidable way for a typo to become a malformed privileged command.
                 string protocol = ppParts[1].Trim().ToUpperInvariant();
+                if (protocol != "TCP" && protocol != "UDP")
+                {
+                    ServiceLogger.Warn($"[CONFIG] Protocol in '{portProto}' must be TCP or UDP. Skipping.");
+                    continue;
+                }
 
                 OpenFirewallPort(ip, port, username, protocol, expirationHours);
             }
