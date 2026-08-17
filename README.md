@@ -315,4 +315,9 @@ whether or not you use an AI assistant.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+Code: **MIT** — see [LICENSE](LICENSE).
+
+Artwork: the door knocker used for the application icon and login logo is **CC0 1.0** (public
+domain dedication) — no attribution required, commercial use permitted. Source and regeneration
+notes are in [assets/](assets/). Deliberately chosen so the whole repository is reusable without
+a licence mismatch between the code and its graphics.
