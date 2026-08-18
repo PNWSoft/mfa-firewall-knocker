@@ -57,6 +57,26 @@ phishing-resistant credential — and then opens it narrowly and briefly.
 | Re-proof of the human | at enrolment, then on key expiry | every session |
 | Identity/ACL platform | SSO, SCIM, device posture, ACL language | none |
 
+The deeper difference is philosophical, not just featural. **This is deliberately small** — closer
+in spirit to WireGuard than to a platform. The entire mechanism fits in a sentence: prove you are
+a human with a passkey, a firewall rule appears for your IP, it expires. You can verify the whole
+thing with `iptables -S`. There is no control plane, no coordination server, no agent, no overlay;
+the state you have to reason about is a firewall rule and a user file. One person can read the
+source end to end in an afternoon.
+
+That is the same bet WireGuard made — be small enough to audit rather than large enough to cover
+everything. It is why TOTP is compiled out rather than config-disabled, and why the built-in ACME
+client was deleted rather than repaired: a capability that isn't there cannot be misconfigured,
+and cannot hide a bug.
+
+Tailscale is an enterprise system, and that is not a criticism. Fleet management, SSO/SCIM,
+device posture, an ACL language and audit tooling are what organisations genuinely need at scale,
+and you cannot deliver them in something a single person reads in an afternoon. The moving parts
+are the point.
+
+The flip side is just as real: small means it does less. If you need those capabilities, "you can
+read the whole thing" is not a substitute for having them.
+
 Pick accordingly. **If you need a network** — reaching things behind NAT, routing subnets,
 naming hosts — those products build one and this does not. **If what you have already works and
 you only want a human gate in front of it**, this adds one without a third party, an agent, or a
