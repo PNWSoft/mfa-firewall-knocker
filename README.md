@@ -179,7 +179,7 @@ database, the other offers a login that always fails — but it is not useful ei
 ## Quick start
 
 ```bash
-git clone https://github.com/<you>/mfa-firewall-knocker.git
+git clone https://github.com/PNWSoft/mfa-firewall-knocker.git
 cd mfa-firewall-knocker
 
 # Configure each component from its template
