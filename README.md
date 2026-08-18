@@ -40,7 +40,7 @@ replacing them or asking you to migrate anything.
   Browser ──HTTPS──▶  MFAWeb          ──named pipe / unix socket──▶  MFAService
                       (unprivileged)                                 (privileged)
                       passkey (WebAuthn)                             writes firewall rules
-                      read-only to DB                                sole writer of users.dat
+                      read-only to DB                                owns users.dat
 ```
 
 1. You hit MFAWeb from the machine you want access from. It shows you the IP it sees.
@@ -57,18 +57,22 @@ exposed to the network and re-checks every policy decision rather than trusting 
 
 ## Features
 
-- **Passkey-only by default.** WebAuthn/FIDO2 with a platform authenticator is the default and
-  only login method; TOTP is not compiled in unless you ask for it at build time. See
-  [Passkey requirements](#passkey-requirements) — the WebAuthn configuration is stricter than
-  most deployments and will reject a YubiKey
+- **Passkey-only by default, with user verification required as built.** WebAuthn/FIDO2 on a
+  platform authenticator, and every registration and every login demands a biometric or device
+  PIN — possession of the device alone is never enough. TOTP is not compiled in unless you ask
+  for it at build time. See [Passkey requirements](#passkey-requirements) — this is stricter
+  than most WebAuthn deployments and will reject a YubiKey
 - **Per-IP, auto-expiring** firewall rules — nothing is left open
 - **Public-IP-only enforcement** — requests from RFC-1918, CGNAT, loopback, and link-local ranges
   are rejected, on both sides of the privilege boundary
 - **No account lockout by design** — usernames are email addresses and therefore guessable, so
   lockout would be a trivial DoS. Throttling is per-IP; failed logins are detected and alerted on
   instead
-- **Encrypted user store** — `users.dat` is DPAPI-encrypted on Windows and guarded by a
-  cross-process mutex; MFAService is its only writer
+- **Encrypted user store — on Windows only.** `users.dat` is DPAPI-encrypted (machine key plus
+  a per-deployment entropy value). **On Linux the store is plain JSON**, protected solely by
+  file permissions — INSTALL.md's permission steps are load-bearing there, not hygiene. Both
+  platforms guard it with a cross-process mutex, and the internet-facing MFAWeb can never
+  write it
 - **TLS cert resilience on both platforms** — Windows selects from the certificate store by CN
   *and* SAN, newest valid one wins; Linux re-reads the PEM every minute and hot-swaps when the
   thumbprint changes. Either way a renewal is picked up **without a restart** (verified against a
