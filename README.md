@@ -15,26 +15,24 @@ It's port knocking, except the knock is WebAuthn instead of a magic packet seque
 
 ## Why this exists
 
-SSH and WireGuard both authenticate a *key*. Neither has any way to express the questions an
-organisation actually needs answered:
+SSH and WireGuard authenticate a *key*. Neither can answer the question that actually matters:
 
-> Should this key still be trusted? Is it still on the device we issued it to? Who used it,
-> from where, and when? How do I take it back from one person without disrupting everyone else?
+> **Is the authorized user the one using this key, right now?**
 
-Those questions have no representation in either protocol — possession of the key **is** the
-authorisation, indefinitely. It's why a copied WireGuard profile or a leaked `id_ed25519` is
-such a bad day, and why trying to detect misuse after the fact tends to be guesswork.
+Possession is the whole test. A copied WireGuard profile or a leaked `id_ed25519` passes it
+forever, from anywhere, and the protocol has no way to notice — which is why detecting key
+theft after the fact tends to be guesswork.
 
-The usual answer is to put a **control plane** in front: something that ties access to a real
-identity, forces re-authentication, and can revoke. The mature options are largely proprietary
-SaaS, and handing a third party the keys to your network is its own decision to make.
+This project answers that question *before the protocol ever sees a packet*. The port is
+closed by default; it opens only for the source IP of someone who just proved who they are
+with a phishing-resistant credential — a passkey, requiring their enrolled device and their
+biometric or PIN. A stolen key alone can no longer reach the service that would accept it.
+The grant expires on its own, and every one is logged: who, from where, when.
 
-This is a small, self-hosted, open-source control plane for infrastructure you already run.
-Access stops being a standing grant and becomes a short-lived, per-IP, automatically-expiring
-firewall rule that exists only because someone just proved who they were with a
-phishing-resistant credential — and every grant is logged. It sits *in front of* SSH,
-WireGuard, RDP, or anything else guarded by a port, without replacing them or asking you to
-migrate anything.
+The usual way to get this is a proprietary access-SaaS, and handing a third party the keys to
+your network is its own decision to make. This is the small, self-hosted, open-source version:
+it sits *in front of* SSH, WireGuard, RDP, or anything else guarded by a port, without
+replacing them or asking you to migrate anything.
 
 ## How it works
 
