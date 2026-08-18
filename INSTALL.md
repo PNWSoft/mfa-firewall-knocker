@@ -566,7 +566,8 @@ sudo apt-get install -y certbot
 
 # MFAWeb does not listen on :80, so certbot --standalone can use it for the HTTP-01 challenge.
 # Port 80 must be open in the firewall and reachable from the internet.
-sudo certbot certonly --standalone --non-interactive --agree-tos     -m admin@your-domain.com -d your.domain.com
+sudo certbot certonly --standalone --non-interactive --agree-tos \
+    -m admin@your-domain.com -d your.domain.com
 ```
 
 Point Kestrel at the result in MFAWeb's `appsettings.json`:
