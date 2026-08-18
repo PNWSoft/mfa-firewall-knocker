@@ -100,9 +100,39 @@ The file permissions in INSTALL.md exist primarily for that second case. DPAPI e
 Windows raises the bar on reads as well, but it is not what stands between an attacker and an
 account — the permissions are.
 
-Enable TOTP (`-p:AllowTotp=true`) and this changes materially: TOTP secrets are shared secrets,
-recoverable from the file and directly usable to authenticate. On Linux, where the store is plain
-JSON, that is worth weighing before turning it on.
+### Why TOTP changes this, and why it is off by default
+
+Enable TOTP (`-p:AllowTotp=true`) and the calculus changes materially — not because of how this
+project stores secrets, but because of how the protocol works.
+
+TOTP verification computes `HMAC-SHA1(secret, timestep)` and compares it to the code the user
+typed. The server must produce the same value the authenticator produced, so it must hold the
+**shared secret in recoverable form**. There is no way around this: you cannot hash a TOTP secret
+the way you hash a password, because a hash cannot generate codes. Encrypting the store — as
+DPAPI does on Windows — protects against theft of the file alone, but the service must be able to
+decrypt it to function, so the material remains recoverable to anything with sufficient access to
+the host.
+
+That produces a sharp asymmetry between the three credential types:
+
+| | What the server stores | What a full database breach yields |
+|---|---|---|
+| Password | a one-way hash | hashes an attacker must still crack |
+| **TOTP** | **the secret itself** | **valid codes for every user, immediately and indefinitely** |
+| WebAuthn / passkey | a public key | public keys — nothing that can authenticate |
+
+A TOTP database breach is a mass-compromise event: every enrolled user's second factor becomes
+forgeable at once, silently, and stays that way until every secret is re-enrolled. A passkey
+database breach is a user list.
+
+This is the second independent reason TOTP is not compiled into the default build — the first
+being that codes are phishable and replayable within their window. Neither is a criticism of TOTP
+as a technology; it is a reasonable second factor where the alternative is a password alone. It
+is simply a poor fit for a component whose stored state is otherwise worth nothing to an
+attacker.
+
+If you do enable it, weigh it especially carefully on Linux, where the store is not encrypted at
+rest.
 
 ### What it does not address
 

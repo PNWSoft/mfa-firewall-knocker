@@ -142,6 +142,14 @@ usually the security fix. Adding surface needs to earn its place.
   `PasskeyProvisioningToken` without this flag — that reintroduces the emailed-link bypass. The
   field lives in all three `UserEntry` classes and must stay in sync (shared `users.dat` schema →
   deploy all three together).
+- **Why TOTP is excluded, so nobody "simplifies" it back in.** Two reasons, one of which is
+  structural: verification is `HMAC-SHA1(secret, timestep)`, so the server must hold the shared
+  secret in recoverable form — it cannot be hashed, and encryption at rest does not help against
+  anything that can reach the running service. Compiling TOTP in therefore converts the user
+  store from something a breach yields nothing from (WebAuthn credentials are public keys) into
+  something that yields valid second factors for every enrolled user. The second reason is that
+  codes are phishable and replayable within their window. This is not a criticism of TOTP; it is
+  a poor fit *here* specifically because the rest of the stored state is worthless to an attacker.
 - **TOTP is a compile-time decision, not a config value.** It is excluded unless built with
   `-p:AllowTotp=true` (`ALLOW_TOTP`). In the default build `/auth`, `/setup/{token}` and `/setup`
   do not exist (404 — no handler, rather than a handler that declines), the login page emits no

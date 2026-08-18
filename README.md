@@ -182,9 +182,20 @@ Practical consequences to plan for:
 
 ### Passkey-only builds (the default)
 
-TOTP is phishable, and a captured code stays valid for roughly 90 seconds. An account is only
-as strong as its weakest enrolled method, so leaving TOTP available means the passkey buys you
-little.
+Two independent reasons.
+
+**Codes are phishable and replayable.** A captured code stays valid for roughly 90 seconds, and
+an account is only as strong as its weakest enrolled method — so leaving TOTP available means the
+passkey buys you little.
+
+**The server must store the secret in the clear.** This one is inherent to the protocol, not to
+this implementation. Verifying a code means computing `HMAC-SHA1(secret, timestep)` and comparing,
+so the server needs the shared secret in recoverable form. You cannot hash it like a password —
+a hash cannot generate codes. Encrypting the store helps against theft of the file alone, but the
+service has to decrypt it to work, so the material stays recoverable. Enabling TOTP therefore
+turns the user database from something an attacker gains nothing from — WebAuthn credentials are
+public keys — into something that yields valid second factors for every enrolled user at once.
+See [SECURITY.md](SECURITY.md) for the full comparison.
 
 **TOTP is therefore a compile-time decision, not a setting.** By default it is not built at
 all:
