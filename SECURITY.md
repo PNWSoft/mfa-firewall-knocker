@@ -84,6 +84,26 @@ Shortening `ExpirationHours` shortens how long a compromise rides a grant, trade
 convenience of authenticating once a day. The real answer to a rooted endpoint is endpoint
 security; no network gate can be one.
 
+### A note on the user database
+
+In a passkey-only build the store holds no directly usable credential. WebAuthn credentials are
+**public keys**, and no TOTP secret is ever written — so the file contains a user list, BCrypt
+password hashes, and public key material.
+
+That makes **integrity, not confidentiality, the property worth defending**. Someone who can
+*read* `users.dat` learns which addresses have accounts and obtains BCrypt hashes whose value is
+limited: for an already-enrolled account the password cannot register a passkey, because
+`AddPasskey` refuses any account that already has one. Someone who can *write* it simply adds
+their own passkey credential and becomes that user.
+
+The file permissions in INSTALL.md exist primarily for that second case. DPAPI encryption on
+Windows raises the bar on reads as well, but it is not what stands between an attacker and an
+account — the permissions are.
+
+Enable TOTP (`-p:AllowTotp=true`) and this changes materially: TOTP secrets are shared secrets,
+recoverable from the file and directly usable to authenticate. On Linux, where the store is plain
+JSON, that is worth weighing before turning it on.
+
 ### What it does not address
 
 - **Anything behind the same public IP.** Rules are keyed on the source address, so every device
