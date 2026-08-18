@@ -64,3 +64,13 @@ Tracked, understood, and not currently considered exploitable:
   which needs the passkey ceremonies re-tested against real authenticators first.
 - **The public-IP filter does not individually reject** multicast, reserved, broadcast, or
   TEST-NET ranges. None of these can be a live TCP source address, so there is no impact.
+- **The Windows named-pipe client does not verify the server's identity.** A local,
+  unprivileged user who pre-creates the pipe name before MFAService starts could observe
+  MFAWeb's IPC traffic (short-lived provisioning tokens, passkey public keys) or cause a
+  denial of service. It cannot forge a firewall change or a database write — those require
+  the real privileged service. Local access is otherwise out of scope, so this is tracked
+  rather than fixed.
+- **Email addresses with a quoted `|` in the local part cannot authenticate.** The IPC
+  protocol is `|`-delimited and the privileged side rejects requests with the wrong field
+  count, so such an address fails closed rather than open. Provisioning does not currently
+  refuse these addresses at `add` time.

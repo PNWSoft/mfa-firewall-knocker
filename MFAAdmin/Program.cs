@@ -407,20 +407,53 @@ namespace MFAAdmin
             return v;
         }
 
-        static int  SmtpPort()   => int.TryParse(Config["Smtp:Port"], out var p) ? p : 25;
-        static bool SmtpUseSsl() => bool.TryParse(Config["Smtp:UseSsl"], out var b) && b;
+        // An ABSENT key takes the documented default; a PRESENT but unparseable value is an
+        // error. The distinction matters most for UseSsl: silently reading garbage as `false`
+        // would downgrade the provisioning email (temp password + setup tokens) to cleartext
+        // SMTP. A typo must fail the send, never weaken it.
+        static int SmtpPort()
+        {
+            string? v = Config["Smtp:Port"];
+            if (string.IsNullOrWhiteSpace(v)) return 25;
+            if (int.TryParse(v, out var p) && p >= 1 && p <= 65535) return p;
+            throw new InvalidOperationException($"Smtp:Port value '{v}' is not a valid port (1-65535).");
+        }
+
+        static bool SmtpUseSsl()
+        {
+            string? v = Config["Smtp:UseSsl"];
+            if (string.IsNullOrWhiteSpace(v)) return false;
+            if (bool.TryParse(v, out var b)) return b;
+            throw new InvalidOperationException($"Smtp:UseSsl value '{v}' is not true or false.");
+        }
 
         static bool SendProvisioningEmail(string userEmail, string tempPassword, string totpUrl, string passkeyUrl)
         {
-            var host = SmtpRequired("Host");
-            var port = SmtpPort();
-            var useSsl = SmtpUseSsl();
-            var smtpUsername = Config["Smtp:Username"];
-            var smtpPassword = Config["Smtp:Password"];
-            var fromAddress = SmtpRequired("FromAddress");
+            // Config problems must land in the same return-false path as network problems:
+            // the callers' fallback (print the credentials to the console) is the only way the
+            // operator ever sees them, and an exception thrown here after the DB write would
+            // skip it -- for reprovision that means a locked-out user and a lost password.
+            string host, fromAddress; int port; bool useSsl;
+            string? smtpUsername, smtpPassword;
+            MailboxAddress fromMailbox;
+            try
+            {
+                host = SmtpRequired("Host");
+                port = SmtpPort();
+                useSsl = SmtpUseSsl();
+                smtpUsername = Config["Smtp:Username"];
+                smtpPassword = Config["Smtp:Password"];
+                fromAddress = SmtpRequired("FromAddress");
+                fromMailbox = new MailboxAddress($"{SiteName} Support", fromAddress);
+            }
+            catch (Exception ex)
+            {
+                AdminLogger.Error($"[EMAIL ERROR]: {ex.Message}");
+                return false;
+            }
 
             var message = new MimeMessage();
-            message.From.Add(new MailboxAddress($"{SiteName} Support", fromAddress));
+            message.From.Add(fromMailbox);
             message.To.Add(new MailboxAddress("New User", userEmail));
             message.Subject = $"Secure Setup: {SiteName} Access";
 
@@ -922,18 +955,34 @@ namespace MFAAdmin
 
         static void AuditNotify(string action, string details)
         {
-            // Read settings from appsettings.json
-            var host = SmtpRequired("Host");
-            var port = SmtpPort();
-            var useSsl = SmtpUseSsl();
-            var username = Config["Smtp:Username"];
-            var password = Config["Smtp:Password"];
-            var fromAddress = SmtpRequired("FromAddress");
-            var notifyAddress = SmtpRequired("NotifyAddress");
+            // The audit email is best-effort and this method must NEVER throw: it is called
+            // after the real work (user created, firewall reset) has already succeeded, and an
+            // exception here would either crash the CLI or -- inside ResetFirewall's try --
+            // report a successful reset as "[ERROR] Failed to reset firewall".
+            string host, fromAddress, notifyAddress; int port; bool useSsl;
+            string? username, password;
+            MailboxAddress fromMailbox, toMailbox;
+            try
+            {
+                host = SmtpRequired("Host");
+                port = SmtpPort();
+                useSsl = SmtpUseSsl();
+                username = Config["Smtp:Username"];
+                password = Config["Smtp:Password"];
+                fromAddress = SmtpRequired("FromAddress");
+                notifyAddress = SmtpRequired("NotifyAddress");
+                fromMailbox = new MailboxAddress($"{SiteName} Admin Tool", fromAddress);
+                toMailbox = new MailboxAddress("Server Admins", notifyAddress);
+            }
+            catch (Exception ex)
+            {
+                AdminLogger.Warn($"[ALERT] Audit email not sent: {ex.Message}");
+                return;
+            }
 
             var message = new MimeMessage();
-            message.From.Add(new MailboxAddress($"{SiteName} Admin Tool", fromAddress));
-            message.To.Add(new MailboxAddress("Server Admins", notifyAddress));
+            message.From.Add(fromMailbox);
+            message.To.Add(toMailbox);
             message.Subject = $"[AUDIT] {action} - {DateTime.Now:yyyy-MM-dd HH:mm}";
 
             message.Body = new TextPart("plain")
