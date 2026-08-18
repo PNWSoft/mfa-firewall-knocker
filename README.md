@@ -29,10 +29,44 @@ with a phishing-resistant credential — a passkey, requiring their enrolled dev
 biometric or PIN. A stolen key alone can no longer reach the service that would accept it.
 The grant expires on its own, and every one is logged: who, from where, when.
 
-The usual way to get this is a proprietary access-SaaS, and handing a third party the keys to
-your network is its own decision to make. This is the small, self-hosted, open-source version:
-it sits *in front of* SSH, WireGuard, RDP, or anything else guarded by a port, without
-replacing them or asking you to migrate anything.
+It sits *in front of* SSH, WireGuard, RDP, or anything else guarded by a port, without replacing
+them or asking you to migrate anything.
+
+### How this differs from Tailscale and friends
+
+Products like Tailscale, Twingate and Cloudflare Access address the same underlying problem, and
+they are mature, well-built things. **This is not a drop-in replacement for any of them** — it is
+a different way of binding a key to a person, with genuinely different trade-offs.
+
+They bind the key **at enrolment**. The device generates its own key, the key never leaves it,
+and SSO ties it to a real identity, so the credential is non-transferable by construction. Then
+they build a network on top: mesh routing, NAT traversal, DNS, ACLs, exit nodes. The binding
+holds until the key expires or you revoke it centrally.
+
+This binds the key **at time of use**. It never touches your SSH or WireGuard keys at all. It
+makes the port unreachable until a human proves who they are — right now, with a
+phishing-resistant credential — and then opens it narrowly and briefly.
+
+| | Overlay products | This |
+|---|---|---|
+| Binds key to human | at enrolment | at each use |
+| Builds a network | yes — mesh, NAT traversal, DNS, routing | no |
+| Client agent | required | none; any browser with a passkey |
+| Third party in the trust path | yes | none |
+| Existing keys and topology | replaced or absorbed | untouched |
+| Re-proof of the human | at enrolment, then on key expiry | every session |
+| Identity/ACL platform | SSO, SCIM, device posture, ACL language | none |
+
+Pick accordingly. **If you need a network** — reaching things behind NAT, routing subnets,
+naming hosts — those products build one and this does not. **If what you have already works and
+you only want a human gate in front of it**, this adds one without a third party, an agent, or a
+migration.
+
+Its own weaknesses are worth stating plainly: per-IP gating degrades behind CGNAT, corporate
+VPNs, and iCloud Private Relay, where a user authenticates from one address and connects from
+another; once a rule is open it is open to that IP for the window, with no per-connection
+authorisation; and it does no encryption of its own, relying entirely on the protocol behind the
+port.
 
 ## How it works
 
