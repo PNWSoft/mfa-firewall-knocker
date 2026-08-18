@@ -255,6 +255,17 @@ Practical redundancy, roughly in order of value:
 - **Run more than one gate, on independent hosts**, each with its own certificate, its own DNS
   name, and its own firewall. Independence is the point — two gates sharing a host, a cert, or
   an upstream link fail together.
+- **Keep at least two keys that can open the gate — ideally in two different pockets.** You
+  wouldn't cut a single key to a house. Best is **two administrators, each enrolled on their
+  own device**: that survives a lost phone *and* a person being unreachable. A single admin
+  should still hold two keys of their own — and since an account holds exactly **one** passkey
+  as built (deliberately; see the security invariants), that means either a passkey that syncs
+  across their devices (iCloud Keychain, Google Password Manager) or a second account enrolled
+  on a different device (`alice@…` plus `alice.backup@…`). Windows Hello passkeys are
+  historically device-bound, so a Windows-only admin with one account has exactly one key.
+  `MFAAdmin reprovision` replaces a lost key — but it runs elevated on the host, and reaching
+  the host may itself depend on the gate. That circularity is exactly what the second key
+  is for.
 - **Keep an out-of-band console** — IPMI/iDRAC/iLO, a cloud provider's serial console, or a
   hypervisor console — that does not depend on the gate or on SSH.
 - **Keep a break-glass path** that is normally disabled and separately monitored: a bastion

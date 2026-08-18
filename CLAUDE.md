@@ -150,6 +150,14 @@ usually the security fix. Adding surface needs to earn its place.
   setting.** A config switch can be flipped, mis-defaulted, or drift between components; an
   absent code path cannot. The flag must match across all three components, which are deployed
   together anyway.
+- **One passkey per account is enforced on the privileged side, and relaxing it is a trap.**
+  `RenewPasskeyToken` and `SetPasskeyToken` both refuse when `PasskeyCredentials.Count > 0`.
+  This is what makes a phished password worthless against an enrolled account: the only
+  registration gates are the password and a post-login token, and the password is the phishable
+  one. If multi-device enrollment is ever added, do **not** do it by dropping these checks —
+  authorize adding a credential with an assertion from an *existing* passkey, never with the
+  password alone. Until then, per-admin redundancy is a synced passkey or a second account
+  (documented in the README's redundancy section).
 - **The privilege boundary re-validates, it does not trust MFAWeb.** MFAService independently
   re-checks `IsPublicIpAddress` before opening a firewall rule and strictly validates every IPC
   request. Keep policy checks (public-IP-only, input validation) on the privileged side even though
