@@ -13,6 +13,12 @@ source IP only**, which **expires automatically**.
 
 It's port knocking, except the knock is WebAuthn instead of a magic packet sequence.
 
+<div align="center">
+  <img src="assets/screenshots/login.png" width="320"
+       alt="Login page showing the connecting IP address above an email field and a Sign in with Passkey button" />
+  <p><em>The page tells you which IP it is about to open, before you authenticate.</em></p>
+</div>
+
 ## Why this exists
 
 SSH and WireGuard authenticate a *key*. Neither can answer the question that actually matters:
@@ -105,6 +111,11 @@ port.
    and the ports you allowed.
 5. A sweeper removes the rule once it expires (default: 1 hour).
 
+<div align="center">
+  <img src="assets/screenshots/access-granted.png" width="420"
+       alt="Access granted page confirming the firewall rule was opened and will expire automatically" />
+</div>
+
 The split matters. MFAWeb is the part exposed to the internet, so it holds no privileges, cannot
 write to the user database, and cannot issue a firewall command directly. MFAService is never
 exposed to the network and re-checks every policy decision rather than trusting its caller.
@@ -163,6 +174,13 @@ Set in `MFAWeb/Program.cs` (registration options and assertion options).
 
 This works out of the box on **iOS/iPadOS, macOS (Touch ID / Face ID), Windows Hello, and
 Android**.
+
+<div align="center">
+  <img src="assets/screenshots/passkey-prompt.png" width="380"
+       alt="Operating system passkey dialog prompting for Touch ID before completing sign-in" />
+  <p><em><code>UserVerification: Required</code> in practice — the OS demands a biometric or PIN on
+  every login, not just at enrolment. Touch ID on macOS shown here.</em></p>
+</div>
 
 Practical consequences to plan for:
 
