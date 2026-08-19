@@ -133,13 +133,20 @@ exposed to the network and re-checks every policy decision rather than trusting 
 - **No account lockout by design** — usernames are email addresses and therefore guessable, so
   lockout would be a trivial DoS. Throttling is per-IP; failed logins are detected and alerted on
   instead
-- **The user store holds no usable secret** in a passkey-only build. Passkey credentials are
-  **public keys** — that is the point of WebAuthn — and no TOTP secret is ever written. So the
-  file contains a user list, BCrypt password hashes, and public key material. It is
-  DPAPI-encrypted on Windows and plain JSON on Linux, but on either platform **write** access is
-  the risk that matters, not read: anyone who can modify the file can enrol their own passkey.
-  That is what INSTALL.md's permission steps exist to prevent. Both platforms serialise access
-  through a cross-process mutex, and the internet-facing MFAWeb can never write it
+- **In the default passkey-only build, the user store holds no usable secret.** Passkey
+  credentials are **public keys** — that is the point of WebAuthn — and because TOTP is not
+  compiled in, no shared secret exists to write. The file holds a user list, BCrypt password
+  hashes, and public key material. That makes **write** access the risk that matters rather than
+  read: anyone who can modify the file can enrol their own passkey. It is what INSTALL.md's
+  permission steps exist to prevent. Both platforms serialise access through a cross-process
+  mutex, and the internet-facing MFAWeb can never write it
+- **Building with `-p:AllowTotp=true` changes that**, and it is the main reason the flag is not
+  the default. TOTP verification is `HMAC-SHA1(secret, timestep)`, so the server must keep each
+  shared secret in recoverable form — it cannot be hashed, because a hash cannot generate codes.
+  A store that was worth nothing to an attacker becomes one that yields a working second factor
+  for every enrolled user, so with TOTP enabled **read** access matters as much as write. The
+  store is DPAPI-encrypted on Windows and plain JSON on Linux; weigh that especially carefully on
+  Linux. See [SECURITY.md](SECURITY.md) for the full comparison
 - **TLS cert resilience on both platforms** — Windows selects from the certificate store by CN
   *and* SAN, newest valid one wins; Linux re-reads the PEM every minute and hot-swaps when the
   thumbprint changes. Either way a renewal is picked up **without a restart** (verified against a
