@@ -86,11 +86,11 @@ security; no network gate can be one.
 
 ### A note on the user database
 
-In a passkey-only build the store holds no directly usable credential. WebAuthn credentials are
-**public keys**, and no TOTP secret is ever written — so the file contains a user list, BCrypt
-password hashes, and public key material.
+In the default passkey-only build the store holds no directly usable credential. WebAuthn
+credentials are **public keys**, and because TOTP is not compiled in there is no shared secret to
+write — so the file contains a user list, BCrypt password hashes, and public key material.
 
-That makes **integrity, not confidentiality, the property worth defending**. Someone who can
+In that build, that makes **integrity, not confidentiality, the property worth defending**. Someone who can
 *read* `users.dat` learns which addresses have accounts and obtains BCrypt hashes whose value is
 limited: for an already-enrolled account the password cannot register a passkey, because
 `AddPasskey` refuses any account that already has one. Someone who can *write* it simply adds
