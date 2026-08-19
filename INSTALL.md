@@ -318,7 +318,9 @@ See [TLS Options](#tls-options) for obtaining the certificate with an external A
 
 ### 7. Open the Firewall Port
 
-Allow inbound traffic on MFAWeb's port (default 8443):
+Allow inbound traffic on MFAWeb's port (default 8443). Scope the rule to the **specific
+executable** as well as the port, so the opening belongs to MFAWeb rather than to whatever process
+happens to bind 8443:
 
 ```powershell
 New-NetFirewallRule `
@@ -326,8 +328,38 @@ New-NetFirewallRule `
     -Direction Inbound `
     -Protocol TCP `
     -LocalPort 8443 `
+    -Program "C:\Services\MFAWeb\MFAWeb.exe" `
     -Action Allow
 ```
+
+Points worth getting right:
+
+- **Name the process that actually listens.** The self-contained publish produces an apphost, so
+  `MFAWeb.exe` binds the port and is the correct target. If you run framework-dependent instead
+  (`dotnet MFAWeb.dll`), the listener is `dotnet.exe` — and naming *that* would widen the rule to
+  every .NET application on the host, which is worse than no program filter at all. Another reason
+  to prefer the self-contained build here.
+- **The path is matched literally.** Relocate or rename the install directory and the rule stops
+  matching silently — MFAWeb simply becomes unreachable. Update it rather than recreating:
+
+  ```powershell
+  Get-NetFirewallRule -DisplayName "MFA Web (HTTPS)" |
+      Set-NetFirewallApplicationFilter -Program "D:\Services\MFAWeb\MFAWeb.exe"
+  ```
+
+- **Verify the filter took effect**, then confirm reachability from another machine *before* you
+  depend on it. A mistyped path fails closed, and a gate nobody can reach is a gate nobody can
+  open:
+
+  ```powershell
+  Get-NetFirewallRule -DisplayName "MFA Web (HTTPS)" | Get-NetFirewallApplicationFilter
+  ```
+
+> **Optionally tighter still:** adding `-Service MFAWebService` restricts the rule to that service's
+> SID, so another process running as the same account still cannot use the opening. This only works
+> if the service has a service SID — check with `sc.exe qsidtype MFAWebService` and expect
+> `UNRESTRICTED`. If it reports `NONE` the filter will never match and MFAWeb will be unreachable,
+> so verify with the command above before relying on it.
 
 ### 8. Start the Services
 
