@@ -268,7 +268,35 @@ database, the other offers a login that always fails — but it is not useful ei
 > `SweepExpiredRules` in `MFAService/Program.cs`. See the Linux Firewall Commands section of
 > [INSTALL.md](INSTALL.md).
 
-## Quick start
+## Download
+
+Prebuilt, **self-contained** archives are on the
+[releases page](https://github.com/PNWSoft/mfa-firewall-knocker/releases/latest) — no .NET runtime
+install needed. Each archive holds all three components, which share the `users.dat` schema and
+**must be deployed together**. Both are the default **passkey-only** build; TOTP requires building
+from source with `-p:AllowTotp=true`.
+
+| Archive | Notes |
+|---------|-------|
+| `mfa-firewall-knocker-<version>-win-x64.zip` | **Code-signed** (Azure Trusted Signing) and timestamped |
+| `mfa-firewall-knocker-<version>-linux-x64.tar.gz` | Unsigned — there is no OS-level ELF signature to check |
+
+Verify before installing. On Windows the signature is the stronger check:
+
+```powershell
+signtool verify /pa MFAWeb.exe        # or right-click -> Properties -> Digital Signatures
+```
+
+On Linux, use the checksums published alongside the archives:
+
+```bash
+sha256sum -c SHA256SUMS.txt --ignore-missing
+```
+
+Then follow [INSTALL.md](INSTALL.md), which covers gMSA setup, systemd units, certbot, file
+permissions, and the shared IPC group.
+
+## Quick start (from source)
 
 ```bash
 git clone https://github.com/PNWSoft/mfa-firewall-knocker.git
