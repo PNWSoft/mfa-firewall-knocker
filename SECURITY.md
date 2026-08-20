@@ -96,10 +96,29 @@ internet at large can reach the vulnerable code. The exposure becomes "someone w
 authenticated with a passkey, from an address we granted, within the last few hours" — which is a
 different problem from "anyone on the internet".
 
-It holds in the other direction too, which matters given this is one person's code and the tool
-with the shorter track record. A flaw here grants no access by itself: an attacker who defeats the
-gate has opened a port to a service that still demands its own key. Neither gate is redundant with
-the other, and getting through the pair means two unrelated failures lining up at once.
+The other direction matters more, given this is one person's code and the component with the
+shorter track record — and it needs stating carefully rather than as a slogan.
+
+**This does add attack surface.** It is an internet-facing web application, and any claim that it
+adds none would be false. What can fairly be said is that the surface is deliberately narrow: a
+small number of routes, no user-supplied content rendered back, no database engine, no file
+uploads, and a process that runs unprivileged, cannot write the user store, and cannot issue a
+firewall command.
+
+More to the point, **most of what an attacker gains by exploiting it leaves you no worse off than
+not having deployed it at all**. Defeat the gate and you have opened a port — to a service that
+still demands its own key, which is precisely the position you would have been in had the port
+simply been left open. The usual failure mode is losing the protection this adds, not losing the
+protection you already had.
+
+The residual risk is the slice that reaches the host itself: remote code execution in the web
+stack rather than a logic flaw in the gate. That category is real and should not be waved away.
+But it is largely the generic risk of hosting *any* web application — the runtime, the TLS stack,
+Kestrel — rather than anything specific to this code, and it is the reason MFAWeb runs
+unprivileged and the privileged half re-validates every request instead of trusting it.
+
+Netting it out: neither gate is redundant with the other, getting through the pair means two
+unrelated failures lining up, and the price of that is one more small service to keep patched.
 
 ### Where the credential goes
 
