@@ -116,9 +116,10 @@ port.
        alt="Access granted page confirming the firewall rule was opened and will expire automatically" />
 </div>
 
-The split matters. MFAWeb is the part exposed to the internet, so it holds no privileges, cannot
-write to the user database, and cannot issue a firewall command directly. MFAService is never
-exposed to the network and re-checks every policy decision rather than trusting its caller.
+The split matters. MFAWeb is the part exposed to the internet, so it runs with only the privileges
+it needs to serve HTTPS — it cannot write to the user database and cannot issue a firewall command
+directly. MFAService is never exposed to the network and re-checks every policy decision rather
+than trusting its caller.
 
 ## Features
 
