@@ -187,6 +187,14 @@ usually the security fix. Adding surface needs to earn its place.
 
 ## Conventions / gotchas
 
+- **Never write an absolute claim into the docs.** README, SECURITY.md and the release notes make
+  security claims to an audience that will test them, so state the bounded version and name the
+  scope it holds in. Overclaims already caught and corrected: "holds no privileges" (MFAWeb runs
+  as a gMSA, which has some), "there is nothing to reset" (you can pull the peer or rotate keys),
+  "no TOTP secret is ever written" (true only of the passkey-only build), "a flaw here grants no
+  access by itself" (it is still an internet-facing web app and does add surface). One falsified
+  claim discredits the rest of the threat model, and the qualified version is nearly always the
+  stronger argument — conceding the limit first leaves something hard to attack.
 - `X509Certificate2.NotBefore/NotAfter` are **local time** — compare against `DateTime.Now`, not
   `UtcNow`.
 - MFAWeb intentionally ignores `X-Forwarded-For`; it uses the TCP connection address (rate limiting,
