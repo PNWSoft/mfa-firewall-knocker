@@ -51,7 +51,7 @@ verified at the moment of access rather than once at enrolment.
 
 Whether that satisfies your particular auditor, carrier or program is a question only they can
 answer, and this project makes no compliance claim on your behalf. But if you have been asked
-whether remote access to your network sits behind MFA, and the honest answer was "not really",
+whether remote access to your network sits behind MFA, and the answer was "not really",
 this is a direct way to change that without replacing the VPN you already run.
 
 ### How this differs from Tailscale and friends
