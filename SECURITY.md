@@ -59,15 +59,21 @@ credentials. The VPN is not the only control and should never be treated as one.
 
 What it buys is **position** — and position is worth more than it sounds, because the rest of the
 posture was designed on the assumption that only trusted parties could reach these services at
-all. That assumption is not laziness. It is the reason firewalls exist. Hardening every internal
-service to survive direct internet exposure is not realistic: the hypervisor's management
-interface, the NAS admin page, the database bound to a private address, the printer, the appliance
-that stopped receiving firmware updates years ago. The workable strategy has always been to put
-them somewhere the internet cannot reach, and to concentrate the guarding at one gate that decides
-who gets inside.
+all.
 
-WireGuard is that gate. Everything behind it is softer than it looks precisely *because* it is
-behind it — which is the argument for the gate itself demanding more than possession of a file.
+That softness is a deliberate choice, not neglect. Security and usability trade against each other
+directly, and a network hardened to the maximum at every point is close to unusable: users spend
+their day authenticating instead of working. So networks are split into zones, each given a
+posture proportionate to what it holds and to who can reach it — and that engineering is sound
+right up until the zone boundary turns out not to be real. The hypervisor's management interface,
+the NAS admin page, the database bound to a private address, the appliance that stopped receiving
+firmware years ago: none of those are hardened for the open internet, and none of them need to be,
+so long as the boundary holds.
+
+WireGuard is that boundary. Which also makes it the highest-leverage place to spend a user's
+patience: **one strong authentication at the gate, lasting a working day, buys more than the same
+friction spread across every service inside — and costs the user far less.** That is the trade this
+is built around.
 
 **This is a pre-incident control.** The stolen file stops being useful the moment it is stolen,
 not the moment somebody works out that it was — and nobody has to notice anything for that to
