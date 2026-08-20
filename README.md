@@ -38,6 +38,22 @@ The grant expires on its own, and every one is logged: who, from where, when.
 It sits *in front of* SSH, WireGuard, RDP, or anything else guarded by a port, without replacing
 them or asking you to migrate anything.
 
+### It is often a requirement, not just a good idea
+
+Multi-factor authentication for remote network access is a control that turns up wherever someone
+is checking: cyber-insurance questionnaires, NIST SP 800-171 (3.5.3) and therefore CMMC, PCI-DSS,
+and most SOC 2 programs.
+
+**A WireGuard profile or an SSH key does not satisfy it.** It is a single factor — *something you
+have* — and possession of the file is the entire test. Putting a passkey in front of the port adds
+a genuinely independent second factor: the enrolled device, plus the user's biometric or PIN,
+verified at the moment of access rather than once at enrolment.
+
+Whether that satisfies your particular auditor, carrier or program is a question only they can
+answer, and this project makes no compliance claim on your behalf. But if you have been asked
+whether remote access to your network sits behind MFA, and the honest answer was "not really",
+this is a direct way to change that without replacing the VPN you already run.
+
 ### How this differs from Tailscale and friends
 
 Products like Tailscale, Twingate and Cloudflare Access address the same underlying problem, and
