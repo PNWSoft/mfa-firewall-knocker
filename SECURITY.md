@@ -32,9 +32,15 @@ obvious and the honest version is still a good deal.
 ### The problem it exists to solve: a credential that leaves the building
 
 A WireGuard profile or an SSH private key is a **bearer token**. Whoever holds the file is you —
-from any address, at any hour, indefinitely, with no further test. That property is the whole
-reason these credentials are worth stealing, and it is why losing one is so much worse than
-losing a password: there is nothing to reset and, usually, nothing to notice.
+from any address, at any hour, with no further test. That property is the whole reason these
+credentials are worth stealing.
+
+Revoking one is easy enough: pull the peer from the server, or drop the key out of
+`authorized_keys`. The difficulty is that **nothing tells you to**. A copied file leaves the
+original in place and working, so there is no failed login, no second session to notice, no
+symptom at all — and revocation is a manual act you have to know to perform, on each host that
+trusts the key. Until then the credential simply keeps working. Compare a password, where the
+compromise at least tends to announce itself eventually.
 
 Files leave. A laptop is lost or stolen. A backup or disk image ends up somewhere it shouldn't.
 Malware copies `~/.ssh` or a `.conf` off the machine. Someone emails a profile to themselves to
