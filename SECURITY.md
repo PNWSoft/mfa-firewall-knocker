@@ -61,9 +61,10 @@ What it buys is **position** — and position is worth more than it sounds, beca
 posture was designed on the assumption that only trusted parties could reach these services at
 all.
 
-That softness is a deliberate choice, not neglect. Security and usability trade against each other
-directly, and a network hardened to the maximum at every point is close to unusable: users spend
-their day authenticating instead of working. So networks are split into zones, each given a
+Internal services are not weak in some absolute sense, and not weaker than they appear — they are
+hardened **less than the internet-facing tier**, correctly and on purpose. Security and usability
+trade against each other directly, and a network hardened to the maximum at every point is close
+to unusable: users spend their day authenticating instead of working. So networks are split into zones, each given a
 posture proportionate to what it holds and to who can reach it — and that engineering is sound
 right up until the zone boundary turns out not to be real. The hypervisor's management interface,
 the NAS admin page, the database bound to a private address, the appliance that stopped receiving
