@@ -76,6 +76,25 @@ patience: **one strong authentication at the gate, lasting a working day, buys m
 friction spread across every service inside — and costs the user far less.** That is the trade this
 is built around.
 
+#### Two gates that fail independently
+
+This does not replace WireGuard's or SSH's authentication — it adds a second one in front, and the
+two share no code, no protocol, and no implementation. That independence is worth something on its
+own, separate from anything to do with stolen credentials.
+
+**A zero-day in one is not a zero-day in the other.** If a remotely exploitable flaw turns up in
+WireGuard or in an SSH daemon, the port it would be reached through is closed to anyone who has
+not completed a WebAuthn ceremony from that address. The flaw is still there and still needs
+patching, but the window between disclosure and patching is no longer a window in which the
+internet at large can reach the vulnerable code. The exposure becomes "someone who already
+authenticated with a passkey, from an address we granted, within the last few hours" — which is a
+different problem from "anyone on the internet".
+
+It holds in the other direction too, which matters given this is one person's code and the tool
+with the shorter track record. A flaw here grants no access by itself: an attacker who defeats the
+gate has opened a port to a service that still demands its own key. Neither gate is redundant with
+the other, and getting through the pair means two unrelated failures lining up at once.
+
 **This is a pre-incident control.** The stolen file stops being useful the moment it is stolen,
 not the moment somebody works out that it was — and nobody has to notice anything for that to
 hold. A lost laptop becomes a lost laptop: whoever has it cannot open the port, so there is no
