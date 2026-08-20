@@ -52,6 +52,23 @@ revocation. **Pulling the peer afterwards does not un-copy a file or remove an i
 what post-incident means in practice — the remedy arrives after the damage it was supposed to
 prevent, and cannot reverse it.
 
+#### What a stolen profile actually buys an attacker
+
+Not everything, on a well-run network. SSH still wants its key; services still want their
+credentials. The VPN is not the only control and should never be treated as one.
+
+What it buys is **position** — and position is worth more than it sounds, because the rest of the
+posture was designed on the assumption that only trusted parties could reach these services at
+all. That assumption is not laziness. It is the reason firewalls exist. Hardening every internal
+service to survive direct internet exposure is not realistic: the hypervisor's management
+interface, the NAS admin page, the database bound to a private address, the printer, the appliance
+that stopped receiving firmware updates years ago. The workable strategy has always been to put
+them somewhere the internet cannot reach, and to concentrate the guarding at one gate that decides
+who gets inside.
+
+WireGuard is that gate. Everything behind it is softer than it looks precisely *because* it is
+behind it — which is the argument for the gate itself demanding more than possession of a file.
+
 **This is a pre-incident control.** The stolen file stops being useful the moment it is stolen,
 not the moment somebody works out that it was — and nobody has to notice anything for that to
 hold. A lost laptop becomes a lost laptop: whoever has it cannot open the port, so there is no
