@@ -36,11 +36,25 @@ from any address, at any hour, with no further test. That property is the whole 
 credentials are worth stealing.
 
 Revoking one is easy enough: pull the peer from the server, or drop the key out of
-`authorized_keys`. The difficulty is that **nothing tells you to**. A copied file leaves the
-original in place and working, so there is no failed login, no second session to notice, no
-symptom at all — and revocation is a manual act you have to know to perform, on each host that
-trusts the key. Until then the credential simply keeps working. Compare a password, where the
-compromise at least tends to announce itself eventually.
+`authorized_keys`. But notice what every control here has in common — pulling a peer, rotating
+keys, auditing handshakes are all **post-incident**. Each is a *response*, and each depends on
+knowing there was something to respond to.
+
+That is the gap this exists to close. A copied file leaves the original in place and working, so
+there is no failed login, no second session, no symptom of any kind. The window between the copy
+and the discovery is unbounded, and frequently it never closes at all — which makes a set of
+remedies that only fire after discovery a weak defence against precisely the case that matters.
+
+Concretely: someone loses a laptop. Today that begins a race — revoke the profile before whoever
+finds it gets curious, then establish what, if anything, was reached in the meantime. The second
+half is the expensive half, because it means proving a negative from whatever logs happen to
+exist.
+
+**This is a pre-incident control.** The stolen file stops being useful the moment it is stolen,
+not the moment somebody works out that it was — and nobody has to notice anything for that to
+hold. A lost laptop becomes a lost laptop: whoever has it cannot open the port, so there is no
+race. And because every grant is recorded with who, where and when, the question of whether
+anything actually happened is answerable rather than a matter of inference.
 
 Files leave. A laptop is lost or stolen. A backup or disk image ends up somewhere it shouldn't.
 Malware copies `~/.ssh` or a `.conf` off the machine. Someone emails a profile to themselves to
