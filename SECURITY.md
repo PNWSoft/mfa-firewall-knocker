@@ -46,15 +46,16 @@ and the discovery is unbounded, and frequently it never closes at all — which 
 remedies that only fire after discovery a weak defence against precisely the case that matters.
 
 Concretely: someone loses a laptop. Today that begins a race — revoke the profile before whoever
-finds it gets curious, then establish what, if anything, was reached in the meantime. The second
-half is the expensive half, because it means proving a negative from whatever logs happen to
-exist.
+has it connects. Lose that race and they are inside the network holding that user's access:
+reading file shares, copying whatever is reachable, planting something that outlives the
+revocation. **Pulling the peer afterwards does not un-copy a file or remove an implant.** That is
+what post-incident means in practice — the remedy arrives after the damage it was supposed to
+prevent, and cannot reverse it.
 
 **This is a pre-incident control.** The stolen file stops being useful the moment it is stolen,
 not the moment somebody works out that it was — and nobody has to notice anything for that to
 hold. A lost laptop becomes a lost laptop: whoever has it cannot open the port, so there is no
-race. And because every grant is recorded with who, where and when, the question of whether
-anything actually happened is answerable rather than a matter of inference.
+window to lose the race in.
 
 Files leave. A laptop is lost or stolen. A backup or disk image ends up somewhere it shouldn't.
 Malware copies `~/.ssh` or a `.conf` off the machine. Someone emails a profile to themselves to
