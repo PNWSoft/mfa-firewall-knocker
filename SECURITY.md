@@ -26,8 +26,8 @@ you'd rather not be.
 
 ## Threat model
 
-Worth being explicit about what this does and does not buy you, because the boundary is not
-obvious and the honest version is still a good deal.
+This sets out what the design does and does not protect against. The boundary is not obvious,
+and the limitations below are as much a part of the specification as the guarantees.
 
 ### The problem it exists to solve: a credential that leaves the building
 
@@ -52,6 +52,11 @@ revocation. **Pulling the peer afterwards does not un-copy a file or remove an i
 what post-incident means in practice — the remedy arrives after the damage it was supposed to
 prevent, and cannot reverse it.
 
+**This is a pre-incident control.** The stolen file stops being useful the moment it is stolen,
+not the moment somebody works out that it was — and nobody has to notice anything for that to
+hold. A lost laptop becomes a lost laptop: whoever has it cannot open the port, so there is no
+window to lose the race in.
+
 #### What a stolen profile actually buys an attacker
 
 Not everything, on a well-run network. SSH still wants its key; services still want their
@@ -64,8 +69,9 @@ all.
 Internal services are not weak in some absolute sense, and not weaker than they appear — they are
 hardened **less than the internet-facing tier**, correctly and on purpose. Security and usability
 trade against each other directly, and a network hardened to the maximum at every point is close
-to unusable: users spend their day authenticating instead of working. So networks are split into zones, each given a
-posture proportionate to what it holds and to who can reach it — and that engineering is sound
+to unusable: users spend their day authenticating instead of working. So networks are split into
+zones, each given a posture proportionate to what it holds and to who can reach it — and that
+engineering is sound
 right up until the zone boundary turns out not to be real. The hypervisor's management interface,
 the NAS admin page, the database bound to a private address, the appliance that stopped receiving
 firmware years ago: none of those are hardened for the open internet, and none of them need to be,
@@ -95,10 +101,7 @@ with the shorter track record. A flaw here grants no access by itself: an attack
 gate has opened a port to a service that still demands its own key. Neither gate is redundant with
 the other, and getting through the pair means two unrelated failures lining up at once.
 
-**This is a pre-incident control.** The stolen file stops being useful the moment it is stolen,
-not the moment somebody works out that it was — and nobody has to notice anything for that to
-hold. A lost laptop becomes a lost laptop: whoever has it cannot open the port, so there is no
-window to lose the race in.
+### Where the credential goes
 
 Files leave. A laptop is lost or stolen. A backup or disk image ends up somewhere it shouldn't.
 Malware copies `~/.ssh` or a `.conf` off the machine. Someone emails a profile to themselves to
