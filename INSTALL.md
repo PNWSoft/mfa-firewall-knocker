@@ -733,6 +733,58 @@ then re-run it.
 
 ---
 
+## Upgrading
+
+> **Do the upgrade over a connection that does not depend on this gate.**
+>
+> A console session, a LAN address, out-of-band management, or any second path you keep for
+> exactly this reason. Not a session whose port was opened by MFA Firewall Knocker.
+>
+> The reason is circular dependency: if an upgrade leaves MFAWeb or MFAService unable to start or
+> unable to talk to each other, then nobody can open a port — including you, and the port you
+> would need is the one you are trying to fix. Grants already issued expire on their own schedule,
+> so a working session is a deadline, not a safety net. This is the same argument as
+> [*Do not make this your only way in*](README.md#do-not-make-this-your-only-way-in), applied to
+> the one moment when the gate is most likely to break.
+
+Then:
+
+1. **Back up first** — `users.dat` and the whole install directory. Rollback is putting the old
+   directory back, so it is worth having.
+
+   ```powershell
+   # Windows
+   robocopy "C:\Program Files\FirewallKnocker" "C:\Backups\FirewallKnocker\<date>" /E
+   copy C:\ProgramData\MFAAuth\users.dat C:\Backups\FirewallKnocker\<date>\
+   ```
+   ```bash
+   # Linux
+   sudo cp -a /opt/mfa /opt/mfa.backup-$(date +%Y%m%d)
+   sudo cp -a /var/lib/mfa/users.dat /opt/mfa.backup-$(date +%Y%m%d)/
+   ```
+
+2. **Keep your `appsettings.json`.** Release archives ship only `appsettings.example.json`, so
+   copy your existing config into the new directory rather than re-deriving it.
+
+3. **Upgrade MFAService before MFAWeb.** From 0.2.0 the client verifies the privileged service's
+   identity before sending anything, so a newer MFAWeb against an older MFAService is the
+   combination most likely to fail. The reverse order is safe.
+
+4. **Deploy all three components together** when the release changes `users.dat`'s schema — they
+   share it. Release notes say when that applies.
+
+5. **Verify before you disconnect**, while you still have the independent path open:
+   - both services are running, and the logs show the expected version at startup
+   - MFAWeb serves HTTPS and selects a certificate
+   - **a real passkey login opens a rule** — this is the only test that exercises the whole
+     chain, including the IPC identity check added in 0.2.0
+   - the rule disappears at expiry (or shorten `ExpirationHours` temporarily to watch it)
+
+6. **If it fails**, stop both services, restore the backed-up directory, and start them again —
+   privileged service first.
+
+---
+
 ## Security Notes
 
 - **`DpapiEntropy`** is a deployment-specific value mixed into the DPAPI key derivation
