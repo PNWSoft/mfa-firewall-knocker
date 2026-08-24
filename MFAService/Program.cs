@@ -92,6 +92,24 @@ return 0;
 // ---------------------------------------------------------------------------
 public enum LogSeverity { Debug, Info, Warning, Error }
 
+// Set once this process owns the IPC endpoint - the named pipe on Windows, the unix socket on
+// Linux. Everything that touches shared state waits for it.
+//
+// A second instance cannot own the endpoint, and its output goes to whatever console launched it
+// rather than to journald or the Event Log, so any work it does is both redundant and invisible
+// where an operator would look for it. A duplicate that swept firewall rules on its own cadence
+// is exactly what made a real incident hard to read: removals appeared in the shared log file
+// with no matching line in journald. So a duplicate now does nothing at all until it owns the
+// endpoint, and if it never does, it never acts.
+internal static class IpcOwnership
+{
+    private static readonly TaskCompletionSource _claimed =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    public static Task Claimed => _claimed.Task;
+    public static void MarkClaimed() => _claimed.TrySetResult();
+}
+
 internal static class ServiceLogger
 {
     private static readonly string LogDirectory = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
@@ -282,6 +300,7 @@ public class FirewallWorkerService : BackgroundService
                 instances.Add(CreatePipeInstance(security, firstInstance: false));
 
             ServiceLogger.Log($"[IPC] Server listening on {PipeInstanceCount} pipe instances.");
+            IpcOwnership.MarkClaimed();
             await Task.WhenAll(instances.Select(inst => ServePipeInstanceAsync(inst, stoppingToken)));
         }
         finally
@@ -588,14 +607,14 @@ public class FirewallWorkerService : BackgroundService
 
             if (endpointBusy)
             {
-                // Release the lock before sleeping so the instance that legitimately owns the
-                // endpoint is never blocked by this one waiting.
+                // Release the lock so the instance that legitimately owns the endpoint is never
+                // blocked by this one.
                 instanceLock?.Dispose();
                 instanceLock = null;
 
                 ServiceLogger.Error(
-                    $"[IPC] {socketPath} is already owned by a live process. Refusing to replace it - " +
-                    "this instance will not serve IPC until the endpoint is free.");
+                    $"[IPC] {socketPath} is already owned by a live process. This instance is a " +
+                    "duplicate and is stopping.");
 
                 // Only consume the one-shot flag if the mail actually went out.
                 if (!alerted)
@@ -608,17 +627,24 @@ public class FirewallWorkerService : BackgroundService
                         "and clients would reach whichever bound the socket last, so this instance is " +
                         "standing down rather than taking over. Running the binary by hand while the " +
                         "service is running is the usual cause.\n\n" +
-                        "No firewall rules will be opened by this instance until the endpoint is free. " +
-                        "It retries automatically, so nothing further is needed once the duplicate exits.");
+                        "This instance is stopping. The running service is unaffected.");
                 }
 
-                try { await Task.Delay(delay, stoppingToken); }
-                catch (OperationCanceledException) { return; }
-                delay = TimeSpan.FromTicks(Math.Min(delay.Ticks * 2, maxDelay.Ticks));
+                // Stop, rather than retry as the Windows path does. The asymmetry is deliberate
+                // and follows from who can hold the endpoint. The socket lives in /run, which
+                // only root can write, so a live holder is root -- in practice the real service,
+                // which makes this process the duplicate, and a duplicate should go away. On
+                // Windows any user can create a pipe name, so a squatter may be unprivileged and
+                // exiting for good would let any local account keep the gate down; there we
+                // retry to reclaim the name when it frees.
+                throw new IOException(
+                    $"{socketPath} is owned by another live MFAService instance. Stopping this duplicate.");
             }
         }
 
         if (listener is null) { instanceLock?.Dispose(); return; }   // cancelled while waiting
+
+        IpcOwnership.MarkClaimed();
 
         // Held until shutdown: releasing it early would let a second instance through.
         using var _instanceLock = instanceLock;
@@ -1181,6 +1207,9 @@ public class FirewallWorkerService : BackgroundService
     // -----------------------------------------------------------------------
     private static async Task RunSweeperAsync(CancellationToken stoppingToken)
     {
+        // Do not touch the firewall until this process owns the IPC endpoint. See IpcOwnership.
+        await IpcOwnership.Claimed.WaitAsync(stoppingToken);
+
         ServiceLogger.Log("[SWEEPER] Starting...");
         using var timer = new PeriodicTimer(TimeSpan.FromMinutes(5));
 
@@ -1329,8 +1358,13 @@ public class DatabaseLockService : BackgroundService
         return MutexAcl.Create(false, mutexName, out _, security);
     }
 
-    protected override Task ExecuteAsync(CancellationToken stoppingToken)
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        // A duplicate instance must not touch the user database either. Its writes would race
+        // the real service's, and on Linux there is no cross-process mutex to serialise them.
+        // See IpcOwnership.
+        await IpcOwnership.Claimed.WaitAsync(stoppingToken);
+
         // Ensure the DB file is ReadOnly at startup. SaveUsers() will clear and
         // restore this attribute around every write, so no periodic sweep is needed.
         if (File.Exists(DbPath))
@@ -1359,7 +1393,6 @@ public class DatabaseLockService : BackgroundService
                 }
             }
         }
-        return Task.CompletedTask;
     }
 
     // -----------------------------------------------------------------------
@@ -1693,6 +1726,10 @@ public class CertificateMonitorService : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        // A duplicate instance must not send expiry alerts: the operator would get two of every
+        // warning from a process that is otherwise doing nothing. See IpcOwnership.
+        await IpcOwnership.Claimed.WaitAsync(stoppingToken);
+
         // The certificate store is a Windows concept. On Linux the certificate is a PEM file,
         // so watch that instead -- this alert must work on BOTH platforms. An expired cert on a
         // passkey-only deployment is a lockout, not an inconvenience: browsers refuse WebAuthn
