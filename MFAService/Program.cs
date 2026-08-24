@@ -945,8 +945,18 @@ public class FirewallWorkerService : BackgroundService
             RunBash($"iptables -I INPUT -p {proto} --dport {port} -s {ip} -j ACCEPT -m comment --comment '{comment}'");
             ServiceLogger.Debug($"[FIREWALL] iptables rule inserted in {fw.ElapsedMilliseconds}ms. Verifying...");
 
-            string verify = RunBash($"iptables -C INPUT -p {proto} --dport {port} -s {ip} -j ACCEPT 2>/dev/null && echo OK || echo FAIL");
-            if (verify.Trim() == "OK")
+            // Verify by scanning the rule list for our comment, not with `iptables -C`.
+            // -C requires the specification to match exactly, including every match module, and
+            // the rule we just inserted carries "-m comment --comment ...". A -C without that
+            // comment therefore never matches a rule that exists, which reported every
+            // successful Linux grant as [FAILED] while the rule was in fact present and working.
+            // Scanning also matches how the upsert above and SweepExpiredRules locate rules.
+            string after = RunBash("iptables -S INPUT 2>/dev/null");
+            bool verified = after
+                .Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                .Any(l => l.TrimStart().StartsWith("-A INPUT") && l.Contains(comment, StringComparison.Ordinal));
+
+            if (verified)
                 ServiceLogger.Log($"[SUCCESS] iptables rule verified: {protocol}/{port} OPEN for {ip}.");
             else
                 ServiceLogger.Log($"[FAILED] iptables rule could not be verified: {protocol}/{port} for {ip}.");
