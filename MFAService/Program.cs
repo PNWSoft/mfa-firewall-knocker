@@ -190,51 +190,207 @@ public class FirewallWorkerService : BackgroundService
 
         // Convert the string to an NTAccount object
         var gmsaAccount = new NTAccount(gmsaName);
-      
-        // ACL: LocalSystem gets full control; gMSA (MFAWeb) gets read/write only.
+
+        var localSystem = new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null);
+
         var security = new PipeSecurity();
+
+        // MFAWeb reads this owner back after connecting and refuses to send anything if it is not
+        // a privileged SID (see IpcFirewallClient.SendViaPipeAsync). Set it explicitly rather than
+        // relying on the creating token's default owner, which is not contractually S-1-5-18 and
+        // can be BUILTIN\Administrators depending on token settings.
+        security.SetOwner(localSystem);
+
+        // ACL: LocalSystem gets full control; gMSA (MFAWeb) gets read/write only.
         security.AddAccessRule(new PipeAccessRule(
-            new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null),
+            localSystem,
             PipeAccessRights.FullControl, AccessControlType.Allow));
+        // ReadWrite here is load-bearing beyond the obvious. PipeAccessRights.Read includes
+        // ReadPermissions (READ_CONTROL), which is what allows MFAWeb to read the owner SID above.
+        // Narrowing this to ReadData|WriteData would silently break the client's identity check.
         security.AddAccessRule(new PipeAccessRule(
             gmsaAccount,
             PipeAccessRights.ReadWrite,
             AccessControlType.Allow));
 
-        ServiceLogger.Debug($"[IPC] Pipe security built for gMSA '{gmsaName}'. Creating pipe...");
-        while (!stoppingToken.IsCancellationRequested)
+        ServiceLogger.Debug($"[IPC] Pipe security built for gMSA '{gmsaName}'. Claiming pipe name...");
+
+        // Claim the name before serving anything. See ClaimPipeNameAsync.
+        NamedPipeServerStream? firstInstance = await ClaimPipeNameAsync(security, stoppingToken);
+        if (firstInstance is null) return;   // cancelled while retrying
+
+        var instances = new List<NamedPipeServerStream> { firstInstance };
+        try
         {
-            NamedPipeServerStream? pipe = null;
+            for (int i = 1; i < PipeInstanceCount; i++)
+                instances.Add(CreatePipeInstance(security, firstInstance: false));
+
+            ServiceLogger.Log($"[IPC] Server listening on {PipeInstanceCount} pipe instances.");
+            await Task.WhenAll(instances.Select(inst => ServePipeInstanceAsync(inst, stoppingToken)));
+        }
+        finally
+        {
+            foreach (var inst in instances)
+            {
+                try { inst.Dispose(); } catch { /* shutting down */ }
+            }
+        }
+    }
+
+    // A fixed pool of long-lived instances rather than one created per connection. Two reasons:
+    //
+    //   * The name must never be released. The old create/serve/dispose loop allowed the live
+    //     instance count to reach zero between iterations, and an unprivileged local process that
+    //     wins that gap owns "MFAFirewallPipe" -- at which point MFAWeb connects to it instead.
+    //   * FILE_FLAG_FIRST_PIPE_INSTANCE only succeeds when no instance exists, so exactly one
+    //     instance can carry it, and that instance has to stay alive for the claim to mean
+    //     anything.
+    //
+    // The pool also bounds concurrency, which the previous fire-and-forget loop did not. Requests
+    // shell out to PowerShell and take several seconds, so this is the ceiling on simultaneous
+    // firewall operations; it is sized well above the load a human-driven gate produces.
+    private const int PipeInstanceCount = 8;
+    private const string PipeName = "MFAFirewallPipe";
+
+    [SupportedOSPlatform("windows")]
+    private static NamedPipeServerStream CreatePipeInstance(PipeSecurity security, bool firstInstance)
+    {
+        var options = PipeOptions.Asynchronous;
+        if (firstInstance) options |= PipeOptions.FirstPipeInstance;
+
+        return NamedPipeServerStreamAcl.Create(
+            PipeName,
+            PipeDirection.InOut,
+            // Must match across every instance of the same name; the first instance fixes it.
+            PipeInstanceCount,
+            PipeTransmissionMode.Byte,
+            options,
+            inBufferSize: 0,
+            outBufferSize: 0,
+            security);
+    }
+
+    // FILE_FLAG_FIRST_PIPE_INSTANCE fails if the name already exists, which is exactly the point:
+    // it converts a silent interception (a squatter created the pipe before us, MFAWeb connects to
+    // them and hands over provisioning tokens) into a loud startup failure.
+    //
+    // Retry with backoff rather than exiting. The squatting process may be short-lived, and a
+    // service that refuses to start for good would hand any unprivileged local account a way to
+    // keep the gate down permanently. Alert once, then keep trying quietly.
+    [SupportedOSPlatform("windows")]
+    private async Task<NamedPipeServerStream?> ClaimPipeNameAsync(PipeSecurity security, CancellationToken ct)
+    {
+        var delay    = TimeSpan.FromSeconds(2);
+        var maxDelay = TimeSpan.FromMinutes(5);
+        bool alerted = false;
+
+        while (!ct.IsCancellationRequested)
+        {
             try
             {
-                // Create one server instance per connection — loop back after each.
-                pipe = NamedPipeServerStreamAcl.Create(
-                    "MFAFirewallPipe",
-                    PipeDirection.InOut,
-                    NamedPipeServerStream.MaxAllowedServerInstances,
-                    PipeTransmissionMode.Byte,
-                    PipeOptions.Asynchronous,
-                    inBufferSize: 0,
-                    outBufferSize: 0,
-                    security);
-
-                ServiceLogger.Debug("[IPC] Pipe created, waiting for connection...");
-                await pipe.WaitForConnectionAsync(stoppingToken);
-                ServiceLogger.Debug("[IPC] Client connected.");
-                // Fire-and-forget: handle the connection while immediately
-                // looping back to listen for the next one.
-                _ = HandlePipeConnectionAsync(pipe, stoppingToken);
-            }
-            catch (OperationCanceledException)
-            {
-                pipe?.Dispose();
-                break;
+                var pipe = CreatePipeInstance(security, firstInstance: true);
+                if (alerted)
+                    ServiceLogger.Log($"[IPC] Pipe name '{PipeName}' claimed after earlier failure.");
+                return pipe;
             }
             catch (Exception ex)
             {
-                ServiceLogger.Warn($"[IPC] Named pipe error: {ex.GetType().Name}: {ex.Message}");
-                pipe?.Dispose();
+                ServiceLogger.Error(
+                    $"[IPC] Could not claim pipe name '{PipeName}' ({ex.GetType().Name}: {ex.Message}). " +
+                    "Another process already holds it - the service will not accept requests until it is released.");
+
+                if (!alerted)
+                {
+                    alerted = true;
+                    SendIpcAlert(
+                        "MFA Firewall: IPC pipe name is held by another process",
+                        $"MFAService could not create '{PipeName}' with FILE_FLAG_FIRST_PIPE_INSTANCE:\n\n" +
+                        $"{ex.GetType().Name}: {ex.Message}\n\n" +
+                        "Another process on this host already owns that name. Until it is released, " +
+                        "MFAService cannot accept requests and no firewall rules will be opened. " +
+                        "If this was not an administrator action, treat it as an attempt to intercept " +
+                        "IPC traffic and investigate which process holds the pipe.");
+                }
+
+                try { await Task.Delay(delay, ct); }
+                catch (OperationCanceledException) { return null; }
+
+                delay = TimeSpan.FromTicks(Math.Min(delay.Ticks * 2, maxDelay.Ticks));
             }
+        }
+        return null;
+    }
+
+    // Serves one instance for the process lifetime, reusing it via Disconnect() rather than
+    // disposing and recreating. Disposing would let the live instance count drop and, if every
+    // instance closed at once, release the name.
+    [SupportedOSPlatform("windows")]
+    private async Task ServePipeInstanceAsync(NamedPipeServerStream pipe, CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            try
+            {
+                await pipe.WaitForConnectionAsync(ct);
+            }
+            catch (OperationCanceledException) { return; }
+            catch (Exception ex)
+            {
+                ServiceLogger.Warn($"[IPC] Accept failed: {ex.GetType().Name}: {ex.Message}");
+                // Do not spin if the instance is in a bad state.
+                try { await Task.Delay(TimeSpan.FromSeconds(1), ct); }
+                catch (OperationCanceledException) { return; }
+                continue;
+            }
+
+            ServiceLogger.Debug("[IPC] Client connected.");
+            try
+            {
+                await HandlePipeConnectionAsync(pipe, ct);
+            }
+            finally
+            {
+                // Return the instance to the listening state for the next client.
+                try { pipe.Disconnect(); } catch { /* already gone */ }
+            }
+        }
+    }
+
+    private bool SendIpcAlert(string subject, string body)
+    {
+        var host   = _config["Smtp:Host"];
+        var from   = _config["Smtp:FromAddress"];
+        var notify = _config["Smtp:NotifyAddress"];
+        if (string.IsNullOrWhiteSpace(host) || string.IsNullOrWhiteSpace(from) || string.IsNullOrWhiteSpace(notify))
+        {
+            ServiceLogger.Warn("[IPC] Smtp Host/FromAddress/NotifyAddress not fully configured - cannot send IPC alert.");
+            return false;
+        }
+
+        int  port   = int.TryParse(_config["Smtp:Port"], out var p) ? p : 25;
+        bool useSsl = bool.TryParse(_config["Smtp:UseSsl"], out var s) && s;
+        var  user   = _config["Smtp:Username"];
+        var  pass   = _config["Smtp:Password"];
+
+        try
+        {
+            using var msg = new MailMessage(from, notify)
+            {
+                Subject = subject,
+                Body    = body + "\n\n-- MFAService IPC monitor"
+            };
+            using var client = new SmtpClient(host, port) { EnableSsl = useSsl };
+            if (!string.IsNullOrWhiteSpace(user) && !string.IsNullOrWhiteSpace(pass))
+                client.Credentials = new System.Net.NetworkCredential(user, pass);
+
+            client.Send(msg);
+            ServiceLogger.Log($"[IPC] Alert email sent to {notify}: {subject}");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            ServiceLogger.Error($"[IPC] Failed to send alert email: {ex.Message}");
+            return false;
         }
     }
 
@@ -256,11 +412,22 @@ public class FirewallWorkerService : BackgroundService
             UnixFileMode.UserRead  | UnixFileMode.UserWrite |
             UnixFileMode.GroupRead | UnixFileMode.GroupWrite);
 
+        // Resolved once: the uid the connecting process must be running as. Empty means
+        // "accept anyone the socket mode let through", which is the pre-0.2.0 behaviour.
+        int expectedUid = ResolveExpectedClientUid();
+
         try
         {
             while (!stoppingToken.IsCancellationRequested)
             {
                 var client = await listener.AcceptAsync(stoppingToken);
+
+                if (expectedUid >= 0 && !VerifyPeerUid(client, expectedUid))
+                {
+                    try { client.Dispose(); } catch { }
+                    continue;
+                }
+
                 _ = HandleUnixConnectionAsync(client, stoppingToken);
             }
         }
@@ -272,6 +439,85 @@ public class FirewallWorkerService : BackgroundService
         }
     }
 
+    // struct ucred { pid_t pid; uid_t uid; gid_t gid; } -- three 32-bit fields on every Linux ABI
+    // .NET runs on. SOL_SOCKET = 1, SO_PEERCRED = 17.
+    private const int SOL_SOCKET  = 1;
+    private const int SO_PEERCRED = 17;
+
+    // Defence in depth over the 0660 socket mode: confirm the connecting process really is the
+    // MFAWeb account rather than anything else that happens to share the IPC group. Credentials
+    // are captured by the kernel at connect() time, so this cannot be raced.
+    [SupportedOSPlatform("linux")]
+    private static bool VerifyPeerUid(Socket client, int expectedUid)
+    {
+        try
+        {
+            Span<byte> cred = stackalloc byte[12];
+            int len = client.GetRawSocketOption(SOL_SOCKET, SO_PEERCRED, cred);
+            if (len < 12)
+            {
+                ServiceLogger.Warn($"[IPC] SO_PEERCRED returned {len} bytes - cannot verify peer, rejecting.");
+                return false;
+            }
+
+            // Deliberately ignoring the pid field: it is racy (pids are reused) and nothing here
+            // needs it.
+            int uid = BitConverter.ToInt32(cred.Slice(4, 4));
+            if (uid == expectedUid) return true;
+
+            ServiceLogger.Warn($"[IPC] Rejected connection from uid {uid}; expected uid {expectedUid}.");
+            return false;
+        }
+        catch (Exception ex)
+        {
+            ServiceLogger.Warn($"[IPC] Could not read peer credentials ({ex.GetType().Name}: {ex.Message}) - rejecting.");
+            return false;
+        }
+    }
+
+    // Reads FirewallService:GmsaAccount, which on Linux holds the local account MFAWeb runs as.
+    // Returns -1 when unset or unresolvable, which leaves the socket mode as the only gate and
+    // preserves the behaviour of installs that predate this check.
+    [SupportedOSPlatform("linux")]
+    private int ResolveExpectedClientUid()
+    {
+        var account = _config["FirewallService:GmsaAccount"];
+        if (string.IsNullOrWhiteSpace(account))
+        {
+            ServiceLogger.Warn("[IPC] FirewallService:GmsaAccount is not set - peer uid verification disabled.");
+            return -1;
+        }
+
+        try
+        {
+            var psi = new ProcessStartInfo("/usr/bin/id", $"-u {account}")
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError  = true,
+                UseShellExecute        = false
+            };
+            using var proc = Process.Start(psi);
+            if (proc is null) return -1;
+
+            string output = proc.StandardOutput.ReadToEnd().Trim();
+            proc.WaitForExit(5000);
+
+            if (proc.ExitCode == 0 && int.TryParse(output, out int uid))
+            {
+                ServiceLogger.Log($"[IPC] Peer verification enabled: only uid {uid} ('{account}') may connect.");
+                return uid;
+            }
+
+            ServiceLogger.Warn($"[IPC] Could not resolve uid for '{account}' - peer uid verification disabled.");
+            return -1;
+        }
+        catch (Exception ex)
+        {
+            ServiceLogger.Warn($"[IPC] Could not resolve uid for '{account}' ({ex.Message}) - peer uid verification disabled.");
+            return -1;
+        }
+    }
+
     // A local IPC client has no legitimate reason to take longer than this to send one short
     // line. Without a deadline, a client that connects and sends nothing pins its handler until
     // service shutdown; enough of those exhaust the named-pipe instance limit and MFAWeb can no
@@ -280,9 +526,10 @@ public class FirewallWorkerService : BackgroundService
     private static readonly TimeSpan IpcReadTimeout = TimeSpan.FromSeconds(15);
 
     [SupportedOSPlatform("windows")]
+    // Does NOT dispose the pipe: instances are pooled and reused via Disconnect() by
+    // ServePipeInstanceAsync, so that the pipe name is never released. See PipeInstanceCount.
     private async Task HandlePipeConnectionAsync(NamedPipeServerStream pipe, CancellationToken ct)
     {
-        using (pipe)
         {
             using var readCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             readCts.CancelAfter(IpcReadTimeout);

@@ -520,6 +520,15 @@ MFAService creates the Unix domain socket at `/run/mfafirewall.sock` with mode `
 owned by root, group root by default. Add the `mfaweb` user to the socket's group so
 MFAWeb can connect:
 
+> **Keep the socket in a root-owned, non-world-writable directory.** This is a security
+> invariant, not a convention. `/run` is root-owned, so an unprivileged user cannot create or
+> replace `/run/mfafirewall.sock` and cannot impersonate the privileged service. Relocating the
+> socket to somewhere world-writable such as `/tmp` would allow exactly that, and would silently
+> undo the protection — the mode bits on the socket itself do not help if an attacker can put
+> their own socket at the path first. Both sides also verify each other's credentials with
+> `SO_PEERCRED` (MFAService requires the `mfaweb` uid; MFAWeb requires uid 0), but treat that as
+> defence in depth rather than as permission to move the socket.
+
 The simplest approach is to set the socket group at runtime. In the MFAService source,
 the socket is set to mode `0660`. To allow `mfaweb` to connect, either:
 

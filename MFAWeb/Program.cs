@@ -18,6 +18,8 @@ using System.IO;
 using System.Linq;
 using System.Net.Mail;
 using System.Runtime.InteropServices;
+using System.Runtime.Versioning;
+using System.Security.Principal;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
@@ -1621,7 +1623,13 @@ public static class IpcFirewallClient
 
         AuditLogger.Debug($"[IPC] Connecting to pipe...");
         await pipe.ConnectAsync(TimeoutMs, cts.Token);
-        AuditLogger.Debug($"[IPC] Connected. Sending request...");
+
+        // Verify who we actually reached BEFORE sending anything. Requests carry provisioning
+        // tokens, so a local process that squatted the pipe name would otherwise be handed
+        // credential material simply for answering the phone. This checks the security descriptor
+        // of the instance we are connected to, so it cannot be swapped afterwards.
+        if (OperatingSystem.IsWindows()) VerifyPipeServerIdentity(pipe);
+        AuditLogger.Debug($"[IPC] Connected and server identity verified. Sending request...");
 
         // Direct byte I/O — avoids StreamReader/StreamWriter BOM and buffering issues on pipes
         byte[] requestBytes = Encoding.UTF8.GetBytes(request + "\n");
@@ -1649,12 +1657,91 @@ public static class IpcFirewallClient
         return response;
     }
 
+    // The privileged service creates the pipe with an explicit owner of LocalSystem. Accept
+    // BUILTIN\Administrators as well: the owner of an object created without an explicit SetOwner
+    // is a token default that is not contractually S-1-5-18, so an MFAWeb newer than its
+    // MFAService would otherwise fail every request and lock users out of the network. Neither SID
+    // can be claimed as owner by an unprivileged process, so accepting both costs nothing here.
+    [SupportedOSPlatform("windows")]
+    private static void VerifyPipeServerIdentity(NamedPipeClientStream pipe)
+    {
+        IdentityReference? owner;
+        try
+        {
+            owner = pipe.GetAccessControl().GetOwner(typeof(SecurityIdentifier));
+        }
+        catch (Exception ex)
+        {
+            // Distinct from a mismatch on purpose: this is almost always a permissions or
+            // platform problem, not an attack, and an operator should be able to tell instantly.
+            AuditLogger.Error($"[IPC] Could not read pipe security descriptor ({ex.GetType().Name}: {ex.Message}) - refusing to send.");
+            throw new IOException("Unable to verify the identity of the IPC endpoint.", ex);
+        }
+
+        if (owner is not SecurityIdentifier sid)
+        {
+            AuditLogger.Error("[IPC] Pipe has no readable owner SID - refusing to send.");
+            throw new IOException("The IPC endpoint has no owner.");
+        }
+
+        if (sid.IsWellKnown(WellKnownSidType.LocalSystemSid) ||
+            sid.IsWellKnown(WellKnownSidType.BuiltinAdministratorsSid))
+            return;
+
+        AuditLogger.Error(
+            $"[IPC] Pipe owner is {sid.Value}, expected LocalSystem or BUILTIN\\Administrators. " +
+            "Another process is impersonating the privileged service - refusing to send.");
+        throw new IOException($"IPC endpoint is owned by an unexpected principal ({sid.Value}).");
+    }
+
+    // struct ucred { pid_t pid; uid_t uid; gid_t gid; }. SOL_SOCKET = 1, SO_PEERCRED = 17.
+    private const int SOL_SOCKET  = 1;
+    private const int SO_PEERCRED = 17;
+
+    // Linux equivalent of the pipe owner check. Per socket(7) the credentials returned to a
+    // client are those in effect when the server called listen(), so this cannot be raced.
+    //
+    // Note this is belt-and-braces rather than the primary control: /run is root-owned and not
+    // world-writable, so an unprivileged user cannot pre-create or replace the socket there in the
+    // first place. That directory permission is the real defence and is an install invariant --
+    // moving the socket somewhere world-writable would reopen the hole this guards.
+    [SupportedOSPlatform("linux")]
+    private static void VerifyUnixServerIdentity(Socket socket)
+    {
+        int uid;
+        try
+        {
+            Span<byte> cred = stackalloc byte[12];
+            int len = socket.GetRawSocketOption(SOL_SOCKET, SO_PEERCRED, cred);
+            if (len < 12)
+            {
+                AuditLogger.Error($"[IPC] SO_PEERCRED returned {len} bytes - refusing to send.");
+                throw new IOException("Unable to verify the identity of the IPC endpoint.");
+            }
+            uid = BitConverter.ToInt32(cred.Slice(4, 4));
+        }
+        catch (IOException) { throw; }
+        catch (Exception ex)
+        {
+            AuditLogger.Error($"[IPC] Could not read peer credentials ({ex.GetType().Name}: {ex.Message}) - refusing to send.");
+            throw new IOException("Unable to verify the identity of the IPC endpoint.", ex);
+        }
+
+        if (uid == 0) return;
+
+        AuditLogger.Error($"[IPC] Socket peer runs as uid {uid}, expected 0 (root) - refusing to send.");
+        throw new IOException($"IPC endpoint is owned by an unexpected uid ({uid}).");
+    }
+
     private static async Task<string?> SendViaUnixSocketAsync(string request)
     {
         using var cts    = new CancellationTokenSource(TimeoutMs);
         using var socket = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
 
         await socket.ConnectAsync(new UnixDomainSocketEndPoint(UnixSocketPath), cts.Token);
+
+        // Same ordering discipline as the Windows path: verify before the first write.
+        if (OperatingSystem.IsLinux()) VerifyUnixServerIdentity(socket);
 
         using var stream = new NetworkStream(socket, ownsSocket: false);
 

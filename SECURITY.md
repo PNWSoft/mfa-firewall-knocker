@@ -272,12 +272,19 @@ Tracked, understood, and not currently considered exploitable:
   which needs the passkey ceremonies re-tested against real authenticators first.
 - **The public-IP filter does not individually reject** multicast, reserved, broadcast, or
   TEST-NET ranges. None of these can be a live TCP source address, so there is no impact.
-- **The Windows named-pipe client does not verify the server's identity.** A local,
-  unprivileged user who pre-creates the pipe name before MFAService starts could observe
-  MFAWeb's IPC traffic (short-lived provisioning tokens, passkey public keys) or cause a
-  denial of service. It cannot forge a firewall change or a database write — those require
-  the real privileged service. Local access is otherwise out of scope, so this is tracked
-  rather than fixed.
+- **A local user can still deny service by holding the IPC pipe name** (Windows). Fixed in
+  0.2.0 was the more serious half: a local, unprivileged user who pre-created
+  `MFAFirewallPipe` before MFAService started used to receive MFAWeb's requests, which meant
+  reading short-lived provisioning tokens *and* answering with forged responses — replying
+  `SUCCESS` to a token-burn that never happened, for instance. MFAWeb now reads the pipe's
+  owner SID before sending anything and refuses to transmit unless the endpoint is owned by
+  LocalSystem or Administrators, neither of which an unprivileged process can claim. MFAService
+  additionally claims the name with `FILE_FLAG_FIRST_PIPE_INSTANCE` and holds a pool of
+  long-lived instances so the name is never released while it runs.
+  What remains is availability: a squatter who wins the name during a restart window keeps
+  MFAService from binding. That is unavoidable with a fixed pipe name and it now fails closed
+  and loudly — the service logs an error, emails `Smtp:NotifyAddress` once, and retries with
+  backoff until the name is free. Interception is closed even in that window.
 - **Email addresses with a quoted `|` in the local part cannot authenticate.** The IPC
   protocol is `|`-delimited and the privileged side rejects requests with the wrong field
   count, so such an address fails closed rather than open. Provisioning does not currently
