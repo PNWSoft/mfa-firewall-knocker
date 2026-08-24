@@ -449,6 +449,15 @@ sudo chmod 640 /etc/mfa-auth/users.json
 [Unit]
 Description=MFA Firewall Service
 After=network.target
+# Give up after five failures in five minutes and enter the failed state, where an operator
+# can see it. Without a limit this unit can flap indefinitely if something else is holding
+# /run/mfafirewall.sock -- a second copy started by hand, for instance. Type=notify reports
+# READY before the IPC endpoint is claimed, so an attempt that then fails still counts as a
+# successful start and resets systemd's rate limiting. Each cycle also sends an alert email,
+# so an unbounded loop buries the mailbox and can get the relay to throttle the alerts that
+# matter. These belong in [Unit]; systemd ignores them under [Service].
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=notify
@@ -478,6 +487,11 @@ After=network.target mfa-service.service
 Wants=mfa-service.service
 # Deliberately Wants=, not Requires=: Requires= propagates STOP, so restarting
 # MFAService would take MFAWeb down and leave it down.
+# Give up after five failures in five minutes rather than restarting forever -- a bad
+# certificate path or a port already in use will not fix itself, and the failed state is
+# visible where a restart loop is not. These belong in [Unit], not [Service].
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=notify
