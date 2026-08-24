@@ -551,11 +551,8 @@ public class FirewallWorkerService : BackgroundService
         // wrongly reports a dead instance as alive.
         FileStream? instanceLock = null;
         Socket? listener = null;
-        var delay    = TimeSpan.FromSeconds(2);
-        var maxDelay = TimeSpan.FromMinutes(5);
-        bool alerted = false;
 
-        while (listener is null && !stoppingToken.IsCancellationRequested)
+        // Single pass: this either takes the endpoint or the process is a duplicate and stops.
         {
             bool endpointBusy = false;
 
@@ -595,8 +592,6 @@ public class FirewallWorkerService : BackgroundService
                     candidate.Bind(new UnixDomainSocketEndPoint(socketPath));
                     candidate.Listen(backlog: 10);
                     listener = candidate;
-                    if (alerted) ServiceLogger.Log("[IPC] Socket claimed after earlier failure.");
-                    break;
                 }
                 catch (SocketException ex)
                 {
@@ -616,10 +611,7 @@ public class FirewallWorkerService : BackgroundService
                     $"[IPC] {socketPath} is already owned by a live process. This instance is a " +
                     "duplicate and is stopping.");
 
-                // Only consume the one-shot flag if the mail actually went out.
-                if (!alerted)
-                {
-                    alerted = SendIpcAlert(
+                SendIpcAlert(
                         "MFA Firewall: the IPC socket is already in use",
                         $"MFAService could not take ownership of {socketPath} because another process " +
                         "is listening on it.\n\n" +
@@ -628,7 +620,6 @@ public class FirewallWorkerService : BackgroundService
                         "standing down rather than taking over. Running the binary by hand while the " +
                         "service is running is the usual cause.\n\n" +
                         "This instance is stopping. The running service is unaffected.");
-                }
 
                 // Stop, rather than retry as the Windows path does. The asymmetry is deliberate
                 // and follows from who can hold the endpoint. The socket lives in /run, which
