@@ -382,28 +382,25 @@ public class FirewallWorkerService : BackgroundService
                 string subject, detail;
                 if (identityProblem)
                 {
-                    subject = "MFA Firewall: IPC server cannot resolve its service account";
-                    detail  = $"MFAService could not build the pipe security descriptor:\n\n{ex.GetType().Name}: {ex.Message}\n\n" +
-                              "This usually means the account in FirewallService:GmsaAccount cannot be resolved - " +
-                              "a domain controller may be unreachable, which is common briefly after a reboot. " +
-                              "MFAService is retrying and will start accepting requests once it succeeds. " +
-                              "No firewall rules can be opened until then.";
+                    subject = $"MFA Firewall: MFAService cannot resolve its service account on {Environment.MachineName}";
+                    detail  = "MFAService cannot resolve the account in FirewallService:GmsaAccount, so its IPC " +
+                              "server has not started and no firewall rules can be opened. A domain controller " +
+                              "being briefly unreachable after a reboot is the usual cause. It keeps retrying and " +
+                              $"recovers on its own.\n\n{ex.GetType().Name}: {ex.Message}";
                     ServiceLogger.Error(
                         $"[IPC] Could not build pipe security ({ex.GetType().Name}: {ex.Message}). " +
                         "The service account may not be resolvable yet - retrying.");
                 }
                 else
                 {
-                    subject = "MFA Firewall: IPC pipe name is held by another process";
-                    detail  = $"MFAService could not create '{PipeName}' with FILE_FLAG_FIRST_PIPE_INSTANCE:\n\n" +
+                    subject = $"MFA Firewall: IPC pipe name held by another process on {Environment.MachineName}";
+                    detail  = $"Another process on {Environment.MachineName} owns the named pipe '{PipeName}', so " +
+                              "MFAService cannot accept requests and no firewall rules will be opened. It keeps " +
+                              "retrying and recovers on its own once the name is free.\n\n" +
                               $"{ex.GetType().Name}: {ex.Message}\n\n" +
-                              "Another process on this host already owns that name. Until it is released, " +
-                              "MFAService cannot accept requests and no firewall rules will be opened. " +
-                              "If this was not an administrator action, treat it as an attempt to intercept " +
-                              "IPC traffic and investigate which process holds the pipe.\n\n" +
-                              "Note: running MFAService.exe from an elevated console rather than as a service " +
-                              "also produces this, because assigning LocalSystem as the pipe owner requires the " +
-                              "SYSTEM token.";
+                              "Usual causes are MFAService.exe started by hand from an elevated console, or a " +
+                              "duplicate service. If neither applies, find out which process holds the pipe - an " +
+                              "unprivileged process holding it is an attempt to intercept IPC traffic.";
                     ServiceLogger.Error(
                         $"[IPC] Could not claim pipe name '{PipeName}' ({ex.GetType().Name}: {ex.Message}). " +
                         "Another process already holds it - the service will not accept requests until it is released.");
@@ -612,14 +609,11 @@ public class FirewallWorkerService : BackgroundService
                     "duplicate and is stopping.");
 
                 SendIpcAlert(
-                        "MFA Firewall: the IPC socket is already in use",
-                        $"MFAService could not take ownership of {socketPath} because another process " +
-                        "is listening on it.\n\n" +
-                        "Two instances would both sweep firewall rules and both write the user store, " +
-                        "and clients would reach whichever bound the socket last, so this instance is " +
-                        "standing down rather than taking over. Running the binary by hand while the " +
-                        "service is running is the usual cause.\n\n" +
-                        "This instance is stopping. The running service is unaffected.");
+                    $"MFA Firewall: duplicate MFAService stopped on {Environment.MachineName}",
+                    $"Another MFAService instance is already running on {Environment.MachineName} and owns " +
+                    $"{socketPath}, so this one terminated without doing anything.\n\n" +
+                    "The running service is unaffected. The usual cause is starting the binary by hand " +
+                    "while the service is running.");
 
                 // Stop, rather than retry as the Windows path does. The asymmetry is deliberate
                 // and follows from who can hold the endpoint. The socket lives in /run, which
