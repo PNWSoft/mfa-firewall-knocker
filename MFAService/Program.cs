@@ -85,7 +85,10 @@ builder.Services.AddHostedService<DatabaseLockService>();
 builder.Services.AddHostedService<CertificateMonitorService>();
 
 await builder.Build().RunAsync();
-return 0;
+
+// Not a hard-coded 0: a background service that faulted sets Environment.ExitCode to 1 before
+// the host shuts down, and returning a literal here would discard that and report success.
+return Environment.ExitCode;
 
 // ---------------------------------------------------------------------------
 // Logger: writes to console + daily rotating log file
@@ -223,7 +226,13 @@ public class FirewallWorkerService : BackgroundService
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            ServiceLogger.Log($"[WORKER] Fatal error - service stopping: {ex}");
+            ServiceLogger.Error($"[WORKER] Fatal error - service stopping: {ex}");
+
+            // A background-service fault stops the host gracefully, so the process would
+            // otherwise exit 0 and report to systemd, the SCM and any monitoring that it stopped
+            // normally. It did not. This is read back by the entry point, which returns it rather
+            // than a hard-coded 0.
+            Environment.ExitCode = 1;
             throw;
         }
         ServiceLogger.Log("[WORKER] Firewall Worker Service stopped.");
