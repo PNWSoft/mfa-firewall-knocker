@@ -120,6 +120,25 @@ unprivileged and the privileged half re-validates every request instead of trust
 Netting it out: neither gate is redundant with the other, getting through the pair means two
 unrelated failures lining up, and the price of that is one more small service to keep patched.
 
+#### What happens if MFAService stops
+
+Worth being precise, because the intuition tends to run the wrong way. Firewall rules live in the
+firewall, not in this program. If MFAService is not running — crashed, stopped, blocked from its
+IPC endpoint, or never started — **nothing about the current rule set changes**:
+
+- **The standing block stays.** Whatever denies the protected port by default is a rule you
+  configured; it is unaffected, so the port remains closed and unreachable. Protection is not lost.
+- **No new access can be granted.** Nobody can authenticate their way in while the service is
+  down. That is the actual failure, and it is fail-closed.
+- **Grants already open stay open, past their expiry.** This is the part that surprises people.
+  Expiry is not enforced by the firewall — the `exp:` value is a comment the sweeper reads. With
+  the sweeper down, an open rule simply persists until the service returns and removes it.
+
+So an outage costs you the ability to let people in, plus the timely removal of rules already
+issued. It does not open anything. If a service outage is prolonged and an open grant concerns
+you, delete the rule directly — `iptables -D` or `Remove-NetFirewallRule` — rather than waiting
+for the sweeper.
+
 ### Where the credential goes
 
 Files leave. A laptop is lost or stolen. A backup or disk image ends up somewhere it shouldn't.

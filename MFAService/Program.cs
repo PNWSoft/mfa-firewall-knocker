@@ -374,7 +374,11 @@ public class FirewallWorkerService : BackgroundService
     //
     // Retry with backoff rather than exiting. The squatting process may be short-lived, and a
     // service that refuses to start for good would hand any unprivileged local account a way to
-    // keep the gate down permanently. Alert once, then keep trying quietly.
+    // stop anyone from being granted access. Note what does NOT happen while this service is
+    // down: firewall rules are untouched, so the standing block stays and the protected port
+    // stays closed, and any MFA rules already open stay open because nothing is sweeping them.
+    // The failure is loss of grant and expiry, not loss of protection. Alert once, then keep
+    // trying quietly.
     [SupportedOSPlatform("windows")]
     private async Task<(NamedPipeServerStream Pipe, PipeSecurity Security)?> ClaimPipeNameAsync(
         Func<PipeSecurity> buildSecurity, CancellationToken ct)
@@ -395,8 +399,9 @@ public class FirewallWorkerService : BackgroundService
                 {
                     ServiceLogger.Log($"[IPC] Pipe name '{PipeName}' claimed after earlier failure.");
 
-                    // Close the loop. Sending a "the gate is down" alert and then never saying it
-                    // recovered leaves an operator to guess, or to go and check by hand.
+                    // Close the loop. Sending an alert that the service cannot accept requests and
+                    // then never saying it recovered leaves an operator to guess, or to go and
+                    // check by hand.
                     SendIpcAlert(
                         $"MFA Firewall: IPC server recovered on {Environment.MachineName}",
                         $"MFAService has claimed the named pipe '{PipeName}' on {Environment.MachineName} " +
@@ -684,7 +689,7 @@ public class FirewallWorkerService : BackgroundService
                 // only root can write, so a live holder is root -- in practice the real service,
                 // which makes this process the duplicate, and a duplicate should go away. On
                 // Windows any user can create a pipe name, so a squatter may be unprivileged and
-                // exiting for good would let any local account keep the gate down; there we
+                // exiting for good would let any local account block all future grants; there we
                 // retry to reclaim the name when it frees.
                 throw new IOException(
                     $"{socketPath} is owned by another live MFAService instance. Stopping this duplicate.");
