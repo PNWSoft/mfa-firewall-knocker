@@ -135,9 +135,17 @@ IPC endpoint, or never started — **nothing about the current rule set changes*
   the sweeper down, an open rule simply persists until the service returns and removes it.
 
 So an outage costs you the ability to let people in, plus the timely removal of rules already
-issued. It does not open anything. If a service outage is prolonged and an open grant concerns
-you, delete the rule directly — `iptables -D` or `Remove-NetFirewallRule` — rather than waiting
-for the sweeper.
+issued. It does not open anything.
+
+If an outage runs long and an open grant concerns you, **`MFAAdmin reset` removes every
+MFA-granted rule and does not need MFAService**. It runs elevated and issues the firewall commands
+itself — `Remove-NetFirewallRule` on Windows, `iptables -D` on Linux — then re-reads the rule list
+and tells you what is actually left rather than assuming the deletions worked. That makes it the
+tool for exactly this situation, and for emergency revocation generally. `MFAAdmin diag` lists the
+rules first if you want to look before removing.
+
+It is all-or-nothing: there is no per-user or per-rule revocation, so everyone re-authenticates
+afterwards. To drop a single grant, delete that one rule directly instead.
 
 ### Where the credential goes
 
