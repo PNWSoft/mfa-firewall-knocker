@@ -1,0 +1,23 @@
+<Project>
+
+  <PropertyGroup>
+    <!--
+      Keep the build machine's directory layout out of shipped binaries.
+
+      Without this, source paths are embedded verbatim and surface in any stack trace the service
+      logs - a published release was printing "C:\Users\<name>\source\repos\..." into customer log
+      files. That is not a vulnerability, but it leaks the maintainer's local layout into every
+      deployment and makes logs look careless.
+
+      ContinuousIntegrationBuild normalises embedded paths to deterministic, repository-relative
+      ones. It also makes builds reproducible, which matters for a signed security tool: two people
+      building the same commit should be able to compare hashes.
+    -->
+    <ContinuousIntegrationBuild>true</ContinuousIntegrationBuild>
+    <Deterministic>true</Deterministic>
+
+    <!-- Stack traces stay useful; only the recorded paths change. -->
+    <DebugType>portable</DebugType>
+  </PropertyGroup>
+
+</Project>

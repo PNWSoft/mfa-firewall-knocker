@@ -111,6 +111,20 @@ internal static class IpcOwnership
 
     public static Task Claimed => _claimed.Task;
     public static void MarkClaimed() => _claimed.TrySetResult();
+
+    // How long a waiter should hold off before acting anyway.
+    //
+    // Waiting forever was wrong. On Windows the claim retries indefinitely -- a squatted pipe
+    // name, or LSA unable to resolve the gMSA during a domain-controller outage -- and a sweeper
+    // blocked on that stops expiring rules that are already open. An unprivileged local user who
+    // squats the pipe across a service restart could hold every existing grant open indefinitely,
+    // turning a fail-closed design fail-open for standing rules. The same argument applies to
+    // certificate-expiry alerts, where silence means an eventual total lockout.
+    //
+    // A duplicate doing either is redundant but harmless: removing an expired rule is idempotent,
+    // and a second expiry warning is noise. Rules that never expire, and warnings that never
+    // arrive, are not. So bound the wait rather than making it absolute.
+    public static readonly TimeSpan MaxWait = TimeSpan.FromMinutes(2);
 }
 
 internal static class ServiceLogger
@@ -378,7 +392,17 @@ public class FirewallWorkerService : BackgroundService
                 var security = buildSecurity();
                 var pipe = CreatePipeInstance(security, firstInstance: true);
                 if (alerted)
+                {
                     ServiceLogger.Log($"[IPC] Pipe name '{PipeName}' claimed after earlier failure.");
+
+                    // Close the loop. Sending a "the gate is down" alert and then never saying it
+                    // recovered leaves an operator to guess, or to go and check by hand.
+                    SendIpcAlert(
+                        $"MFA Firewall: IPC server recovered on {Environment.MachineName}",
+                        $"MFAService has claimed the named pipe '{PipeName}' on {Environment.MachineName} " +
+                        "and is accepting requests again. Firewall rules can be opened normally.\n\n" +
+                        "This follows an earlier alert about the endpoint being unavailable. No action needed.");
+                }
                 return (pipe, security);
             }
             catch (Exception ex)
@@ -560,7 +584,12 @@ public class FirewallWorkerService : BackgroundService
 
         // Single pass: this either takes the endpoint or the process is a duplicate and stops.
         {
-            bool endpointBusy = false;
+            // Three distinct failures, deliberately NOT collapsed into one flag. Holding the lock
+            // proves no live MFAService owns the endpoint, so a bind that fails while we hold it
+            // is an environment problem -- not a duplicate. Reporting it as one would tell an
+            // operator "the running service is unaffected" when nothing is running at all.
+            bool duplicate  = false;   // another instance genuinely owns the endpoint
+            string? envFail = null;    // we own the claim but could not open the endpoint
 
             // Hold the lock across probe-unlink-bind so two starting instances cannot both
             // conclude the socket is stale and unlink each other's.
@@ -571,26 +600,26 @@ public class FirewallWorkerService : BackgroundService
             }
             catch (IOException)
             {
-                endpointBusy = true;
+                duplicate = true;
             }
 
-            if (!endpointBusy && File.Exists(socketPath))
+            if (!duplicate && File.Exists(socketPath))
             {
                 try
                 {
                     using var probe = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
                     probe.Connect(new UnixDomainSocketEndPoint(socketPath));
-                    endpointBusy = true;
+                    duplicate = true;
                 }
                 catch (SocketException)
                 {
                     ServiceLogger.Warn($"[IPC] Removing stale socket {socketPath} left by a previous run.");
                     try { File.Delete(socketPath); }
-                    catch (Exception ex) { ServiceLogger.Error($"[IPC] Could not remove stale socket: {ex.Message}"); endpointBusy = true; }
+                    catch (Exception ex) { envFail = $"could not remove the stale socket file ({ex.GetType().Name}: {ex.Message})"; }
                 }
             }
 
-            if (!endpointBusy)
+            if (!duplicate && envFail is null)
             {
                 try
                 {
@@ -601,10 +630,34 @@ public class FirewallWorkerService : BackgroundService
                 }
                 catch (SocketException ex)
                 {
-                    ServiceLogger.Error($"[IPC] Could not bind {socketPath}: {ex.SocketErrorCode} ({ex.Message}).");
-                    endpointBusy = true;
+                    envFail = $"bind failed with {ex.SocketErrorCode} ({ex.Message})";
                 }
             }
+
+            // Not a duplicate: we held the lock, so no other instance owns the endpoint. Report it
+            // as what it is - the host will not serve IPC and needs attention.
+            if (envFail is not null)
+            {
+                instanceLock?.Dispose();
+                instanceLock = null;
+
+                ServiceLogger.Error(
+                    $"[IPC] Could not open {socketPath}: {envFail}. No other MFAService instance holds it, " +
+                    "so this is an environment problem rather than a duplicate. No firewall rules can be opened.");
+
+                SendIpcAlert(
+                    $"MFA Firewall: MFAService cannot open its IPC socket on {Environment.MachineName}",
+                    $"MFAService could not open {socketPath} on {Environment.MachineName}: {envFail}.\n\n" +
+                    "No other instance holds the endpoint, so this is not a duplicate - the socket path or " +
+                    "its directory is the likely cause (permissions, a leftover directory at that path, or " +
+                    "a security policy such as AppArmor or SELinux).\n\n" +
+                    "No firewall rules can be opened until this is resolved.");
+
+                Environment.ExitCode = 1;
+                throw new IOException($"Could not open {socketPath}: {envFail}");
+            }
+
+            bool endpointBusy = duplicate;
 
             if (endpointBusy)
             {
@@ -623,6 +676,8 @@ public class FirewallWorkerService : BackgroundService
                     $"{socketPath}, so this one terminated without doing anything.\n\n" +
                     "The running service is unaffected. The usual cause is starting the binary by hand " +
                     "while the service is running.");
+
+                Environment.ExitCode = 1;
 
                 // Stop, rather than retry as the Windows path does. The asymmetry is deliberate
                 // and follows from who can hold the endpoint. The socket lives in /run, which
@@ -1201,8 +1256,19 @@ public class FirewallWorkerService : BackgroundService
     // -----------------------------------------------------------------------
     private static async Task RunSweeperAsync(CancellationToken stoppingToken)
     {
-        // Do not touch the firewall until this process owns the IPC endpoint. See IpcOwnership.
-        await IpcOwnership.Claimed.WaitAsync(stoppingToken);
+        // Prefer to start only once this process owns the IPC endpoint, so a duplicate stays
+        // inert -- but never let that wait stop rules from expiring. See IpcOwnership.MaxWait.
+        try
+        {
+            await IpcOwnership.Claimed.WaitAsync(IpcOwnership.MaxWait, stoppingToken);
+        }
+        catch (TimeoutException)
+        {
+            ServiceLogger.Warn(
+                $"[SWEEPER] IPC endpoint not owned after {IpcOwnership.MaxWait.TotalMinutes:0} minutes - " +
+                "sweeping anyway so open rules still expire. Expect an IPC alert explaining why the " +
+                "endpoint is unavailable.");
+        }
 
         ServiceLogger.Log("[SWEEPER] Starting...");
         using var timer = new PeriodicTimer(TimeSpan.FromMinutes(5));
@@ -1720,9 +1786,20 @@ public class CertificateMonitorService : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        // A duplicate instance must not send expiry alerts: the operator would get two of every
-        // warning from a process that is otherwise doing nothing. See IpcOwnership.
-        await IpcOwnership.Claimed.WaitAsync(stoppingToken);
+        // Prefer to stay quiet in a duplicate -- two of every warning helps nobody -- but do not
+        // let that suppress the alert entirely if the endpoint never becomes available. An
+        // expired certificate means no passkey ceremony and therefore a total lockout, which is
+        // precisely what this alert exists to warn about.
+        try
+        {
+            await IpcOwnership.Claimed.WaitAsync(IpcOwnership.MaxWait, stoppingToken);
+        }
+        catch (TimeoutException)
+        {
+            ServiceLogger.Warn(
+                $"[CERT] IPC endpoint not owned after {IpcOwnership.MaxWait.TotalMinutes:0} minutes - " +
+                "monitoring anyway so certificate expiry is still reported.");
+        }
 
         // The certificate store is a Windows concept. On Linux the certificate is a PEM file,
         // so watch that instead -- this alert must work on BOTH platforms. An expired cert on a
@@ -1897,7 +1974,8 @@ public class CertificateMonitorService : BackgroundService
                 Subject = subject,
                 Body    = body + "\n\n-- MFAService certificate monitor"
             };
-            using var client = new SmtpClient(host, port) { EnableSsl = useSsl };
+            // Bounded like the IPC alert path: a hung relay must not stall a check cycle.
+            using var client = new SmtpClient(host, port) { EnableSsl = useSsl, Timeout = 10000 };
             if (!string.IsNullOrWhiteSpace(user) && !string.IsNullOrWhiteSpace(pass))
                 client.Credentials = new System.Net.NetworkCredential(user, pass);
 
