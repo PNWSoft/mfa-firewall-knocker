@@ -285,6 +285,18 @@ Tracked, understood, and not currently considered exploitable:
   MFAService from binding. That is unavoidable with a fixed pipe name and it now fails closed
   and loudly — the service logs an error, emails `Smtp:NotifyAddress` once, and retries with
   backoff until the name is free. Interception is closed even in that window.
+- **This only adds allow rules; it never removes one.** If the protected port is reachable for
+  some other reason — a standing allow rule, a blanket accept on the internet-facing interface, a
+  permissive default policy, an upstream forward that bypasses the host's INPUT chain — then every
+  grant is redundant and the gate protects nothing, while the logs, the UI and the rule list all
+  look exactly as they would if it were working. There is no symptom, so it will not be noticed by
+  accident. INSTALL.md has a "Verify the gate is actually gating" section; run it after install and
+  after any firewall change.
+- **On Linux the rule is created with `iptables`, so a client connecting over public IPv6 gets no
+  rule.** Both sides accept a public IPv6 address as valid, and the user is shown ACCESS GRANTED,
+  but the `iptables` call cannot create a v6 rule and the verification logs a failure. It fails
+  closed — nothing is opened — but the report to the user is wrong. Until `ip6tables` support
+  exists, publish an A record only, or disable the IPv6 listener on Linux deployments.
 - **Email addresses with a quoted `|` in the local part cannot authenticate.** The IPC
   protocol is `|`-delimited and the privileged side rejects requests with the wrong field
   count, so such an address fails closed rather than open. Provisioning does not currently

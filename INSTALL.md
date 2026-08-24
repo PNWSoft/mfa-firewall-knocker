@@ -733,6 +733,55 @@ then re-run it.
 
 ---
 
+## Verify the gate is actually gating
+
+**Do this after installing, and again after any firewall change.** It is the one check that
+distinguishes a working deployment from a decorative one, and nothing else will tell you.
+
+This tool only adds *allow* rules. It never removes anything. If the protected port is already
+reachable for another reason, every grant it opens is redundant and the gate protects nothing —
+while the logs, the web UI and the firewall rules all continue to look exactly as they would if it
+were working. There is no symptom.
+
+The usual causes are ordinary and easy to miss:
+
+- a **standing allow rule** for the protected port, left from before the gate was installed
+- a **blanket accept on the internet-facing interface** (`-A INPUT -i eth0 -j ACCEPT`) — check
+  which interface actually carries the default route rather than assuming, since the public NIC is
+  not always the first one
+- a permissive default policy (`-P INPUT ACCEPT`, or a `ufw`/`firewalld` zone set to allow)
+- a **port-forward or upstream firewall** that reaches the service without traversing this host's
+  INPUT chain
+
+**The test — from an address that has *not* authenticated:**
+
+```bash
+# Should FAIL / time out while you hold no grant.
+nc -vz -w 5 your-host.example.com 51820      # UDP: use `nc -vzu`
+```
+
+Then authenticate through MFAWeb from that address and repeat: it should now succeed, and fail
+again once the grant expires. A port that is reachable *before* you authenticate means the gate is
+not in the path.
+
+Inspect the rules directly too:
+
+```bash
+sudo iptables -S INPUT     # look for any accept for the protected port that is not MFA_Temp_*
+ip route get 8.8.8.8       # confirms which interface is internet-facing
+```
+```powershell
+Get-NetFirewallRule -Enabled True -Direction Inbound |
+  Where-Object { $_.Name -notlike 'MFA_Temp_*' } |
+  Where-Object { ($_ | Get-NetFirewallPortFilter).LocalPort -contains '51820' }
+```
+
+If you deliberately keep a standing allow while testing — a reasonable thing to do so you don't
+lock yourself out mid-install — write yourself a note to remove it. Until you do, the gate is
+inert.
+
+---
+
 ## Upgrading
 
 > **Do the upgrade over a connection that does not depend on this gate.**

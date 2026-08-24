@@ -723,7 +723,13 @@ public class FirewallWorkerService : BackgroundService
 
         // STRICT ENFORCEMENT: Only accept exactly 2 parameters from the Web App.
         if (parts.Length != 2)
+        {
+            // Warn rather than stay silent. MFAWeb never sends a malformed request, so one
+            // arriving means something else reached the IPC endpoint - worth being visible to
+            // anyone watching for that, even though the request is rejected here regardless.
+            ServiceLogger.Warn($"[IPC] Rejected malformed request ({parts.Length} field(s), expected 2).");
             return "ERROR: Invalid request format. Expected 'IP|Username'";
+        }
 
         string ip = parts[0].Trim();
         string username = parts[1].Trim();
@@ -919,7 +925,10 @@ public class FirewallWorkerService : BackgroundService
             if (verifyOutput.Equals(ruleName, StringComparison.OrdinalIgnoreCase))
                 ServiceLogger.Log($"[SUCCESS] Rule verified: {protocol}/{port} OPEN for {ip}.");
             else
-                ServiceLogger.Log($"[FAILED] Rule '{ruleName}' could not be verified after creation.");
+                // Warn, not Log: a verification failure means the grant the user was told they
+                // received may not exist. At INFO it disappears under Logging:AppMinLevel=warning,
+                // which is exactly the setting a production host is likely to run.
+                ServiceLogger.Warn($"[FAILED] Rule '{ruleName}' could not be verified after creation.");
         }
         else
         {
@@ -959,7 +968,7 @@ public class FirewallWorkerService : BackgroundService
             if (verified)
                 ServiceLogger.Log($"[SUCCESS] iptables rule verified: {protocol}/{port} OPEN for {ip}.");
             else
-                ServiceLogger.Log($"[FAILED] iptables rule could not be verified: {protocol}/{port} for {ip}.");
+                ServiceLogger.Warn($"[FAILED] iptables rule could not be verified: {protocol}/{port} for {ip}.");
         }
     }
 
