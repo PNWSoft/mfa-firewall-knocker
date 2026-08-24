@@ -151,10 +151,19 @@ public class FirewallWorkerService : BackgroundService
         ServiceLogger.Log("[WORKER] Firewall Worker Service starting...");
         try
         {
-            await Task.WhenAll(
-                RunIpcServerAsync(stoppingToken),
-                RunSweeperAsync(stoppingToken)
-            );
+            var ipc     = RunIpcServerAsync(stoppingToken);
+            var sweeper = RunSweeperAsync(stoppingToken);
+
+            // Deliberately not Task.WhenAll: it does not surface a fault until every task has
+            // completed, and the sweeper runs until shutdown. An IPC server that died during
+            // startup would therefore fail silently -- nothing logged, the service still
+            // reporting healthy to the SCM, and nobody able to open a firewall port until a
+            // human noticed. Observe whichever finishes first so the fault propagates, the
+            // service stops, and SCM recovery can act on it.
+            var finished = await Task.WhenAny(ipc, sweeper);
+            await finished;
+
+            await Task.WhenAll(ipc, sweeper);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -188,36 +197,45 @@ public class FirewallWorkerService : BackgroundService
             throw new Exception("gMSA account name not found in configuration.");
         }
 
-        // Convert the string to an NTAccount object
-        var gmsaAccount = new NTAccount(gmsaName);
+        // Built inside the retry loop, not here. Translating the gMSA NTAccount to a SID goes to
+        // LSA, which throws IdentityNotMappedException when the domain controller is not yet
+        // reachable -- routine on a cold boot. Constructing this outside the retry made a
+        // transient netlogon delay a permanent, unlogged IPC outage.
+        PipeSecurity BuildPipeSecurity()
+        {
+            var localSystem = new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null);
+            var security = new PipeSecurity();
 
-        var localSystem = new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null);
+            // MFAWeb reads this owner back after connecting and refuses to send anything if it is
+            // not a privileged SID (see IpcFirewallClient.SendViaPipeAsync). Set it explicitly
+            // rather than relying on the creating token's default owner, which is not
+            // contractually S-1-5-18 and can be BUILTIN\Administrators depending on token
+            // settings.
+            security.SetOwner(localSystem);
 
-        var security = new PipeSecurity();
+            // ACL: LocalSystem gets full control; gMSA (MFAWeb) gets read/write only.
+            security.AddAccessRule(new PipeAccessRule(
+                localSystem,
+                PipeAccessRights.FullControl, AccessControlType.Allow));
+            // ReadWrite here is load-bearing beyond the obvious. PipeAccessRights.Read includes
+            // ReadPermissions (READ_CONTROL), which is what allows MFAWeb to read the owner SID
+            // above. Narrowing this to ReadData|WriteData would silently break the client's
+            // identity check.
+            security.AddAccessRule(new PipeAccessRule(
+                new NTAccount(gmsaName),
+                PipeAccessRights.ReadWrite,
+                AccessControlType.Allow));
 
-        // MFAWeb reads this owner back after connecting and refuses to send anything if it is not
-        // a privileged SID (see IpcFirewallClient.SendViaPipeAsync). Set it explicitly rather than
-        // relying on the creating token's default owner, which is not contractually S-1-5-18 and
-        // can be BUILTIN\Administrators depending on token settings.
-        security.SetOwner(localSystem);
+            return security;
+        }
 
-        // ACL: LocalSystem gets full control; gMSA (MFAWeb) gets read/write only.
-        security.AddAccessRule(new PipeAccessRule(
-            localSystem,
-            PipeAccessRights.FullControl, AccessControlType.Allow));
-        // ReadWrite here is load-bearing beyond the obvious. PipeAccessRights.Read includes
-        // ReadPermissions (READ_CONTROL), which is what allows MFAWeb to read the owner SID above.
-        // Narrowing this to ReadData|WriteData would silently break the client's identity check.
-        security.AddAccessRule(new PipeAccessRule(
-            gmsaAccount,
-            PipeAccessRights.ReadWrite,
-            AccessControlType.Allow));
-
-        ServiceLogger.Debug($"[IPC] Pipe security built for gMSA '{gmsaName}'. Claiming pipe name...");
+        ServiceLogger.Debug($"[IPC] Claiming pipe name for gMSA '{gmsaName}'...");
 
         // Claim the name before serving anything. See ClaimPipeNameAsync.
-        NamedPipeServerStream? firstInstance = await ClaimPipeNameAsync(security, stoppingToken);
-        if (firstInstance is null) return;   // cancelled while retrying
+        var claimed = await ClaimPipeNameAsync(BuildPipeSecurity, stoppingToken);
+        if (claimed is null) return;   // cancelled while retrying
+
+        var (firstInstance, security) = claimed.Value;
 
         var instances = new List<NamedPipeServerStream> { firstInstance };
         try
@@ -278,7 +296,8 @@ public class FirewallWorkerService : BackgroundService
     // service that refuses to start for good would hand any unprivileged local account a way to
     // keep the gate down permanently. Alert once, then keep trying quietly.
     [SupportedOSPlatform("windows")]
-    private async Task<NamedPipeServerStream?> ClaimPipeNameAsync(PipeSecurity security, CancellationToken ct)
+    private async Task<(NamedPipeServerStream Pipe, PipeSecurity Security)?> ClaimPipeNameAsync(
+        Func<PipeSecurity> buildSecurity, CancellationToken ct)
     {
         var delay    = TimeSpan.FromSeconds(2);
         var maxDelay = TimeSpan.FromMinutes(5);
@@ -288,29 +307,55 @@ public class FirewallWorkerService : BackgroundService
         {
             try
             {
+                // Both steps are inside the try: building the descriptor resolves the gMSA
+                // through LSA and can fail independently of the pipe name being taken.
+                var security = buildSecurity();
                 var pipe = CreatePipeInstance(security, firstInstance: true);
                 if (alerted)
                     ServiceLogger.Log($"[IPC] Pipe name '{PipeName}' claimed after earlier failure.");
-                return pipe;
+                return (pipe, security);
             }
             catch (Exception ex)
             {
-                ServiceLogger.Error(
-                    $"[IPC] Could not claim pipe name '{PipeName}' ({ex.GetType().Name}: {ex.Message}). " +
-                    "Another process already holds it - the service will not accept requests until it is released.");
+                // Distinguish the causes. Reporting a domain-controller hiccup as an attempted
+                // interception sends operations chasing an attacker that does not exist, and
+                // reporting a squat as a config problem does the reverse.
+                bool identityProblem = ex is IdentityNotMappedException or SystemException and not IOException and not UnauthorizedAccessException;
 
-                if (!alerted)
+                string subject, detail;
+                if (identityProblem)
                 {
-                    alerted = true;
-                    SendIpcAlert(
-                        "MFA Firewall: IPC pipe name is held by another process",
-                        $"MFAService could not create '{PipeName}' with FILE_FLAG_FIRST_PIPE_INSTANCE:\n\n" +
-                        $"{ex.GetType().Name}: {ex.Message}\n\n" +
-                        "Another process on this host already owns that name. Until it is released, " +
-                        "MFAService cannot accept requests and no firewall rules will be opened. " +
-                        "If this was not an administrator action, treat it as an attempt to intercept " +
-                        "IPC traffic and investigate which process holds the pipe.");
+                    subject = "MFA Firewall: IPC server cannot resolve its service account";
+                    detail  = $"MFAService could not build the pipe security descriptor:\n\n{ex.GetType().Name}: {ex.Message}\n\n" +
+                              "This usually means the account in FirewallService:GmsaAccount cannot be resolved - " +
+                              "a domain controller may be unreachable, which is common briefly after a reboot. " +
+                              "MFAService is retrying and will start accepting requests once it succeeds. " +
+                              "No firewall rules can be opened until then.";
+                    ServiceLogger.Error(
+                        $"[IPC] Could not build pipe security ({ex.GetType().Name}: {ex.Message}). " +
+                        "The service account may not be resolvable yet - retrying.");
                 }
+                else
+                {
+                    subject = "MFA Firewall: IPC pipe name is held by another process";
+                    detail  = $"MFAService could not create '{PipeName}' with FILE_FLAG_FIRST_PIPE_INSTANCE:\n\n" +
+                              $"{ex.GetType().Name}: {ex.Message}\n\n" +
+                              "Another process on this host already owns that name. Until it is released, " +
+                              "MFAService cannot accept requests and no firewall rules will be opened. " +
+                              "If this was not an administrator action, treat it as an attempt to intercept " +
+                              "IPC traffic and investigate which process holds the pipe.\n\n" +
+                              "Note: running MFAService.exe from an elevated console rather than as a service " +
+                              "also produces this, because assigning LocalSystem as the pipe owner requires the " +
+                              "SYSTEM token.";
+                    ServiceLogger.Error(
+                        $"[IPC] Could not claim pipe name '{PipeName}' ({ex.GetType().Name}: {ex.Message}). " +
+                        "Another process already holds it - the service will not accept requests until it is released.");
+                }
+
+                // Only consume the one-shot flag if the mail actually went out. SMTP is commonly
+                // unreachable in exactly the situations that trigger this, and an alert that is
+                // marked sent but never delivered is worse than no alert at all.
+                if (!alerted) alerted = SendIpcAlert(subject, detail);
 
                 try { await Task.Delay(delay, ct); }
                 catch (OperationCanceledException) { return null; }
@@ -336,7 +381,13 @@ public class FirewallWorkerService : BackgroundService
             catch (OperationCanceledException) { return; }
             catch (Exception ex)
             {
+                // A client that connects and aborts before we call WaitForConnectionAsync leaves
+                // the instance in a state where every later accept fails with ERROR_NO_DATA until
+                // it is disconnected. Without this, one aborted connect retires an instance for
+                // the life of the process and the pool erodes silently to zero.
                 ServiceLogger.Warn($"[IPC] Accept failed: {ex.GetType().Name}: {ex.Message}");
+                try { pipe.Disconnect(); } catch { /* was not connected */ }
+
                 // Do not spin if the instance is in a bad state.
                 try { await Task.Delay(TimeSpan.FromSeconds(1), ct); }
                 catch (OperationCanceledException) { return; }
@@ -350,6 +401,23 @@ public class FirewallWorkerService : BackgroundService
             }
             finally
             {
+                // DisconnectNamedPipe is abortive: it discards anything the client has not read
+                // yet. The pre-pool code disposed the handle instead, which closes gracefully and
+                // lets the client drain, so reusing instances without draining first would
+                // truncate responses -- silently turning a firewall rule that WAS opened into a
+                // reported failure, or losing a freshly minted provisioning token after the old
+                // one had already been burned.
+                //
+                // PipeStream.Flush is documented as a no-op, so it provides nothing here.
+                // WaitForPipeDrain is the real primitive. Bound it: only the gMSA and SYSTEM can
+                // connect at all, but a hung client must not pin an instance indefinitely.
+                try
+                {
+                    await Task.Run(() => pipe.WaitForPipeDrain(), ct)
+                              .WaitAsync(TimeSpan.FromSeconds(5), ct);
+                }
+                catch { /* client vanished or never drained - disconnect anyway */ }
+
                 // Return the instance to the listening state for the next client.
                 try { pipe.Disconnect(); } catch { /* already gone */ }
             }
@@ -379,7 +447,9 @@ public class FirewallWorkerService : BackgroundService
                 Subject = subject,
                 Body    = body + "\n\n-- MFAService IPC monitor"
             };
-            using var client = new SmtpClient(host, port) { EnableSsl = useSsl };
+            // SmtpClient.Send is synchronous and defaults to a 100s timeout. This runs from the
+            // startup path, where an unreachable relay is common, so cap it well below that.
+            using var client = new SmtpClient(host, port) { EnableSsl = useSsl, Timeout = 10000 };
             if (!string.IsNullOrWhiteSpace(user) && !string.IsNullOrWhiteSpace(pass))
                 client.Credentials = new System.Net.NetworkCredential(user, pass);
 
@@ -490,8 +560,9 @@ public class FirewallWorkerService : BackgroundService
 
         try
         {
-            var psi = new ProcessStartInfo("/usr/bin/id", $"-u {account}")
+            var psi = new ProcessStartInfo("/usr/bin/id")
             {
+                ArgumentList = { "-u", account },
                 RedirectStandardOutput = true,
                 RedirectStandardError  = true,
                 UseShellExecute        = false
@@ -508,7 +579,13 @@ public class FirewallWorkerService : BackgroundService
                 return uid;
             }
 
-            ServiceLogger.Warn($"[IPC] Could not resolve uid for '{account}' - peer uid verification disabled.");
+            ServiceLogger.Error($"[IPC] FirewallService:GmsaAccount is set to '{account}' but it could not be resolved to a uid - peer verification is DISABLED.");
+            SendIpcAlert(
+                "MFA Firewall: configured IPC account could not be resolved",
+                $"FirewallService:GmsaAccount is set to '{account}', but resolving it to a uid failed.\n\n" +
+                "Peer credential verification on the IPC socket is disabled as a result. The socket's " +
+                "directory permissions and mode are still in force, but the configured check is not. " +
+                "Correct the account name or remove the setting to silence this.");
             return -1;
         }
         catch (Exception ex)
@@ -531,6 +608,7 @@ public class FirewallWorkerService : BackgroundService
     private async Task HandlePipeConnectionAsync(NamedPipeServerStream pipe, CancellationToken ct)
     {
         {
+            // (block retained to keep the body's indentation stable)
             using var readCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             readCts.CancelAfter(IpcReadTimeout);
 
