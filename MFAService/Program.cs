@@ -26,6 +26,43 @@ using System.Text.RegularExpressions;
 
 Directory.SetCurrentDirectory(AppContext.BaseDirectory);
 
+// Handle informational flags before anything starts. Without this every argument was silently
+// ignored and the service ran regardless, so `MFAService --version` -- an entirely reasonable
+// thing for an operator to type -- started a second privileged instance instead of printing a
+// version. That is how a duplicate ended up running for the better part of an hour on a test
+// host, sweeping firewall rules alongside the real service.
+if (args.Length > 0)
+{
+    var probeAsm   = Assembly.GetExecutingAssembly();
+    var probeVer   = probeAsm.GetName().Version?.ToString(3) ?? "unknown";
+    var probeBuilt = probeAsm.GetCustomAttributes<AssemblyMetadataAttribute>()
+                             .FirstOrDefault(a => a.Key == "BuildDate")?.Value ?? "unknown";
+
+    switch (args[0].ToLowerInvariant())
+    {
+        case "--version":
+        case "-v":
+            Console.WriteLine($"MFAService {probeVer} (built {probeBuilt} UTC)");
+            return 0;
+
+        case "--help":
+        case "-h":
+        case "-?":
+            Console.WriteLine("MFAService - privileged firewall service for MFA Firewall Knocker.");
+            Console.WriteLine();
+            Console.WriteLine("Started by the service manager with no arguments; it is not meant to be");
+            Console.WriteLine("run by hand while the service is running.");
+            Console.WriteLine();
+            Console.WriteLine("  --version, -v   print version and exit");
+            Console.WriteLine("  --help,    -h   print this message and exit");
+            return 0;
+
+        default:
+            Console.Error.WriteLine($"MFAService: unrecognized argument '{args[0]}'. Try --help.");
+            return 2;
+    }
+}
+
 var builder = Host.CreateApplicationBuilder(args);
 ServiceLogger.SetMinLevel(builder.Configuration["Logging:AppMinLevel"]);
 
@@ -48,6 +85,7 @@ builder.Services.AddHostedService<DatabaseLockService>();
 builder.Services.AddHostedService<CertificateMonitorService>();
 
 await builder.Build().RunAsync();
+return 0;
 
 // ---------------------------------------------------------------------------
 // Logger: writes to console + daily rotating log file
@@ -468,11 +506,122 @@ public class FirewallWorkerService : BackgroundService
     private async Task RunUnixSocketServerAsync(CancellationToken stoppingToken)
     {
         const string socketPath = "/run/mfafirewall.sock";
-        if (File.Exists(socketPath)) File.Delete(socketPath);
+        const string lockPath   = "/run/mfafirewall.lock";
 
-        var listener = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
-        listener.Bind(new UnixDomainSocketEndPoint(socketPath));
-        listener.Listen(backlog: 10);
+        // Single-instance guard, the Linux counterpart to FirstPipeInstance on Windows.
+        //
+        // The previous code deleted the socket unconditionally and then bound, so a second
+        // instance would unlink the first one's socket and take over the path -- leaving two
+        // privileged services both sweeping firewall rules and both able to write the user store,
+        // with clients reaching whichever bound last. Not hypothetical: it happened on a test host
+        // when the binary was run by hand while the service was up.
+        //
+        // Two mechanisms are needed, because neither is sufficient alone:
+        //
+        //   * A socket file outlives the process that created it. After a crash the path still
+        //     blocks bind() while nothing is listening, so the file's presence proves nothing
+        //     about liveness and cannot simply be trusted or simply be deleted. Hence the probe:
+        //     a refused connection means debris, a successful one means a live owner.
+        //   * The probe alone leaves a race. Two instances can both find the socket stale, both
+        //     unlink, and both bind -- and the second unlink removes the *first's live socket*,
+        //     reproducing the takeover this is meant to prevent.
+        //
+        // So the probe-and-unlink runs under an exclusive advisory lock. FileShare.None maps to
+        // flock on Unix, which the kernel releases when the process dies by any means including
+        // SIGKILL -- so unlike the socket file, the lock never needs cleaning up and never
+        // wrongly reports a dead instance as alive.
+        FileStream? instanceLock = null;
+        Socket? listener = null;
+        var delay    = TimeSpan.FromSeconds(2);
+        var maxDelay = TimeSpan.FromMinutes(5);
+        bool alerted = false;
+
+        while (listener is null && !stoppingToken.IsCancellationRequested)
+        {
+            bool endpointBusy = false;
+
+            // Hold the lock across probe-unlink-bind so two starting instances cannot both
+            // conclude the socket is stale and unlink each other's.
+            try
+            {
+                instanceLock = new FileStream(lockPath, FileMode.OpenOrCreate,
+                                              FileAccess.ReadWrite, FileShare.None);
+            }
+            catch (IOException)
+            {
+                endpointBusy = true;
+            }
+
+            if (!endpointBusy && File.Exists(socketPath))
+            {
+                try
+                {
+                    using var probe = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
+                    probe.Connect(new UnixDomainSocketEndPoint(socketPath));
+                    endpointBusy = true;
+                }
+                catch (SocketException)
+                {
+                    ServiceLogger.Warn($"[IPC] Removing stale socket {socketPath} left by a previous run.");
+                    try { File.Delete(socketPath); }
+                    catch (Exception ex) { ServiceLogger.Error($"[IPC] Could not remove stale socket: {ex.Message}"); endpointBusy = true; }
+                }
+            }
+
+            if (!endpointBusy)
+            {
+                try
+                {
+                    var candidate = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
+                    candidate.Bind(new UnixDomainSocketEndPoint(socketPath));
+                    candidate.Listen(backlog: 10);
+                    listener = candidate;
+                    if (alerted) ServiceLogger.Log("[IPC] Socket claimed after earlier failure.");
+                    break;
+                }
+                catch (SocketException ex)
+                {
+                    ServiceLogger.Error($"[IPC] Could not bind {socketPath}: {ex.SocketErrorCode} ({ex.Message}).");
+                    endpointBusy = true;
+                }
+            }
+
+            if (endpointBusy)
+            {
+                // Release the lock before sleeping so the instance that legitimately owns the
+                // endpoint is never blocked by this one waiting.
+                instanceLock?.Dispose();
+                instanceLock = null;
+
+                ServiceLogger.Error(
+                    $"[IPC] {socketPath} is already owned by a live process. Refusing to replace it - " +
+                    "this instance will not serve IPC until the endpoint is free.");
+
+                // Only consume the one-shot flag if the mail actually went out.
+                if (!alerted)
+                {
+                    alerted = SendIpcAlert(
+                        "MFA Firewall: the IPC socket is already in use",
+                        $"MFAService could not take ownership of {socketPath} because another process " +
+                        "is listening on it.\n\n" +
+                        "Two instances would both sweep firewall rules and both write the user store, " +
+                        "and clients would reach whichever bound the socket last, so this instance is " +
+                        "standing down rather than taking over. Running the binary by hand while the " +
+                        "service is running is the usual cause.\n\n" +
+                        "No firewall rules will be opened by this instance until the endpoint is free. " +
+                        "It retries automatically, so nothing further is needed once the duplicate exits.");
+                }
+
+                try { await Task.Delay(delay, stoppingToken); }
+                catch (OperationCanceledException) { return; }
+                delay = TimeSpan.FromTicks(Math.Min(delay.Ticks * 2, maxDelay.Ticks));
+            }
+        }
+
+        if (listener is null) { instanceLock?.Dispose(); return; }   // cancelled while waiting
+
+        // Held until shutdown: releasing it early would let a second instance through.
+        using var _instanceLock = instanceLock;
 
         // 0660: owner rw, group rw, others none. The socket is created by this process, so it
         // ends up root:root -- there is no chgrp here. To let MFAWeb connect, give MFAService a
