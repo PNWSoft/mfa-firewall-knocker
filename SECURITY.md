@@ -29,104 +29,86 @@ you'd rather not be.
 This sets out what the design does and does not protect against. The boundary is not obvious,
 and the limitations below are as much a part of the specification as the guarantees.
 
-### The problem it exists to solve: a credential that leaves the building
+### The problem addressed: a credential that leaves the building
 
-A WireGuard profile or an SSH private key is a **bearer token**. Whoever holds the file is you —
-from any address, at any hour, with no further test. That property is the whole reason these
-credentials are worth stealing.
+A WireGuard profile or an SSH private key is a bearer token. Possession is the entire test: the
+holder of the file authenticates as its owner, from any address, at any hour.
 
-Revoking one is easy enough: pull the peer from the server, or drop the key out of
-`authorized_keys`. But notice what every control here has in common — pulling a peer, rotating
-keys, auditing handshakes are all **post-incident**. Each is a *response*, and each depends on
-knowing there was something to respond to.
+Revocation is straightforward — remove the peer from the server, or the key from
+`authorized_keys`. Every control available is post-incident: revoke, rotate, audit handshakes.
+Each is a response, and each requires knowing that something happened.
 
-That is the gap this exists to close. A copied file leaves the original in place and working, so
-the ordinary signs of a compromised credential never appear: no failed login, no lockout, nothing
-that stops working for the legitimate user.
+Detection is the weak point. A copied file leaves the original working, so the usual indicators of
+credential compromise do not appear: no failed login, no lockout, no loss of service for the
+legitimate user.
 
-There are signals. Conntrack shows the flows, and two concurrent sessions from different
-addresses on one peer key is a reasonable thing to alert on. Some tools are built on exactly that.
+Some signals exist. Conntrack records the flows, and two concurrent sessions from different
+addresses on one peer key can be alerted on; some tools do this. Three limitations apply:
 
-But look at what it detects: a **collision, not a theft**. It fires only if the attacker happens
-to be connected at the same moment as the legitimate user — and the attacker chooses when to
-connect. Someone who uses a stolen profile overnight, or simply checks that the owner is offline
-first, produces one ordinary-looking session and trips nothing. That catches the careless and
-misses anyone patient, which is the wrong way round for a control you would want to rely on.
+1. **It detects concurrent use, not theft.** The alert requires the attacker to be connected at
+   the same time as the legitimate user, and the attacker controls when to connect. A stolen
+   profile used while the owner is offline produces a single session indistinguishable from
+   normal use.
+2. **It is post-incident.** The alert follows the connection.
+3. **Conntrack is not a security control.** It is kernel connection-tracking state and evicts
+   entries under memory pressure by design, so its completeness degrades under load.
 
-Two further limits, even when it does fire. It is still post-incident: the alert arrives once the
-attacker is already inside. And conntrack is kernel bookkeeping rather than a security control —
-it evicts entries under memory pressure by design, so the evidence thins out exactly when the host
-is busiest, and detection built on it depends on a facility documented to discard what it holds.
+The interval between copy and discovery is therefore unbounded and may be indefinite. Remedies
+that require discovery do not cover the case.
 
-So the window between the copy and the discovery is unbounded, and frequently never closes at all
-— which makes a set of remedies that only fire after discovery a weak defence against precisely
-the case that matters.
+Worked example: a laptop is lost. The current response is to revoke the profile before whoever
+finds it connects. If revocation loses that race, the holder has that user's network access —
+file shares, anything else reachable, and the opportunity to leave persistence behind. Revoking
+afterwards does not recover copied data or remove an implant. The remedy arrives after the damage
+and cannot reverse it.
 
-Concretely: someone loses a laptop. Today that begins a race — revoke the profile before whoever
-has it connects. Lose that race and they are inside the network holding that user's access:
-reading file shares, copying whatever is reachable, planting something that outlives the
-revocation. **Pulling the peer afterwards does not un-copy a file or remove an implant.** That is
-what post-incident means in practice — the remedy arrives after the damage it was supposed to
-prevent, and cannot reverse it.
-
-**This is a pre-incident control.** The stolen file stops being useful the moment it is stolen,
-not the moment somebody works out that it was — and nobody has to notice anything for that to
-hold. A lost laptop becomes a lost laptop: whoever has it cannot open the port, so there is no
-window to lose the race in.
+**This is a pre-incident control.** A stolen file stops being usable when it is stolen rather than
+when the theft is discovered, and no detection is required for that to hold. A lost laptop remains
+a lost laptop: the holder cannot open the port.
 
 #### What a stolen profile actually buys an attacker
 
 Not everything, on a well-run network. SSH still wants its key; services still want their
 credentials. The VPN is not the only control and should never be treated as one.
 
-What it buys is **position** — and position is worth more than it sounds, because the rest of the
-posture was designed on the assumption that only trusted parties could reach these services at
-all.
+What it provides is position. The services behind the boundary are configured on the assumption
+that only trusted parties can reach them.
 
-Internal services are not weak in some absolute sense, and not weaker than they appear — they are
-hardened **less than the internet-facing tier**, correctly and on purpose. Security and usability
-trade against each other directly, and a network hardened to the maximum at every point is close
-to unusable: users spend their day authenticating instead of working. So networks are split into
-zones, each given a posture proportionate to what it holds and to who can reach it — and that
-engineering is sound
-right up until the zone boundary turns out not to be real. The hypervisor's management interface,
-the NAS admin page, the database bound to a private address, the appliance that stopped receiving
-firmware years ago: none of those are hardened for the open internet, and none of them need to be,
-so long as the boundary holds.
+That configuration is deliberate, not deficient. Security and usability trade against each other,
+and a network hardened uniformly at every point becomes unusable — users spend their time
+authenticating rather than working. Networks are therefore divided into zones, each given a
+posture proportionate to its exposure. The arrangement is sound while the zone boundary holds.
+Hypervisor management interfaces, NAS administration pages, databases bound to private addresses
+and appliances no longer receiving firmware updates are not hardened for direct internet exposure,
+and do not need to be while the boundary holds.
 
-WireGuard is that boundary. Which also makes it the highest-leverage place to spend a user's
-patience: **one strong authentication at the gate, lasting a working day, buys more than the same
-friction spread across every service inside — and costs the user far less.** That is the trade this
-is built around.
+WireGuard is that boundary, which also makes it the most efficient place to require
+authentication. One authentication at the boundary, valid for a working day, costs the user less
+than equivalent friction applied to every service behind it.
 
 #### Two gates that fail independently
 
-This does not replace WireGuard's or SSH's authentication — it adds a second one in front, and the
-two share no code, no protocol, and no implementation. That independence is worth something on its
-own, separate from anything to do with stolen credentials.
+This does not replace WireGuard's or SSH's authentication. It adds a second, independent one in
+front: the two share no code, no protocol and no implementation.
 
-**A zero-day in one is not a zero-day in the other.** If a remotely exploitable flaw turns up in
-WireGuard or in an SSH daemon, the port it would be reached through is closed to anyone who has
-not completed a WebAuthn ceremony from that address. The flaw is still there and still needs
-patching, but the window between disclosure and patching is no longer a window in which the
-internet at large can reach the vulnerable code. The exposure becomes "someone who already
-authenticated with a passkey, from an address we granted, within the last few hours" — which is a
-different problem from "anyone on the internet".
+**A remotely exploitable flaw in one is not a flaw in the other.** If such a flaw is found in
+WireGuard or an SSH daemon, the port it would be reached through is closed to anyone who has not
+completed a WebAuthn ceremony from that address. The flaw still requires patching, but during the
+interval between disclosure and patch the vulnerable code is not reachable from the internet at
+large — only by an address granted within the current expiry window.
 
-The other direction matters more, given this is one person's code and the component with the
-shorter track record.
+The reverse case matters more, since this is one person's code and the component with the shorter
+track record.
 
-**This does add attack surface.** It is an internet-facing web application, and any claim that it
-adds none would be false. What can fairly be said is that the surface is deliberately narrow: a
-small number of routes, no user-supplied content rendered back, no database engine, no file
-uploads, and a process that runs unprivileged, cannot write the user store, and cannot issue a
-firewall command.
+**This adds attack surface.** It is an internet-facing web application. The surface is narrow by
+construction: a small number of routes, no user-supplied content rendered back, no database
+engine, no file uploads, and a process that runs unprivileged, cannot write the user store and
+cannot issue a firewall command.
 
-More to the point, **most of what an attacker gains by exploiting it leaves you no worse off than
-not having deployed it at all**. Defeat the gate and you have opened a port — to a service that
-still demands its own key, which is precisely the position you would have been in had the port
-simply been left open. The usual failure mode is losing the protection this adds, not losing the
-protection you already had.
+Most outcomes of exploiting it leave the operator no worse off than not deploying it. Defeating
+the gate opens a port to a service that still requires its own key — the position the operator
+would have been in had the port been left open. The usual failure mode is loss of the protection
+this adds, not loss of protection already in place.
 
 The residual risk is the slice that reaches the host itself: remote code execution in the web
 stack rather than a logic flaw in the gate. That category is real and should not be waved away.
@@ -139,30 +121,29 @@ unrelated failures lining up, and the price of that is one more small service to
 
 #### What happens if MFAService stops
 
-Worth being precise, because the intuition tends to run the wrong way. Firewall rules live in the
-firewall, not in this program. If MFAService is not running — crashed, stopped, blocked from its
-IPC endpoint, or never started — **nothing about the current rule set changes**:
+Firewall rules are held by the firewall, not by this program. If MFAService is not running —
+crashed, stopped, unable to claim its IPC endpoint, or never started — the current rule set does
+not change:
 
-- **The standing block stays.** Whatever denies the protected port by default is a rule you
-  configured; it is unaffected, so the port remains closed and unreachable. Protection is not lost.
-- **No new access can be granted.** Nobody can authenticate their way in while the service is
-  down. That is the actual failure, and it is fail-closed.
-- **Grants already open stay open, past their expiry.** This is the part that surprises people.
-  Expiry is not enforced by the firewall — the `exp:` value is a comment the sweeper reads. With
-  the sweeper down, an open rule simply persists until the service returns and removes it.
+- **The standing block remains.** Whatever denies the protected port by default is an
+  operator-configured rule and is unaffected. The port stays closed.
+- **No new access can be granted.** No one can authenticate while the service is down. This is the
+  actual failure mode, and it is fail-closed.
+- **Grants already open remain open past their expiry.** Expiry is enforced by the sweeper, not by
+  the firewall: the `exp:` value is a comment the sweeper reads. With the sweeper stopped, an open
+  rule persists until the service returns.
 
-So an outage costs you the ability to let people in, plus the timely removal of rules already
-issued. It does not open anything.
+An outage therefore costs the ability to grant access and the timely removal of existing grants.
+It does not open anything.
 
-If an outage runs long and an open grant concerns you, **`MFAAdmin reset` removes every
-MFA-granted rule and does not need MFAService**. It runs elevated and issues the firewall commands
-itself — `Remove-NetFirewallRule` on Windows, `iptables -D` on Linux — then re-reads the rule list
-and tells you what is actually left rather than assuming the deletions worked. That makes it the
-tool for exactly this situation, and for emergency revocation generally. `MFAAdmin diag` lists the
-rules first if you want to look before removing.
+`MFAAdmin reset` removes every MFA-granted rule and does not require MFAService. It runs elevated
+and issues the firewall commands directly — `Remove-NetFirewallRule` on Windows, `iptables -D` on
+Linux — then re-reads the rule list and reports what remains rather than assuming the deletions
+succeeded. This applies to emergency revocation generally, not only to outages. `MFAAdmin diag`
+lists the rules without removing them.
 
-It is all-or-nothing: there is no per-user or per-rule revocation, so everyone re-authenticates
-afterwards. To drop a single grant, delete that one rule directly instead.
+`reset` is all-or-nothing; there is no per-user or per-rule revocation, so all users must
+re-authenticate afterwards. To remove a single grant, delete that rule directly.
 
 ### Where the credential goes
 
@@ -185,8 +166,6 @@ until someone completes a WebAuthn ceremony against a passkey that:
 So an attacker holding your profile has a key to a door that isn't there. They cannot open it
 from their address, and no amount of possessing the file changes that. The credential's value
 drops from "permanent access from anywhere" to nothing, without rotating a single key.
-
-That is the case this is built for, and it is the one that actually happens.
 
 **It also removes standing exposure generally:** the port is closed by default, each grant covers
 one source address, expires on its own, and is logged.
