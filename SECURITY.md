@@ -57,10 +57,10 @@ The interval between copy and discovery is therefore unbounded and may be indefi
 that require discovery do not cover the case.
 
 Worked example: a laptop is lost. The current response is to revoke the profile before whoever
-finds it connects. If revocation loses that race, the holder has that user's network access —
-file shares, anything else reachable, and the opportunity to leave persistence behind. Revoking
-afterwards does not recover copied data or remove an implant. The remedy arrives after the damage
-and cannot reverse it.
+finds it connects. If revocation loses that race, the holder is inside the perimeter, on the
+internal network, holding that user's access. Revoking afterwards closes their route in; it does
+not reverse anything done while they had it. The remedy arrives after the exposure and cannot
+undo it.
 
 **This is a pre-incident control.** A stolen file stops being usable when it is stolen rather than
 when the theft is discovered, and no detection is required for that to hold. A lost laptop remains
