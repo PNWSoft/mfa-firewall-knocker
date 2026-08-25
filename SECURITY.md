@@ -41,9 +41,19 @@ keys, auditing handshakes are all **post-incident**. Each is a *response*, and e
 knowing there was something to respond to.
 
 That is the gap this exists to close. A copied file leaves the original in place and working, so
-there is no failed login, no second session, no symptom of any kind. The window between the copy
-and the discovery is unbounded, and frequently it never closes at all — which makes a set of
-remedies that only fire after discovery a weak defence against precisely the case that matters.
+the ordinary signs of a compromised credential never appear: no failed login, no lockout, nothing
+that stops working for the legitimate user.
+
+There *are* signals, and it would be dishonest to claim otherwise. Conntrack shows the flows, and
+two concurrent sessions from different addresses on one peer key is a reasonable thing to alert
+on. But that is still post-incident — it appears only once the attacker has already connected. And
+conntrack is kernel bookkeeping, not a security control: it evicts entries under memory pressure
+by design, so the evidence thins out exactly when the host is busiest. Detection built on it
+depends on a facility documented to discard what it holds.
+
+So the window between the copy and the discovery is unbounded, and frequently never closes at all
+— which makes a set of remedies that only fire after discovery a weak defence against precisely
+the case that matters.
 
 Concretely: someone loses a laptop. Today that begins a race — revoke the profile before whoever
 has it connects. Lose that race and they are inside the network holding that user's access:
