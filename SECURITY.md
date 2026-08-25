@@ -46,10 +46,18 @@ that stops working for the legitimate user.
 
 There *are* signals, and it would be dishonest to claim otherwise. Conntrack shows the flows, and
 two concurrent sessions from different addresses on one peer key is a reasonable thing to alert
-on. But that is still post-incident — it appears only once the attacker has already connected. And
-conntrack is kernel bookkeeping, not a security control: it evicts entries under memory pressure
-by design, so the evidence thins out exactly when the host is busiest. Detection built on it
-depends on a facility documented to discard what it holds.
+on. Some tools are built on exactly that.
+
+But look at what it detects: a **collision, not a theft**. It fires only if the attacker happens
+to be connected at the same moment as the legitimate user — and the attacker chooses when to
+connect. Someone who uses a stolen profile overnight, or simply checks that the owner is offline
+first, produces one ordinary-looking session and trips nothing. That catches the careless and
+misses anyone patient, which is the wrong way round for a control you would want to rely on.
+
+Two further limits, even when it does fire. It is still post-incident: the alert arrives once the
+attacker is already inside. And conntrack is kernel bookkeeping rather than a security control —
+it evicts entries under memory pressure by design, so the evidence thins out exactly when the host
+is busiest, and detection built on it depends on a facility documented to discard what it holds.
 
 So the window between the copy and the discovery is unbounded, and frequently never closes at all
 — which makes a set of remedies that only fire after discovery a weak defence against precisely
