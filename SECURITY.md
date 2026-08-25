@@ -44,9 +44,8 @@ That is the gap this exists to close. A copied file leaves the original in place
 the ordinary signs of a compromised credential never appear: no failed login, no lockout, nothing
 that stops working for the legitimate user.
 
-There *are* signals, and it would be dishonest to claim otherwise. Conntrack shows the flows, and
-two concurrent sessions from different addresses on one peer key is a reasonable thing to alert
-on. Some tools are built on exactly that.
+There are signals. Conntrack shows the flows, and two concurrent sessions from different
+addresses on one peer key is a reasonable thing to alert on. Some tools are built on exactly that.
 
 But look at what it detects: a **collision, not a theft**. It fires only if the attacker happens
 to be connected at the same moment as the legitimate user — and the attacker chooses when to
@@ -115,7 +114,7 @@ authenticated with a passkey, from an address we granted, within the last few ho
 different problem from "anyone on the internet".
 
 The other direction matters more, given this is one person's code and the component with the
-shorter track record — and it needs stating carefully rather than as a slogan.
+shorter track record.
 
 **This does add attack surface.** It is an internet-facing web application, and any claim that it
 adds none would be false. What can fairly be said is that the surface is deliberately narrow: a
