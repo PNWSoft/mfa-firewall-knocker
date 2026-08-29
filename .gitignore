@@ -11,8 +11,12 @@ MFAAdmin/appsettings.json
 *.log
 **/Logs/
 
-# Claude Code session data
+# Claude Code session data and assistant guidance. CLAUDE.md is working notes for an AI
+# assistant, not documentation for anyone using or contributing to this project, so it
+# stays local. Anything in it that a user or contributor actually needs belongs in
+# README.md, INSTALL.md or SECURITY.md instead.
 **/.claude/
+**/CLAUDE.md
 
 # Visual Studio
 .vs/
