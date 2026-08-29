@@ -102,7 +102,7 @@ All three components read from their own `appsettings.json`. Copy the
 |-----|-------------|
 | `DpapiEntropy` | Must match MFAWeb and MFAAdmin exactly. |
 | `BouncerConfig:AllowedPorts` | Ports opened for each authenticated IP, in `port/protocol` format. Examples: `"22/TCP"`, `"51820/UDP"`. |
-| `BouncerConfig:ExpirationHours` | How long firewall rules stay open. Rules are automatically removed by the sweeper when they expire. |
+| `BouncerConfig:ExpirationHours` | How long firewall rules stay open. Rules are automatically removed by the sweeper when they expire. **Clamped to 1-48 on the privileged side**, so a larger value is silently reduced to 48 and logged with a `[CONFIG]` warning — a slipped digit turns time-limited access into a standing grant, so the cap is enforced where it cannot be configured away. The port must likewise be 1-65535 and the protocol TCP or UDP; anything else is skipped with the same warning. |
 | `BouncerConfig:RulePrefix` | Prefix applied to every firewall rule name. Must also match the value in MFAAdmin's config so the `diag` and `reset` commands can find the rules. |
 | `HttpsCert:PemPath` | **Linux only, and required for expiry alerts there.** Full path to the certificate MFAWeb serves (e.g. `/etc/letsencrypt/live/your.domain.com/fullchain.pem`). There is no certificate store on Linux, so without this the expiry watchdog is silently disabled — and an expired certificate means no passkey sign-in at all. |
 
