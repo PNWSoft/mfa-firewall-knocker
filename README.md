@@ -448,8 +448,8 @@ revoke, you know whether you have closed the door or actually removed the person
   credentials are public keys and are not sensitive — passkeys are the stronger option for this
   reason, among others.
 - Firewall rules expire after `ExpirationHours`; the sweeper runs every 5 minutes.
-- Passkey registration always requires proof of password or a post-login token. See the security
-  invariants in [CLAUDE.md](CLAUDE.md) before changing anything in that path.
+- Passkey registration always requires proof of password or a post-login token. That check is a
+  deliberate invariant rather than an incidental one — treat any change to that path with care.
 - This software is provided as-is under the MIT license, with no warranty. It manipulates firewall
   rules on a privileged host. **Review the code and test in a non-production environment first.**
 
@@ -459,9 +459,9 @@ around a compromised MFAWeb are deliberate design decisions) and the current **k
 
 ## Contributing
 
-Issues and pull requests are welcome. [CLAUDE.md](CLAUDE.md) documents the architecture, the
-invariants that must not regress, and the non-obvious gotchas — it's the fastest way to get oriented,
-whether or not you use an AI assistant.
+Issues and pull requests are welcome. [How it works](#how-it-works) is the quickest way to get
+oriented, and [SECURITY.md](SECURITY.md) records what is deliberately out of scope, which is worth
+reading before proposing a change that adds one of those things back.
 
 ## License
 
