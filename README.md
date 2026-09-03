@@ -36,7 +36,9 @@ biometric or PIN. A stolen key alone can no longer reach the service that would 
 The grant expires on its own, and every one is logged: who, from where, when.
 
 It sits *in front of* SSH, WireGuard, RDP, or anything else guarded by a port, without replacing
-them or asking you to migrate anything.
+them or asking you to migrate anything. WireGuard was the original reason this exists — if that's
+your use case, [WIREGUARD.md](WIREGUARD.md) covers the parts specific to it: config, what happens
+to a session in progress when a grant expires, and how roaming interacts with a per-IP gate.
 
 ### It is often a requirement, not just a good idea
 
