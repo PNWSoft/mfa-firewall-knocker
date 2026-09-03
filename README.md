@@ -106,11 +106,16 @@ naming hosts — those products build one and this does not. **If what you have 
 you only want a human gate in front of it**, this adds one without a third party, an agent, or a
 migration.
 
-Its own weaknesses are worth stating plainly: per-IP gating degrades behind CGNAT, corporate
-VPNs, and iCloud Private Relay, where a user authenticates from one address and connects from
-another; once a rule is open it is open to that IP for the window, with no per-connection
-authorisation; and it does no encryption of its own, relying entirely on the protocol behind the
-port.
+Its own weaknesses are worth stating plainly: per-IP gating degrades behind CGNAT and most
+corporate VPNs, where several users can share one address or a user's address can change between
+requests. **iCloud Private Relay is a related but distinct case, not the same failure mode.** It
+proxies only standard web traffic (HTTP/HTTPS) through its relay and does not proxy WireGuard's
+UDP port or other non-web protocols, so a mismatch only arises if authenticating to MFAWeb happens
+over the relay while the protected connection does not. Reached without Private Relay in the path
+— disabled for that site, or the network itself isn't relayed — both legs present the same address
+and gating works as expected. Once a rule is open it is open to that IP for the window, with no
+per-connection authorisation; and it does no encryption of its own, relying entirely on the
+protocol behind the port.
 
 ## How it works
 
