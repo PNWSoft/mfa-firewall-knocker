@@ -703,16 +703,14 @@ public class FirewallWorkerService : BackgroundService
         // Held until shutdown: releasing it early would let a second instance through.
         using var _instanceLock = instanceLock;
 
-        // 0660: owner rw, group rw, others none. The socket is created by this process, so it
-        // ends up root:root -- there is no chgrp here. To let MFAWeb connect, give MFAService a
-        // supplementary group that the MFAWeb account also belongs to (see INSTALL.md,
-        // "Socket Permissions"). Verified on Ubuntu 24.04: srw-rw---- root root.
+        // 0660: owner rw, group rw, others none. The socket inherits this process's primary
+        // group; use Group=mfaipc in the service unit and add MFAWeb to that group.
         File.SetUnixFileMode(socketPath,
             UnixFileMode.UserRead  | UnixFileMode.UserWrite |
             UnixFileMode.GroupRead | UnixFileMode.GroupWrite);
 
-        // Resolved once: the uid the connecting process must be running as. Empty means
-        // "accept anyone the socket mode let through", which is the pre-0.2.0 behaviour.
+        // Resolve once per service start. Failure rejects all callers without stopping this
+        // endpoint owner: the sweeper must keep removing grants even with a bad account setting.
         int expectedUid = ResolveExpectedClientUid();
 
         try
@@ -721,7 +719,7 @@ public class FirewallWorkerService : BackgroundService
             {
                 var client = await listener.AcceptAsync(stoppingToken);
 
-                if (expectedUid >= 0 && !VerifyPeerUid(client, expectedUid))
+                if (expectedUid < 0 || !VerifyPeerUid(client, expectedUid))
                 {
                     try { client.Dispose(); } catch { }
                     continue;
@@ -775,15 +773,15 @@ public class FirewallWorkerService : BackgroundService
     }
 
     // Reads FirewallService:GmsaAccount, which on Linux holds the local account MFAWeb runs as.
-    // Returns -1 when unset or unresolvable, which leaves the socket mode as the only gate and
-    // preserves the behaviour of installs that predate this check.
+    // Returns -1 when unset or unresolvable. The accept loop then rejects every connection;
+    // it never silently falls back to trusting every member of the socket's group.
     [SupportedOSPlatform("linux")]
     private int ResolveExpectedClientUid()
     {
         var account = _config["FirewallService:GmsaAccount"];
         if (string.IsNullOrWhiteSpace(account))
         {
-            ServiceLogger.Warn("[IPC] FirewallService:GmsaAccount is not set - peer uid verification disabled.");
+            ReportInvalidClientAccount("FirewallService:GmsaAccount is not set. Set it to the local MFAWeb account (normally mfaweb).");
             return -1;
         }
 
@@ -797,7 +795,8 @@ public class FirewallWorkerService : BackgroundService
                 UseShellExecute        = false
             };
             using var proc = Process.Start(psi);
-            if (proc is null) return -1;
+            if (proc is null)
+                throw new InvalidOperationException("The account lookup process could not be started.");
 
             string output = proc.StandardOutput.ReadToEnd().Trim();
             proc.WaitForExit(5000);
@@ -808,20 +807,22 @@ public class FirewallWorkerService : BackgroundService
                 return uid;
             }
 
-            ServiceLogger.Error($"[IPC] FirewallService:GmsaAccount is set to '{account}' but it could not be resolved to a uid - peer verification is DISABLED.");
-            SendIpcAlert(
-                "MFA Firewall: configured IPC account could not be resolved",
-                $"FirewallService:GmsaAccount is set to '{account}', but resolving it to a uid failed.\n\n" +
-                "Peer credential verification on the IPC socket is disabled as a result. The socket's " +
-                "directory permissions and mode are still in force, but the configured check is not. " +
-                "Correct the account name or remove the setting to silence this.");
+            ReportInvalidClientAccount($"FirewallService:GmsaAccount '{account}' could not be resolved to a uid.");
             return -1;
         }
         catch (Exception ex)
         {
-            ServiceLogger.Warn($"[IPC] Could not resolve uid for '{account}' ({ex.Message}) - peer uid verification disabled.");
+            ReportInvalidClientAccount($"Could not resolve uid for '{account}' ({ex.Message}).");
             return -1;
         }
+    }
+
+    private void ReportInvalidClientAccount(string reason)
+    {
+        string detail = reason + " All IPC clients will be rejected; existing grants will still be swept. " +
+            "Correct FirewallService:GmsaAccount and restart MFAService to enable new grants.";
+        ServiceLogger.Error($"[IPC] {detail}");
+        SendIpcAlert("MFA Firewall: IPC client account invalid - new grants blocked", detail);
     }
 
     // A local IPC client has no legitimate reason to take longer than this to send one short
