@@ -35,14 +35,12 @@ if (args.Length > 0)
 {
     var probeAsm   = Assembly.GetExecutingAssembly();
     var probeVer   = probeAsm.GetName().Version?.ToString(3) ?? "unknown";
-    var probeBuilt = probeAsm.GetCustomAttributes<AssemblyMetadataAttribute>()
-                             .FirstOrDefault(a => a.Key == "BuildDate")?.Value ?? "unknown";
 
     switch (args[0].ToLowerInvariant())
     {
         case "--version":
         case "-v":
-            Console.WriteLine($"MFAService {probeVer} (built {probeBuilt} UTC)");
+            Console.WriteLine($"MFAService {probeVer}");
             return 0;
 
         case "--help":
@@ -68,9 +66,7 @@ ServiceLogger.SetMinLevel(builder.Configuration["Logging:AppMinLevel"]);
 
 var _asm = Assembly.GetExecutingAssembly();
 var _ver = _asm.GetName().Version?.ToString(3) ?? "unknown";
-var _built = _asm.GetCustomAttributes<AssemblyMetadataAttribute>()
-    .FirstOrDefault(a => a.Key == "BuildDate")?.Value ?? "unknown";
-ServiceLogger.Log($"MFAService v{_ver} (built {_built} UTC) starting...");
+ServiceLogger.Log($"MFAService v{_ver} starting...");
 
 builder.Services.AddWindowsService(options =>
 {

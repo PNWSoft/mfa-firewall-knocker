@@ -249,11 +249,9 @@ namespace MFAAdmin
             {
                 var _asm = Assembly.GetExecutingAssembly();
                 var _ver = _asm.GetName().Version?.ToString(3) ?? "unknown";
-                var _built = _asm.GetCustomAttributes<AssemblyMetadataAttribute>()
-                    .FirstOrDefault(a => a.Key == "BuildDate")?.Value ?? "unknown";
                 Console.WriteLine("========================================");
                 Console.WriteLine($"       {SiteName} MFA Admin Tool          ");
-                Console.WriteLine($"       v{_ver}  |  Built {_built} UTC");
+                Console.WriteLine($"       v{_ver}");
                 Console.WriteLine("========================================");
                 Console.WriteLine("Usage: MFAAdmin [add|list|delete|diag|reset|reprovision|export|import|purge-totp] [username|filepath]");
                 return;
