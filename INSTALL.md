@@ -104,7 +104,7 @@ All three components read from their own `appsettings.json`. Copy the
 | `BouncerConfig:AllowedPorts` | Ports opened for each authenticated IP, in `port/protocol` format. Examples: `"22/TCP"`, `"51820/UDP"`. |
 | `BouncerConfig:ExpirationHours` | How long firewall rules stay open. Rules are automatically removed by the sweeper when they expire. **Clamped to 1-48 on the privileged side**, so a larger value is silently reduced to 48 and logged with a `[CONFIG]` warning — a slipped digit turns time-limited access into a standing grant, so the cap is enforced where it cannot be configured away. The port must likewise be 1-65535 and the protocol TCP or UDP; anything else is skipped with the same warning. |
 | `BouncerConfig:RulePrefix` | Prefix applied to every firewall rule name. Must also match the value in MFAAdmin's config so the `diag` and `reset` commands can find the rules. |
-| `HttpsCert:PemPath` | **Linux only, and required for expiry alerts there.** Full path to the certificate MFAWeb serves (e.g. `/etc/mfa-auth/tls/fullchain.pem`). There is no certificate store on Linux, so without this the expiry watchdog is silently disabled — and an expired certificate means no passkey sign-in at all. |
+| `HttpsCert:PemPath` | **Linux only, and required for expiry alerts there.** Full path to the certificate MFAWeb serves (e.g. `/etc/mfa-auth/tls/current/fullchain.pem`). There is no certificate store on Linux, so without this the expiry watchdog is silently disabled — and an expired certificate means no passkey sign-in at all. |
 
 ### MFAAdmin — `appsettings.json`
 
@@ -683,12 +683,37 @@ umask 077
 lineage=/etc/letsencrypt/live/your.domain.com
 [ "${RENEWED_LINEAGE:-}" = "$lineage" ] || exit 0
 
-# Prepare both files before replacing either. Every copy is root-owned and only the
-# web account's group can read it; no permissions on Certbot's originals are changed.
-install -o root -g mfaweb -m 640 "$lineage/fullchain.pem" /etc/mfa-auth/tls/fullchain.pem.new
-install -o root -g mfaweb -m 640 "$lineage/privkey.pem" /etc/mfa-auth/tls/privkey.pem.new
-mv -f /etc/mfa-auth/tls/privkey.pem.new /etc/mfa-auth/tls/privkey.pem
-mv -f /etc/mfa-auth/tls/fullchain.pem.new /etc/mfa-auth/tls/fullchain.pem
+# Prepare a new generation on the same filesystem. Until publication, current still
+# selects the complete old pair, including if this hook fails or the service restarts.
+tls_dir=/etc/mfa-auth/tls
+generation=$(mktemp -d "$tls_dir/generation.XXXXXXXXXX")
+pending_link="$tls_dir/.current.${generation##*/}"
+trap 'rm -f -- "$pending_link"' 0
+trap 'exit 1' 1 2 15
+install -o root -g mfaweb -m 640 "$lineage/fullchain.pem" "$generation/fullchain.pem"
+install -o root -g mfaweb -m 640 "$lineage/privkey.pem" "$generation/privkey.pem"
+
+# Compare the public keys in canonical DER form. pkey supports both RSA and ECDSA;
+# separate commands ensure a failed OpenSSL step cannot be hidden by a pipeline.
+openssl x509 -in "$generation/fullchain.pem" -pubkey -noout > "$generation/certificate-public.pem"
+openssl pkey -pubin -in "$generation/certificate-public.pem" -outform DER -out "$generation/certificate-public.der"
+openssl pkey -in "$generation/privkey.pem" -passin pass: -pubout -outform DER -out "$generation/private-public.der"
+openssl dgst -sha256 -binary -out "$generation/certificate-public.sha256" "$generation/certificate-public.der"
+openssl dgst -sha256 -binary -out "$generation/private-public.sha256" "$generation/private-public.der"
+if ! cmp -s "$generation/certificate-public.sha256" "$generation/private-public.sha256"; then
+    echo 'MFAWeb certificate and private key do not match; current generation unchanged.' >&2
+    exit 1
+fi
+rm -f -- "$generation/certificate-public.pem" "$generation/certificate-public.der" \
+    "$generation/private-public.der" "$generation/certificate-public.sha256" "$generation/private-public.sha256"
+chown root:mfaweb "$generation"
+chmod 750 "$generation"
+
+# Rename a sibling symlink atomically. Keep earlier generation directories for rollback.
+previous=$(readlink "$tls_dir/current" 2>/dev/null || true)
+ln -s "${generation##*/}" "$pending_link"
+mv -Tf -- "$pending_link" "$tls_dir/current"
+printf 'MFAWeb certificate generation: %s (previous: %s)\n' "${generation##*/}" "$previous"
 HOOK
 sudo chown root:root /etc/letsencrypt/renewal-hooks/deploy/10-mfaweb-certificate.sh
 sudo chmod 700 /etc/letsencrypt/renewal-hooks/deploy/10-mfaweb-certificate.sh
@@ -696,7 +721,7 @@ sudo chmod 700 /etc/letsencrypt/renewal-hooks/deploy/10-mfaweb-certificate.sh
 # Install the existing certificate now; subsequent successful renewals call the hook.
 sudo env RENEWED_LINEAGE=/etc/letsencrypt/live/your.domain.com \
     /etc/letsencrypt/renewal-hooks/deploy/10-mfaweb-certificate.sh
-sudo -u mfaweb test -r /etc/mfa-auth/tls/privkey.pem && echo OK
+sudo -u mfaweb test -r /etc/mfa-auth/tls/current/privkey.pem && echo OK
 ```
 
 Point Kestrel at these copies in MFAWeb's `appsettings.json`:
@@ -707,24 +732,43 @@ Point Kestrel at these copies in MFAWeb's `appsettings.json`:
     "Https": {
       "Url": "https://*:8443",
       "Certificate": {
-        "Path":    "/etc/mfa-auth/tls/fullchain.pem",
-        "KeyPath": "/etc/mfa-auth/tls/privkey.pem"
+        "Path":    "/etc/mfa-auth/tls/current/fullchain.pem",
+        "KeyPath": "/etc/mfa-auth/tls/current/privkey.pem"
       }
     }
   }
 }
 ```
 
-Set MFAService's `HttpsCert:PemPath` to `/etc/mfa-auth/tls/fullchain.pem` too, so expiry alerts
+Set MFAService's `HttpsCert:PemPath` to `/etc/mfa-auth/tls/current/fullchain.pem` too, so expiry alerts
 monitor the certificate actually served. Test that a renewal of an unrelated lineage leaves
 these files unchanged and that `mfaweb` cannot read that other lineage's private key.
 
 MFAWeb re-reads the PEM once a minute and swaps it in when the thumbprint changes, so a renewal
 takes effect **without a restart and without downtime** — verified against a real forced renewal:
-the served certificate changed while the process ID stayed the same. If a reload falls between
-the two file replacements, it retains the last working certificate and retries on the next
-poll. A failed copy leaves the running certificate loaded; investigate any failed deploy hook
-before its expiry.
+the served certificate changed while the process ID stayed the same. A failed copy, key check,
+or symlink replacement leaves the previous complete pair on disk for both reload and restart.
+A reload that straddles the symlink switch can still retry on the next poll; it retains the
+last working certificate in memory. Investigate a failed deploy hook before the old certificate
+expires.
+
+The hook prints the new and previous generation names and retains the previous directories.
+For rollback, select a known-good, still-valid generation from that record and atomically
+switch `current` back (replace `generation.KNOWN_GOOD` before running):
+
+```bash
+(
+set -eu
+sudo test -s /etc/mfa-auth/tls/generation.KNOWN_GOOD/privkey.pem
+sudo openssl x509 -in /etc/mfa-auth/tls/generation.KNOWN_GOOD/fullchain.pem -checkend 0 -noout
+sudo ln -s generation.KNOWN_GOOD /etc/mfa-auth/tls/current.rollback
+sudo mv -Tf -- /etc/mfa-auth/tls/current.rollback /etc/mfa-auth/tls/current
+)
+```
+
+Never edit a published generation in place. Old and failed generations remain protected under
+`/etc/mfa-auth/tls`; periodically remove only inspected generations that are neither current
+nor needed for rollback. Do not automate removal during certificate publication.
 
 **Do not add a `--pre-hook` that stops MFAWeb.** MFAWeb never binds port 80, so certbot
 `--standalone` does not conflict with it; stopping the service would be pure downtime, and
