@@ -38,7 +38,10 @@ jobs:
         run: dotnet restore MFA.slnx --locked-mode
 
       - name: Build
-        run: dotnet build MFA.slnx -c Release --no-restore -p:AllowTotp=${{ matrix.allow_totp }}
+        run: dotnet build MFA.slnx -c Release --no-restore -p:AllowTotp=${{ matrix.allow_totp }} -p:SourceRevisionId=${{ github.sha }}
+
+      - name: Test
+        run: dotnet test MFA.slnx -c Release --no-build --no-restore -p:AllowTotp=${{ matrix.allow_totp }} -p:SourceRevisionId=${{ github.sha }}
 
   audit:
     name: Dependency audit
@@ -91,7 +94,7 @@ jobs:
         run: |
           set -euo pipefail
           dotnet restore MFA.slnx --locked-mode
-          dotnet build MFA.slnx -c Release --no-restore
+          dotnet build MFA.slnx -c Release --no-restore -p:SourceRevisionId=${{ github.sha }}
           sha256sum \
             MFAAdmin/bin/Release/net10.0/MFAAdmin.dll \
             MFAService/bin/Release/net10.0/MFAService.dll \
@@ -99,7 +102,7 @@ jobs:
 
           dotnet clean MFA.slnx -c Release
           dotnet restore MFA.slnx --locked-mode
-          dotnet build MFA.slnx -c Release --no-restore
+          dotnet build MFA.slnx -c Release --no-restore -p:SourceRevisionId=${{ github.sha }}
           sha256sum \
             MFAAdmin/bin/Release/net10.0/MFAAdmin.dll \
             MFAService/bin/Release/net10.0/MFAService.dll \

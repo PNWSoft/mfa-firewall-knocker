@@ -248,7 +248,8 @@ namespace MFAAdmin
             if (cleanArgs.Length == 0)
             {
                 var _asm = Assembly.GetExecutingAssembly();
-                var _ver = _asm.GetName().Version?.ToString(3) ?? "unknown";
+                var _ver = _asm.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion
+                           ?? _asm.GetName().Version?.ToString(3) ?? "unknown";
                 Console.WriteLine("========================================");
                 Console.WriteLine($"       {SiteName} MFA Admin Tool          ");
                 Console.WriteLine($"       v{_ver}");

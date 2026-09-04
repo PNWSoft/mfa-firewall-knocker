@@ -301,7 +301,8 @@ AuditLogger.LogDirectory = app.Configuration["LogPath"] ?? AuditLogger.LogDirect
 LoginFailureMonitor.Configure(app.Configuration);
 
 var _asm = Assembly.GetExecutingAssembly();
-var _ver = _asm.GetName().Version?.ToString(3) ?? "unknown";
+var _ver = _asm.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion
+           ?? _asm.GetName().Version?.ToString(3) ?? "unknown";
 AuditLogger.Log($"MFAWeb v{_ver} starting...");
 
 string siteName = app.Configuration["SiteName"] ?? "MFA Secure Access";
@@ -1996,4 +1997,3 @@ public static class AuditLogger
         return safeString.ToString();
     }
 }
-

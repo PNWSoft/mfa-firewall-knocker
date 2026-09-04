@@ -34,7 +34,8 @@ Directory.SetCurrentDirectory(AppContext.BaseDirectory);
 if (args.Length > 0)
 {
     var probeAsm   = Assembly.GetExecutingAssembly();
-    var probeVer   = probeAsm.GetName().Version?.ToString(3) ?? "unknown";
+    var probeVer   = probeAsm.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion
+                     ?? probeAsm.GetName().Version?.ToString(3) ?? "unknown";
 
     switch (args[0].ToLowerInvariant())
     {
@@ -65,7 +66,8 @@ var builder = Host.CreateApplicationBuilder(args);
 ServiceLogger.SetMinLevel(builder.Configuration["Logging:AppMinLevel"]);
 
 var _asm = Assembly.GetExecutingAssembly();
-var _ver = _asm.GetName().Version?.ToString(3) ?? "unknown";
+var _ver = _asm.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion
+           ?? _asm.GetName().Version?.ToString(3) ?? "unknown";
 ServiceLogger.Log($"MFAService v{_ver} starting...");
 
 builder.Services.AddWindowsService(options =>
