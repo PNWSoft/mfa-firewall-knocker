@@ -16,6 +16,7 @@
 
   <ItemGroup>
     <AssemblyMetadata Include="BuildDate" Value="$(BuildDate)" />
+    <InternalsVisibleTo Include="MFAService.RegressionTests" />
   </ItemGroup>
 
   <ItemGroup>
