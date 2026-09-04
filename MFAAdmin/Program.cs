@@ -419,14 +419,13 @@ namespace MFAAdmin
             throw new InvalidOperationException($"Smtp:Port value '{v}' is not a valid port (1-65535).");
         }
 
-        static bool SmtpUseSsl()
+        static bool SmtpUseSsl(string host)
         {
             string? v = Config["Smtp:UseSsl"];
             if (string.IsNullOrWhiteSpace(v)) return true;
             if (!bool.TryParse(v, out var b))
                 throw new InvalidOperationException($"Smtp:UseSsl value '{v}' is not true or false.");
 
-            string host = SmtpRequired("Host");
             if (!b && !IsLoopbackSmtpHost(host))
                 throw new InvalidOperationException(
                     "Smtp:UseSsl may be false only for a loopback SMTP relay (localhost, 127.0.0.0/8, or ::1).");
@@ -457,7 +456,7 @@ namespace MFAAdmin
             {
                 host = SmtpRequired("Host");
                 port = SmtpPort();
-                useSsl = SmtpUseSsl();
+                useSsl = SmtpUseSsl(host);
                 smtpUsername = Config["Smtp:Username"];
                 smtpPassword = Config["Smtp:Password"];
                 fromAddress = SmtpRequired("FromAddress");
@@ -983,7 +982,7 @@ namespace MFAAdmin
             {
                 host = SmtpRequired("Host");
                 port = SmtpPort();
-                useSsl = SmtpUseSsl();
+                useSsl = SmtpUseSsl(host);
                 username = Config["Smtp:Username"];
                 password = Config["Smtp:Password"];
                 fromAddress = SmtpRequired("FromAddress");
