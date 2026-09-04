@@ -1871,10 +1871,10 @@ public static class LoginFailureMonitor
             return;
         }
         int  port   = int.TryParse(cfg["Smtp:Port"], out var p) ? p : 25;
-        bool useSsl = bool.TryParse(cfg["Smtp:UseSsl"], out var s) && s;
         string? user = cfg["Smtp:Username"], pass = cfg["Smtp:Password"];
         try
         {
+            bool useSsl = GetSmtpUseSsl(cfg, host);
             using var msg = new MailMessage(from, notify)
             {
                 Subject = $"[MFA] {failures} failed logins for {username}",
@@ -1892,6 +1892,28 @@ public static class LoginFailureMonitor
         {
             AuditLogger.Error($"[SECURITY] Failed to send login-alert email: {ex.Message}");
         }
+    }
+
+    private static bool GetSmtpUseSsl(IConfiguration cfg, string host)
+    {
+        string? configured = cfg["Smtp:UseSsl"];
+        if (string.IsNullOrWhiteSpace(configured)) return true;
+        if (!bool.TryParse(configured, out bool useSsl))
+            throw new InvalidOperationException($"Smtp:UseSsl value '{configured}' is not true or false.");
+        if (!useSsl && !IsLoopbackSmtpHost(host))
+            throw new InvalidOperationException(
+                "Smtp:UseSsl may be false only for a loopback SMTP relay (localhost, 127.0.0.0/8, or ::1).");
+        return useSsl;
+    }
+
+    private static bool IsLoopbackSmtpHost(string host)
+    {
+        string candidate = host.Trim().TrimEnd('.');
+        if (candidate.Equals("localhost", StringComparison.OrdinalIgnoreCase)) return true;
+
+        candidate = candidate.TrimStart('[').TrimEnd(']');
+        return System.Net.IPAddress.TryParse(candidate, out var address)
+            && System.Net.IPAddress.IsLoopback(address);
     }
 }
 
@@ -1998,5 +2020,4 @@ public static class AuditLogger
         return safeString.ToString();
     }
 }
-
 

@@ -283,7 +283,8 @@ database, the other offers a login that always fails — but it is not useful ei
 - **Windows:** Windows Server 2019+, PowerShell 5.1+ with the `NetSecurity` module, and an Active
   Directory domain if you want to run MFAWeb under a gMSA
 - **Linux:** systemd, and `iptables` (see the note below)
-- An SMTP relay, for user provisioning emails and alerts
+- An SMTP relay with STARTTLS, for user provisioning emails and alerts. Plaintext SMTP is
+  accepted only for an explicit loopback relay.
 - A TLS certificate for MFAWeb. MFAWeb is not an ACME client; obtain it with certbot (Linux)
   or win-acme (Windows). certbot `--standalone` needs port 80 reachable during issuance only.
 
