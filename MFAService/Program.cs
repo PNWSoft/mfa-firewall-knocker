@@ -129,7 +129,7 @@ internal static class IpcOwnership
 
 internal static class ServiceLogger
 {
-    private static readonly string LogDirectory = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
+    internal static string LogDirectory { get; set; } = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
         ? @"C:\ProgramData\MFAAuth\Logs"
         : @"/var/log/mfa-auth";
 
@@ -207,16 +207,21 @@ internal static class ServiceLogger
 public class FirewallWorkerService : BackgroundService
 {
     private readonly IConfiguration _config;
-    private static string _rulePrefix = "MFA_Temp_";
+    private readonly string _rulePrefix;
+    private readonly IFirewallCommands _commands;
+    private readonly object _firewallLock = new();
 
     // Hard ceiling on BouncerConfig:ExpirationHours. Deliberate multi-day windows are still
     // possible, but a misconfiguration cannot leave rules in the firewall indefinitely.
     private const int MaxExpirationHours = 48;
 
-    public FirewallWorkerService(IConfiguration config)
+    public FirewallWorkerService(IConfiguration config) : this(config, new SystemFirewallCommands()) { }
+
+    internal FirewallWorkerService(IConfiguration config, IFirewallCommands commands)
     {
         _config = config;
         _rulePrefix = config["BouncerConfig:RulePrefix"] ?? "MFA_Temp_";
+        _commands = commands;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -936,7 +941,7 @@ public class FirewallWorkerService : BackgroundService
     }
 
     // Request format: "IP|Username" or "DB:COMMAND|..."
-    private string ProcessFirewallRequest(string? request)
+    internal string ProcessFirewallRequest(string? request)
     {
         if (string.IsNullOrWhiteSpace(request))
             return "ERROR: Empty request";
@@ -1007,35 +1012,36 @@ public class FirewallWorkerService : BackgroundService
 
         try
         {
-            // 3. APPLY RULES FOR ALL CONFIGURED PORTS
-            foreach (var portProto in allowedPorts)
+            // Serialize grants and expiry so the sweeper cannot delete a concurrently renewed rule.
+            lock (_firewallLock)
             {
-                var ppParts = portProto.Split('/');
-                if (ppParts.Length != 2)
+                // 3. APPLY RULES FOR ALL CONFIGURED PORTS
+                foreach (var portProto in allowedPorts)
                 {
-                    ServiceLogger.Warn($"[IPC] Configured port '{portProto}' is invalid. Skipping.");
-                    continue;
-                }
+                    var ppParts = portProto.Split('/');
+                    if (ppParts.Length != 2)
+                    {
+                        throw new InvalidOperationException($"Configured port '{portProto}' is invalid.");
+                    }
 
-                // Range-check the port. int.TryParse alone accepts 0, negatives and 99999, which
-                // then get handed to iptables/netsh to reject in a much less obvious way.
-                if (!int.TryParse(ppParts[0].Trim(), out int port) || port < 1 || port > 65535)
-                {
-                    ServiceLogger.Warn($"[CONFIG] Configured port in '{portProto}' is not in 1-65535. Skipping.");
-                    continue;
-                }
+                    // Range-check the port. int.TryParse alone accepts 0, negatives and 99999, which
+                    // then get handed to iptables/netsh to reject in a much less obvious way.
+                    if (!int.TryParse(ppParts[0].Trim(), out int port) || port < 1 || port > 65535)
+                    {
+                        throw new InvalidOperationException($"Configured port in '{portProto}' is not in 1-65535.");
+                    }
 
-                // Allow-list the protocol. It is interpolated into the iptables/PowerShell command,
-                // and although only root can write this config, an unvalidated value here is an
-                // avoidable way for a typo to become a malformed privileged command.
-                string protocol = ppParts[1].Trim().ToUpperInvariant();
-                if (protocol != "TCP" && protocol != "UDP")
-                {
-                    ServiceLogger.Warn($"[CONFIG] Protocol in '{portProto}' must be TCP or UDP. Skipping.");
-                    continue;
-                }
+                    // Allow-list the protocol. It is interpolated into the iptables/PowerShell command,
+                    // and although only root can write this config, an unvalidated value here is an
+                    // avoidable way for a typo to become a malformed privileged command.
+                    string protocol = ppParts[1].Trim().ToUpperInvariant();
+                    if (protocol != "TCP" && protocol != "UDP")
+                    {
+                        throw new InvalidOperationException($"Protocol in '{portProto}' must be TCP or UDP.");
+                    }
 
-                OpenFirewallPort(ip, port, username, protocol, expirationHours);
+                    OpenFirewallPort(ip, port, username, protocol, expirationHours);
+                }
             }
 
             ServiceLogger.Log($"[IPC] Request completed in {sw.ElapsedMilliseconds}ms");
@@ -1099,14 +1105,14 @@ public class FirewallWorkerService : BackgroundService
     // -----------------------------------------------------------------------
     // FIREWALL OPERATIONS
     // -----------------------------------------------------------------------
-    private static void OpenFirewallPort(string ip, int port, string username, string protocol, int expirationHours)
+    private void OpenFirewallPort(string ip, int port, string username, string protocol, int expirationHours)
     {
         string expiresClean = DateTime.UtcNow.AddHours(expirationHours).ToString("yyyy-MM-dd HH:mm UTC");
-        string ruleName     = $"{_rulePrefix}{ip}_{port}";
+        string ruleName     = $"{_rulePrefix}{ip}_{port}_{protocol}";
         var fw = System.Diagnostics.Stopwatch.StartNew();
         ServiceLogger.Log($"[FIREWALL] Configuring rule: {ruleName}...");
 
-        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        if (_commands.IsWindows)
         {
             // Escape single quotes for PowerShell string safety ('' is the PS escape for ')
             string safeUsername = username.Replace("'", "''");
@@ -1125,6 +1131,8 @@ public class FirewallWorkerService : BackgroundService
                         -RemoteAddress $ip `
                         -LocalPort $p `
                         -Protocol $proto `
+                        -Direction Inbound `
+                        -Action Allow `
                         -Enabled True `
                         -Profile Any `
                         -ErrorAction Stop
@@ -1143,21 +1151,18 @@ public class FirewallWorkerService : BackgroundService
                 }}
             ";
 
-            RunPowerShell(script);
+            _commands.PowerShell(script);
             ServiceLogger.Debug($"[FIREWALL] Rule script completed in {fw.ElapsedMilliseconds}ms. Verifying...");
 
-            string verifyOutput = RunPowerShell(
-                $"Get-NetFirewallRule -Name '{ruleName}' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name"
+            string verifyOutput = _commands.PowerShell(
+                $"Get-NetFirewallRule -ErrorAction Stop | Where-Object {{ $_.Name -eq '{ruleName}' }} | Select-Object -ExpandProperty Name"
             ).Trim();
             ServiceLogger.Debug($"[FIREWALL] Verify completed in {fw.ElapsedMilliseconds}ms total.");
 
             if (verifyOutput.Equals(ruleName, StringComparison.OrdinalIgnoreCase))
                 ServiceLogger.Log($"[SUCCESS] Rule verified: {protocol}/{port} OPEN for {ip}.");
             else
-                // Warn, not Log: a verification failure means the grant the user was told they
-                // received may not exist. At INFO it disappears under Logging:AppMinLevel=warning,
-                // which is exactly the setting a production host is likely to run.
-                ServiceLogger.Warn($"[FAILED] Rule '{ruleName}' could not be verified after creation.");
+                throw new InvalidOperationException($"Rule '{ruleName}' could not be verified after creation.");
         }
         else
         {
@@ -1173,14 +1178,14 @@ public class FirewallWorkerService : BackgroundService
             // Upsert: remove any existing rule for this IP+port, then insert a fresh one.
             // iptables -I is not idempotent on its own — without the delete step it would
             // stack duplicate rules on repeated logins from the same IP.
-            string existing = RunBash("iptables -S INPUT 2>/dev/null");
+            string existing = _commands.Bash("iptables -S INPUT");
             foreach (string line in existing.Split('\n', StringSplitOptions.RemoveEmptyEntries))
             {
-                if (line.TrimStart().StartsWith("-A INPUT") && line.Contains(ruleName))
-                    RunBash("iptables " + line.TrimStart().Replace("-A INPUT", "-D INPUT"));
+                if (TryGetManagedRule(line, out var name, out _) && name == ruleName)
+                    DeleteLinuxRule(line);
             }
 
-            RunBash($"iptables -I INPUT -p {proto} --dport {port} -s {ip} -j ACCEPT -m comment --comment '{comment}'");
+            _commands.Bash($"iptables -I INPUT -p {proto} --dport {port} -s {ip} -j ACCEPT -m comment --comment '{comment}'");
             ServiceLogger.Debug($"[FIREWALL] iptables rule inserted in {fw.ElapsedMilliseconds}ms. Verifying...");
 
             // Verify by scanning the rule list for our comment, not with `iptables -C`.
@@ -1189,21 +1194,21 @@ public class FirewallWorkerService : BackgroundService
             // comment therefore never matches a rule that exists, which reported every
             // successful Linux grant as [FAILED] while the rule was in fact present and working.
             // Scanning also matches how the upsert above and SweepExpiredRules locate rules.
-            string after = RunBash("iptables -S INPUT 2>/dev/null");
+            string after = _commands.Bash("iptables -S INPUT");
             bool verified = after
                 .Split('\n', StringSplitOptions.RemoveEmptyEntries)
-                .Any(l => l.TrimStart().StartsWith("-A INPUT") && l.Contains(comment, StringComparison.Ordinal));
+                .Any(l => TryGetManagedRule(l, out var name, out var expiry) && name == ruleName && expiry == expEpoch);
 
             if (verified)
                 ServiceLogger.Log($"[SUCCESS] iptables rule verified: {protocol}/{port} OPEN for {ip}.");
             else
-                ServiceLogger.Warn($"[FAILED] iptables rule could not be verified: {protocol}/{port} for {ip}.");
+                throw new InvalidOperationException($"iptables rule could not be verified: {protocol}/{port} for {ip}.");
         }
     }
 
     internal static string RunPowerShell(string script)
     {
-        string full   = $"$ProgressPreference = 'SilentlyContinue'; Import-Module NetSecurity -ErrorAction SilentlyContinue; {script}";
+        string full   = $"$ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue'; Import-Module NetSecurity -ErrorAction Stop; {script}";
         string base64 = Convert.ToBase64String(Encoding.Unicode.GetBytes(full));
 
         var psi = new ProcessStartInfo("powershell.exe",
@@ -1215,20 +1220,10 @@ public class FirewallWorkerService : BackgroundService
             RedirectStandardError  = true
         };
 
-        var ps = System.Diagnostics.Stopwatch.StartNew();
-        using var proc = Process.Start(psi);
-        if (proc == null) return string.Empty;
-        ServiceLogger.Debug($"[PS] Process started in {ps.ElapsedMilliseconds}ms");
-
-        string output = proc.StandardOutput.ReadToEnd().Trim();
-        string error  = proc.StandardError.ReadToEnd();
-        proc.WaitForExit();
-        ServiceLogger.Debug($"[PS] Process exited in {ps.ElapsedMilliseconds}ms (exit code {proc.ExitCode})");
-
-        if (!string.IsNullOrWhiteSpace(error) && !error.Contains("<Objs"))
-            ServiceLogger.Error($"[PS ERROR] {error.Trim()}");
-
-        return output;
+        var result = FirewallCommandRunner.Run(psi);
+        if (!string.IsNullOrWhiteSpace(result.StandardError))
+            ServiceLogger.Warn($"[PS STDERR] {result.StandardError}");
+        return result.StandardOutput;
     }
 
     internal static string RunBash(string script)
@@ -1241,25 +1236,16 @@ public class FirewallWorkerService : BackgroundService
         psi.RedirectStandardOutput = true;
         psi.RedirectStandardError  = true;
 
-        var sw = System.Diagnostics.Stopwatch.StartNew();
-        using var proc = Process.Start(psi);
-        if (proc == null) return string.Empty;
-
-        string output = proc.StandardOutput.ReadToEnd().Trim();
-        string error  = proc.StandardError.ReadToEnd();
-        proc.WaitForExit();
-        ServiceLogger.Debug($"[BASH] Exited in {sw.ElapsedMilliseconds}ms (exit code {proc.ExitCode})");
-
-        if (!string.IsNullOrWhiteSpace(error))
-            ServiceLogger.Error($"[BASH ERROR] {error.Trim()}");
-
-        return output;
+        var result = FirewallCommandRunner.Run(psi);
+        if (!string.IsNullOrWhiteSpace(result.StandardError))
+            ServiceLogger.Warn($"[BASH STDERR] {result.StandardError}");
+        return result.StandardOutput;
     }
 
     // -----------------------------------------------------------------------
     // FIREWALL SWEEPER: Remove expired rules every 5 minutes
     // -----------------------------------------------------------------------
-    private static async Task RunSweeperAsync(CancellationToken stoppingToken)
+    internal async Task RunSweeperAsync(CancellationToken stoppingToken)
     {
         // Prefer to start only once this process owns the IPC endpoint, so a duplicate stays
         // inert -- but never let that wait stop rules from expiring. See IpcOwnership.MaxWait.
@@ -1276,37 +1262,48 @@ public class FirewallWorkerService : BackgroundService
         }
 
         ServiceLogger.Log("[SWEEPER] Starting...");
+        try { SweepExpiredRules(); }
+        catch (Exception ex) { ServiceLogger.Error($"[SWEEPER ERROR] {ex.Message}"); }
         using var timer = new PeriodicTimer(TimeSpan.FromMinutes(5));
 
         while (await timer.WaitForNextTickAsync(stoppingToken))
         {
             try { SweepExpiredRules(); }
-            catch (Exception ex) { ServiceLogger.Log($"[SWEEPER ERROR] {ex.Message}"); }
+            catch (Exception ex) { ServiceLogger.Error($"[SWEEPER ERROR] {ex.Message}"); }
         }
     }
 
-    private static void SweepExpiredRules()
+    internal void SweepExpiredRules()
+    {
+        lock (_firewallLock)
+            SweepExpiredRulesLocked();
+    }
+
+    private void SweepExpiredRulesLocked()
     {
         ServiceLogger.Log("[SWEEPER] Checking for expired rules...");
 
-        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        if (_commands.IsWindows)
         {
             string reaperScript = $@"
-                $rules = Get-NetFirewallRule -DisplayName '{_rulePrefix}*' -ErrorAction SilentlyContinue
+                $rules = Get-NetFirewallRule -ErrorAction Stop | Where-Object {{ $_.DisplayName -like '{_rulePrefix}*' }}
                 $nowUtcString = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm')
 
                 foreach ($rule in $rules) {{
                     if ($rule.Description -match 'Exp:\s*(\d{{4}}-\d{{2}}-\d{{2}}\s\d{{2}}:\d{{2}})') {{
                         $expString = $matches[1]
-                        if ($nowUtcString -gt $expString) {{
-                            Remove-NetFirewallRule -Name $rule.Name
+                        if ($nowUtcString -ge $expString) {{
+                            Remove-NetFirewallRule -Name $rule.Name -ErrorAction Stop
+                            if (Get-NetFirewallRule -ErrorAction Stop | Where-Object {{ $_.Name -eq $rule.Name }}) {{
+                                throw ('Expired rule remains after deletion: ' + $rule.Name)
+                            }}
                             Write-Output $rule.DisplayName
                         }}
                     }}
                 }}
             ";
 
-            string results = RunPowerShell(reaperScript).Trim();
+            string results = _commands.PowerShell(reaperScript).Trim();
 
             if (!string.IsNullOrWhiteSpace(results))
             {
@@ -1325,7 +1322,7 @@ public class FirewallWorkerService : BackgroundService
             // Linux: parse 'iptables -S INPUT' and delete any of our rules whose
             // stored expiry epoch has passed.  Update these commands if your distro
             // uses nftables, ufw, or firewalld instead of iptables.
-            string rules = RunBash("iptables -S INPUT 2>/dev/null");
+            string rules = _commands.Bash("iptables -S INPUT");
             if (string.IsNullOrWhiteSpace(rules))
             {
                 ServiceLogger.Log("[SWEEPER] No iptables rules found.");
@@ -1337,18 +1334,9 @@ public class FirewallWorkerService : BackgroundService
 
             foreach (string line in rules.Split('\n', StringSplitOptions.RemoveEmptyEntries))
             {
-                if (!line.Contains(_rulePrefix)) continue;
-
-                var expMatch = Regex.Match(line, @"exp:(\d+)");
-                if (!expMatch.Success) continue;
-
-                if (nowEpoch <= long.Parse(expMatch.Groups[1].Value)) continue;
-
-                // Delete by replaying the save-format rule with -D instead of -A
-                RunBash("iptables " + line.TrimStart().Replace("-A INPUT", "-D INPUT"));
-
-                var nameMatch = Regex.Match(line, Regex.Escape(_rulePrefix) + @"[^\s'""]+");
-                ServiceLogger.Log($"[SWEEPER] Expired iptables rule removed: {(nameMatch.Success ? nameMatch.Value : "unknown")}");
+                if (!TryGetManagedRule(line, out var name, out var expiry) || nowEpoch < expiry) continue;
+                DeleteLinuxRule(line);
+                ServiceLogger.Log($"[SWEEPER] Expired iptables rule removed: {name}");
                 count++;
             }
 
@@ -1356,6 +1344,30 @@ public class FirewallWorkerService : BackgroundService
                 ? $"[SWEEPER] Done. Removed {count} rule(s)."
                 : "[SWEEPER] No expired rules found.");
         }
+    }
+
+    // iptables -S quotes comments containing spaces. Match the complete generated comment,
+    // including its delimiter: port 22 must never match 2222, nor TCP match UDP. The old
+    // protocol-less names are still understood by expiry, so upgrades do not strand grants.
+    private bool TryGetManagedRule(string line, out string name, out long expiry)
+    {
+        name = string.Empty;
+        expiry = 0;
+        if (!line.TrimStart().StartsWith("-A INPUT ", StringComparison.Ordinal)) return false;
+        var match = Regex.Match(line, @"(?:^|\s)--comment ""(?<name>[^""]+) exp:(?<expiry>\d+)""(?:\s|$)");
+        if (!match.Success || !match.Groups["name"].Value.StartsWith(_rulePrefix, StringComparison.Ordinal)
+            || !long.TryParse(match.Groups["expiry"].Value, out expiry)) return false;
+        name = match.Groups["name"].Value;
+        return true;
+    }
+
+    private void DeleteLinuxRule(string line)
+    {
+        string rule = line.Trim();
+        _commands.Bash("iptables -D INPUT" + rule["-A INPUT".Length..]);
+        string remaining = _commands.Bash("iptables -S INPUT");
+        if (remaining.Split('\n', StringSplitOptions.RemoveEmptyEntries).Any(l => l.Trim() == rule))
+            throw new InvalidOperationException("iptables rule remains after deletion.");
     }
 }
 
