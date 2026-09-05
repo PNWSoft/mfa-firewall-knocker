@@ -1568,7 +1568,7 @@ public class DatabaseLockService : BackgroundService
     // -----------------------------------------------------------------------
     // DB IPC COMMAND DISPATCHER
     // Called by FirewallWorkerService when a request starts with "DB:"
-    // Commands: BURN_TOTP_TOKEN | SET_PASSKEY_TOKEN | UPDATE_SIGN_COUNT | ADD_PASSKEY
+    // Commands: BURN_TOTP_TOKEN | CONSUME_TOTP | SET_PASSKEY_TOKEN | UPDATE_SIGN_COUNT | ADD_PASSKEY
     // -----------------------------------------------------------------------
     internal static string ProcessDbRequest(string command)
     {
@@ -1580,6 +1580,9 @@ public class DatabaseLockService : BackgroundService
             {
 #if ALLOW_TOTP
                 "BURN_TOTP_TOKEN"     when parts.Length == 2 => BurnTotpToken(parts[1].Trim()),
+                "CONSUME_TOTP"        when parts.Length == 4 => TotpReplayProtection.Consume(
+                    parts[1].Trim(), parts[2].Trim(), parts[3].Trim(),
+                    AcquireDbLock, LoadUsers, SaveUsers, DateTimeOffset.UtcNow),
 #endif
                 "SET_PASSKEY_TOKEN"   when parts.Length == 4 => SetPasskeyToken(parts[1].Trim(), parts[2].Trim(), parts[3].Trim()),
                 "RENEW_PASSKEY_TOKEN" when parts.Length == 2 => RenewPasskeyToken(parts[1].Trim()),
@@ -1757,6 +1760,51 @@ public class DatabaseLockService : BackgroundService
     }
 
 }
+
+#if ALLOW_TOTP
+// Keep the read/check/write in one synchronous critical section: Mutex ownership is
+// thread-affine, and two requests must never both accept the same or an older step.
+// The callbacks use the existing authoritative DB lock and atomic, flushed save.
+internal static class TotpReplayProtection
+{
+    internal static string Consume(string username, string timeStepText, string secretFingerprint,
+        Func<IDisposable?> acquireLock, Func<List<UserEntry>> loadUsers,
+        Action<List<UserEntry>> saveUsers, DateTimeOffset utcNow)
+    {
+        if (!long.TryParse(timeStepText, System.Globalization.NumberStyles.None,
+                System.Globalization.CultureInfo.InvariantCulture, out long timeStep))
+            return "ERROR: Invalid TOTP time step";
+
+        // Match Otp.NET's default 30-second period and MFAWeb's +/- one-step window.
+        // An old queued request or a forged far-future watermark must fail closed.
+        long currentStep = utcNow.ToUnixTimeSeconds() / 30;
+        if (timeStep < currentStep - 1 || timeStep > currentStep + 1)
+            return "ERROR: TOTP time step expired";
+
+        using var dbLock = acquireLock();
+        if (dbLock == null) return "ERROR: DB lock timeout";
+
+        var users = loadUsers();
+        var user = users.FirstOrDefault(u => u.Username.Equals(username, StringComparison.OrdinalIgnoreCase));
+        if (user == null || !user.TotpConfirmed || string.IsNullOrWhiteSpace(user.TotpSecret))
+            return "ERROR: TOTP not enrolled";
+
+        string currentFingerprint = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(user.TotpSecret)));
+        if (!CryptographicOperations.FixedTimeEquals(Encoding.UTF8.GetBytes(currentFingerprint),
+                Encoding.UTF8.GetBytes(secretFingerprint)))
+            return "ERROR: TOTP enrollment changed";
+
+        if (user.LastAcceptedTotpTimeStep.HasValue && timeStep <= user.LastAcceptedTotpTimeStep.Value)
+            return "ERROR: TOTP time step already consumed";
+
+        // Older files have no recorded use. The first accepted step establishes the
+        // watermark, and every model preserves it across future writes and restarts.
+        user.LastAcceptedTotpTimeStep = timeStep;
+        saveUsers(users); // A failed save throws; the caller must not authorize access.
+        return "SUCCESS";
+    }
+}
+#endif
 
 // -----------------------------------------------------------------------
 // CERTIFICATE MONITOR SERVICE
@@ -2004,6 +2052,7 @@ public class UserEntry
     // True once the user has visited the setup page and scanned their QR code.
     // MFAAdmin sets this to false on add/reprovision; BurnTotpToken sets it to true.
     public bool TotpConfirmed { get; set; } = false;
+    public long? LastAcceptedTotpTimeStep { get; set; }
     public string? ProvisioningToken { get; set; }
     public DateTime? ProvisioningExpiresUtc { get; set; }
     public List<StoredPasskeyCredential> PasskeyCredentials { get; set; } = new();
