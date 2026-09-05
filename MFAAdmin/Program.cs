@@ -91,6 +91,8 @@ namespace MFAAdmin
         // True once the user has visited the setup page and scanned their QR code.
         // MFAAdmin sets this to false on add/reprovision; BurnTotpToken sets it to true.
         public bool TotpConfirmed { get; set; } = false;
+        // Preserve the service's replay watermark on every unrelated admin DB write.
+        public long? LastAcceptedTotpTimeStep { get; set; }
         public string? ProvisioningToken { get; set; }
         public DateTime? ProvisioningExpiresUtc { get; set; }
         public List<StoredPasskeyCredential> PasskeyCredentials { get; set; } = new();
@@ -543,6 +545,7 @@ namespace MFAAdmin
 
                     u.TotpSecret    = "";
                     u.TotpConfirmed = false;
+                    u.LastAcceptedTotpTimeStep = null;
                     cleared++;
                 }
 
@@ -601,6 +604,7 @@ namespace MFAAdmin
                 user.PasswordHash              = newPasswordHash;
                 user.TotpSecret                = newBase32Secret;
                 user.TotpConfirmed             = false;
+                user.LastAcceptedTotpTimeStep   = null;
                 user.ProvisioningToken         = TotpEnabled ? newTotpToken : null;
                 user.ProvisioningExpiresUtc    = TotpEnabled ? expiresUtc : (DateTime?)null;
                 user.PasskeyCredentials        = new();

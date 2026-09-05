@@ -37,6 +37,9 @@ jobs:
       - name: Build
         run: dotnet build MFA.slnx -c Release --no-restore -p:AllowTotp=${{ matrix.allow_totp }}
 
+      - name: TOTP replay regression checks
+        run: dotnet run --project tests/MFAService.ReplayTests -c Release --no-build --no-restore -p:AllowTotp=${{ matrix.allow_totp }}
+
   audit:
     name: Dependency audit
     runs-on: ubuntu-latest

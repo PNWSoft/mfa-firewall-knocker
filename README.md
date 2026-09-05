@@ -233,9 +233,10 @@ Practical consequences to plan for:
 
 Two independent reasons.
 
-**Codes are phishable and replayable.** A captured code stays valid for roughly 90 seconds, and
-an account is only as strong as its weakest enrolled method — so leaving TOTP available means the
-passkey buys you little.
+**Codes are phishable and time-sensitive.** A captured, unused code stays valid for roughly 90
+seconds. This implementation persists the accepted time-step and rejects a second use, but an
+attacker who submits a captured code first can still win the race. An account is only as strong as
+its weakest enrolled method, so leaving TOTP available gives up much of the passkey's protection.
 
 **The server must store the secret in the clear.** This one is inherent to the protocol, not to
 this implementation. Verifying a code means computing `HMAC-SHA1(secret, timestep)` and comparing,
