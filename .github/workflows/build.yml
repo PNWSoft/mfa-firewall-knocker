@@ -1,5 +1,8 @@
 name: build
 
+permissions:
+  contents: read
+
 on:
   push:
     branches: [ main ]
@@ -25,30 +28,33 @@ jobs:
         allow_totp: [ 'false', 'true' ]
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - uses: actions/setup-dotnet@v6
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6
         with:
-          dotnet-version: '10.0.x'
+          global-json-file: global.json
 
       - name: Restore
-        run: dotnet restore MFA.slnx
+        run: dotnet restore MFA.slnx --locked-mode
 
       - name: Build
-        run: dotnet build MFA.slnx -c Release --no-restore -p:AllowTotp=${{ matrix.allow_totp }}
+        run: dotnet build MFA.slnx -c Release --no-restore -p:AllowTotp=${{ matrix.allow_totp }} -p:SourceRevisionId=${{ github.sha }}
+
+      - name: Test
+        run: dotnet test MFA.slnx -c Release --no-build --no-restore -p:AllowTotp=${{ matrix.allow_totp }} -p:SourceRevisionId=${{ github.sha }}
 
   audit:
     name: Dependency audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - uses: actions/setup-dotnet@v6
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6
         with:
-          dotnet-version: '10.0.x'
+          global-json-file: global.json
 
       - name: Restore
-        run: dotnet restore MFA.slnx
+        run: dotnet restore MFA.slnx --locked-mode
 
       # Fails the build on any known advisory, including transitive ones.
       #
@@ -72,3 +78,34 @@ jobs:
       - name: Report deprecated packages
         continue-on-error: true
         run: dotnet list MFA.slnx package --deprecated
+
+  reproducible:
+    name: Reproducible managed assemblies
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6
+        with:
+          global-json-file: global.json
+
+      - name: Build twice and compare
+        shell: bash
+        run: |
+          set -euo pipefail
+          dotnet restore MFA.slnx --locked-mode
+          dotnet build MFA.slnx -c Release --no-restore -p:SourceRevisionId=${{ github.sha }}
+          sha256sum \
+            MFAAdmin/bin/Release/net10.0/MFAAdmin.dll \
+            MFAService/bin/Release/net10.0/MFAService.dll \
+            MFAWeb/bin/Release/net10.0/MFAWeb.dll > "$RUNNER_TEMP/first.sha256"
+
+          dotnet clean MFA.slnx -c Release
+          dotnet restore MFA.slnx --locked-mode
+          dotnet build MFA.slnx -c Release --no-restore -p:SourceRevisionId=${{ github.sha }}
+          sha256sum \
+            MFAAdmin/bin/Release/net10.0/MFAAdmin.dll \
+            MFAService/bin/Release/net10.0/MFAService.dll \
+            MFAWeb/bin/Release/net10.0/MFAWeb.dll > "$RUNNER_TEMP/second.sha256"
+
+          diff -u "$RUNNER_TEMP/first.sha256" "$RUNNER_TEMP/second.sha256"

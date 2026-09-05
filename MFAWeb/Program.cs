@@ -301,10 +301,9 @@ AuditLogger.LogDirectory = app.Configuration["LogPath"] ?? AuditLogger.LogDirect
 LoginFailureMonitor.Configure(app.Configuration);
 
 var _asm = Assembly.GetExecutingAssembly();
-var _ver = _asm.GetName().Version?.ToString(3) ?? "unknown";
-var _built = _asm.GetCustomAttributes<AssemblyMetadataAttribute>()
-    .FirstOrDefault(a => a.Key == "BuildDate")?.Value ?? "unknown";
-AuditLogger.Log($"MFAWeb v{_ver} (built {_built} UTC) starting...");
+var _ver = _asm.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion
+           ?? _asm.GetName().Version?.ToString(3) ?? "unknown";
+AuditLogger.Log($"MFAWeb v{_ver} starting...");
 
 string siteName = app.Configuration["SiteName"] ?? "MFA Secure Access";
 // HTML-escaped form for interpolation into the inline markup below. Operator-controlled
@@ -1998,5 +1997,3 @@ public static class AuditLogger
         return safeString.ToString();
     }
 }
-
-
