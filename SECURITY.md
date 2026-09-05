@@ -31,8 +31,11 @@ and the limitations below are as much a part of the specification as the guarant
 
 ### The problem addressed: a credential that leaves the building
 
-A WireGuard profile or an SSH private key is a bearer token. Possession is the entire test: the
-holder of the file authenticates as its owner, from any address, at any hour.
+A WireGuard profile or a conventional file-backed SSH private key is a bearer credential:
+possession of the file is the authentication test. OpenSSH FIDO credentials (`sk-ecdsa-*` and
+`sk-ssh-ed25519-*`) are a material exception: since OpenSSH 8.2, the local key handle is unusable
+without the security key, and deployments can also require touch or PIN verification. See the
+[OpenSSH 8.2 release notes](https://www.openssh.com/txt/release-8.2).
 
 Revocation is straightforward — remove the peer from the server, or the key from
 `authorized_keys`. Every control available is post-incident: revoke, rotate, audit handshakes.
@@ -156,10 +159,13 @@ rotate keys across the fleet and hope you were fast enough.
 **Behind this gate, that file is inert on its own.** The port it would connect to does not exist
 until someone completes a WebAuthn ceremony against a passkey that:
 
-- **cannot be copied** — the private key is generated in and confined to the device's secure
-  hardware, and is non-exportable by design. Stealing files does not steal it.
-- **cannot be used without the person** — user verification is required on every assertion, so a
-  biometric or device PIN is needed each time, not just at enrolment.
+- **is managed by an authenticator rather than stored by this server** — stealing the server's
+  user database does not reveal a private key. The configured `attestationPreference = None`
+  does not prove secure hardware, device binding, or non-exportability; Apple, Google, Microsoft,
+  and third-party providers may sync or back up passkeys according to their own policies.
+- **requires authenticator-mediated user verification** — every assertion requests a biometric,
+  device PIN, or equivalent local verification. This protects against simple device possession,
+  while the authenticator provider's account-recovery and sync controls remain a trust boundary.
 - **cannot be phished** — the assertion is bound to the origin, so a convincing fake site cannot
   harvest anything replayable.
 
@@ -195,19 +201,21 @@ security; no network gate can be one.
 
 ### A note on the user database
 
-In the default passkey-only build the store holds no directly usable credential. WebAuthn
-credentials are **public keys**, and because TOTP is not compiled in there is no shared secret to
-write — so the file contains a user list, BCrypt password hashes, and public key material.
+In the default passkey-only build, enrolled WebAuthn credentials are **public keys** and there is
+no recoverable TOTP secret. The store still contains usernames and BCrypt password hashes. During
+enrollment or reprovisioning it also contains short-lived passkey registration tokens and the
+registration-ready state. A reader who can watch an active enrollment can race the legitimate
+user after the password gate has made that token ready, so confidentiality still matters during
+those windows.
 
-In that build, that makes **integrity, not confidentiality, the property worth defending**. Someone who can
-*read* `users.dat` learns which addresses have accounts and obtains BCrypt hashes whose value is
-limited: for an already-enrolled account the password cannot register a passkey, because
-`AddPasskey` refuses any account that already has one. Someone who can *write* it simply adds
-their own passkey credential and becomes that user.
+Integrity is always critical: someone who can write the store can add their own passkey credential
+and become that user. For an already-enrolled account with no active provisioning state, a read
+does not reveal a credential that can produce a WebAuthn assertion, but it still discloses the user
+list and password hashes.
 
-The file permissions in INSTALL.md exist primarily for that second case. DPAPI encryption on
-Windows raises the bar on reads as well, but it is not what stands between an attacker and an
-account — the permissions are.
+The file permissions in INSTALL.md protect both properties. DPAPI encryption on Windows raises the
+bar on reads, while filesystem permissions remain the primary boundary against unauthorized reads
+and writes.
 
 ### Why TOTP changes this, and why it is off by default
 
@@ -222,23 +230,23 @@ DPAPI does on Windows — protects against theft of the file alone, but the serv
 decrypt it to function, so the material remains recoverable to anything with sufficient access to
 the host.
 
-That produces a sharp asymmetry between the three credential types:
+That produces a sharp asymmetry between the two build modes:
 
 | | What the server stores | What a full database breach yields |
 |---|---|---|
-| Password | a one-way hash | hashes an attacker must still crack |
-| **TOTP** | **the secret itself** | **valid codes for every user, immediately and indefinitely** |
-| WebAuthn / passkey | a public key | public keys — nothing that can authenticate |
+| Passkey-only | public keys, usernames, BCrypt password hashes, and any active enrollment state | account data, hashes, and usable enrollment tokens during their short validity window, but no private passkey key |
+| **TOTP-enabled** | **all passkey-only data plus each TOTP secret** | **all of the above plus valid codes for every TOTP user until each secret is re-enrolled** |
 
 A TOTP database breach is a mass-compromise event: every enrolled user's second factor becomes
-forgeable at once, silently, and stays that way until every secret is re-enrolled. A passkey
-database breach is a user list.
+forgeable at once, silently, and stays that way until every secret is re-enrolled. A passkey-only
+database breach is still serious, but it does not disclose the private key needed to produce an
+assertion for an already-enrolled credential.
 
 This is the second independent reason TOTP is not compiled into the default build — the first
 being that codes are phishable and replayable within their window. Neither is a criticism of TOTP
 as a technology; it is a reasonable second factor where the alternative is a password alone. It
-is simply a poor fit for a component whose stored state is otherwise worth nothing to an
-attacker.
+adds immediately usable shared authenticator secrets to a store that is already confidential and
+integrity-sensitive.
 
 If you do enable it, weigh it especially carefully on Linux, where the store is not encrypted at
 rest.
@@ -281,8 +289,11 @@ logs, or bypass the passkey-registration password gate.
 
 ## Supported versions
 
-This project has not yet cut a tagged release. Until it does, only the current `main` branch
-receives fixes.
+| Version | Security fixes |
+|---------|----------------|
+| Current `main` | Yes |
+| Latest tagged release | Yes |
+| Older tagged releases | No |
 
 ## Known issues
 
