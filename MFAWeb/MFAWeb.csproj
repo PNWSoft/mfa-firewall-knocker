@@ -15,6 +15,7 @@
 
   <ItemGroup>
     <AssemblyMetadata Include="BuildDate" Value="$(BuildDate)" />
+    <InternalsVisibleTo Include="MFAWeb.RegistrationTests" />
   </ItemGroup>
 
   <ItemGroup>
