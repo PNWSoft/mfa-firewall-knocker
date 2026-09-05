@@ -500,12 +500,14 @@ app.MapPost("/auth", async (HttpContext context, IAntiforgery antiforgery, IConf
 
     // 3. Validate credentials (read-only — MFAWeb never writes the DB)
     bool credentialsValid = false;
+    bool monitorTotpFailure = false;
     bool hadNoPasskeys = false;
     string authedUsername = "";
 
     {
         var users = LoadUsers(DbPath, Entropy);
         var user = users.FirstOrDefault(u => u.Username.Equals(username, StringComparison.OrdinalIgnoreCase));
+        monitorTotpFailure = user is { TotpConfirmed: true } && !string.IsNullOrWhiteSpace(user.TotpSecret);
         // The empty-secret check is defence in depth. Passkey-only accounts store
         // TotpSecret = "" and TotpConfirmed = false, so TotpConfirmed alone already blocks
         // them — but if that pairing is ever broken (a crafted 'import', DB tampering, a
@@ -526,7 +528,7 @@ app.MapPost("/auth", async (HttpContext context, IAntiforgery antiforgery, IConf
 
     if (!credentialsValid)
     {
-        LoginFailureMonitor.RecordFailure(username, clientIp);
+        if (monitorTotpFailure) LoginFailureMonitor.RecordFailure(username, clientIp);
         AuditLogger.Warn("Failed - Invalid credentials or expired code");
         await SendDenyResponse(context, "Invalid credentials or expired code.");
         return;
@@ -668,6 +670,7 @@ app.MapPost("/setup", async (HttpContext context, IAntiforgery antiforgery) =>
         else if (!BCrypt.Net.BCrypt.Verify(password, user.PasswordHash))
         {
             setupBadPassword = true;
+            authedUsername = user.Username;
         }
         else if (string.IsNullOrWhiteSpace(user.TotpSecret))
         {
@@ -690,6 +693,7 @@ app.MapPost("/setup", async (HttpContext context, IAntiforgery antiforgery) =>
     }
     if (setupBadPassword)
     {
+        LoginFailureMonitor.RecordFailure(authedUsername!, context.Connection.RemoteIpAddress?.ToString() ?? "unknown");
         AuditLogger.Warn("Provisioning - Invalid password");
         await SendDenyResponse(context, "Invalid password.");
         return;
@@ -700,6 +704,8 @@ app.MapPost("/setup", async (HttpContext context, IAntiforgery antiforgery) =>
         await SendDenyResponse(context, "This account has no authenticator secret. Use your passkey setup link instead.");
         return;
     }
+
+    LoginFailureMonitor.RecordSuccess(authedUsername!);
 
     // Burn the token via IPC — MFAService is the sole DB writer
     if (!await IpcFirewallClient.BurnTotpTokenAsync(token))
@@ -823,6 +829,7 @@ app.MapPost("/setup-passkey", async (HttpContext context, IAntiforgery antiforge
 
     bool pkInvalid = false;
     bool pkBadPassword = false;
+    string? provisionUsername = null;
     {
         var users = LoadUsers(DbPath, Entropy);
         var user = users.FirstOrDefault(u => TokenEquals(u.PasskeyProvisioningToken, token)
@@ -830,8 +837,11 @@ app.MapPost("/setup-passkey", async (HttpContext context, IAntiforgery antiforge
 
         if (user == null || user.PasskeyProvisioningExpiresUtc == null || DateTime.UtcNow > user.PasskeyProvisioningExpiresUtc)
             pkInvalid = true;
-        else if (!BCrypt.Net.BCrypt.Verify(password, user.PasswordHash))
-            pkBadPassword = true;
+        else
+        {
+            provisionUsername = user.Username;
+            pkBadPassword = !BCrypt.Net.BCrypt.Verify(password, user.PasswordHash);
+        }
     }
 
     if (pkInvalid)
@@ -842,11 +852,14 @@ app.MapPost("/setup-passkey", async (HttpContext context, IAntiforgery antiforge
     }
     if (pkBadPassword)
     {
+        // A live token resolved this account. Token/username guesses never reach here.
+        LoginFailureMonitor.RecordFailure(provisionUsername!, context.Connection.RemoteIpAddress?.ToString() ?? "unknown");
         AuditLogger.Warn($"Passkey provisioning - invalid password for '{username}'");
         await SendDenyResponse(context, "Invalid password.");
         return;
     }
 
+    LoginFailureMonitor.RecordSuccess(provisionUsername!);
     AuditLogger.Log($"Passkey provisioning password verified for '{username}'");
 
     // Burn the email-link token immediately and replace it with a fresh 5-minute token.
@@ -1030,6 +1043,9 @@ app.MapPost("/passkey/verify", async (HttpContext context, IConfiguration config
     }
 
     // Async FIDO2 verification (lock not held)
+    // Only count complete assertions against the resolved account/credential. Missing
+    // challenges, unknown credentials and malformed transport data are not attributed to an account.
+    bool monitorAssertionFailure = HasCompleteAssertionData(clientAssertion);
     uint newSignCount;
     try
     {
@@ -1048,6 +1064,9 @@ app.MapPost("/passkey/verify", async (HttpContext context, IConfiguration config
     }
     catch (Exception ex)
     {
+        if (monitorAssertionFailure)
+            LoginFailureMonitor.RecordFailure(username, context.Connection.RemoteIpAddress?.ToString() ?? "unknown");
+
         // Sign-count regression means the credential counter went backwards — a strong indicator
         // of a cloned authenticator.  Log at ERROR so it surfaces in monitoring.
         bool isCounterAnomaly = ex.Message.Contains("counter", StringComparison.OrdinalIgnoreCase)
@@ -1058,6 +1077,8 @@ app.MapPost("/passkey/verify", async (HttpContext context, IConfiguration config
             AuditLogger.Warn($"Passkey assertion failed for '{username}': {ex.Message}");
         context.Response.StatusCode = 401; await context.Response.WriteAsync("Passkey verification failed."); return;
     }
+
+    LoginFailureMonitor.RecordSuccess(username);
 
     // Defense-in-depth: if the library somehow allowed a non-increasing counter, flag it.
     if (credSignCount > 0 && newSignCount <= credSignCount)
@@ -1368,6 +1389,26 @@ app.MapGet("/access-granted", async context =>
 app.Run();
 
 // --- Helper Methods ---
+
+// Shape check for monitoring only; Fido2 remains the authority for authentication.
+// Do not turn syntactically valid JSON with missing assertion fields into alert mail.
+static bool HasCompleteAssertionData(AuthenticatorAssertionRawResponse assertion)
+{
+    if (assertion.Type != PublicKeyCredentialType.PublicKey || assertion.Response is not { } response
+        || response.AuthenticatorData is not { Length: >= 37 }
+        || response.Signature is not { Length: > 0 } || response.ClientDataJson is not { Length: > 0 })
+        return false;
+
+    try
+    {
+        using var data = JsonDocument.Parse(response.ClientDataJson);
+        return data.RootElement.ValueKind == JsonValueKind.Object
+            && new[] { "type", "challenge", "origin" }.All(name =>
+                data.RootElement.TryGetProperty(name, out var value)
+                && value.ValueKind == JsonValueKind.String && !string.IsNullOrEmpty(value.GetString()));
+    }
+    catch (JsonException) { return false; }
+}
 
 // Reads the request body up to maxBytes. Returns null if the body exceeds the limit.
 static async Task<string?> ReadBodyWithLimitAsync(HttpRequest request, int maxBytes = 65_536)
@@ -1998,5 +2039,3 @@ public static class AuditLogger
         return safeString.ToString();
     }
 }
-
-
