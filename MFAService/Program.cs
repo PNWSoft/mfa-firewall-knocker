@@ -528,12 +528,12 @@ public class FirewallWorkerService : BackgroundService
         }
 
         int  port   = int.TryParse(_config["Smtp:Port"], out var p) ? p : 25;
-        bool useSsl = bool.TryParse(_config["Smtp:UseSsl"], out var s) && s;
         var  user   = _config["Smtp:Username"];
         var  pass   = _config["Smtp:Password"];
 
         try
         {
+            bool useSsl = SmtpTransportPolicy.GetUseSsl(_config, host);
             using var msg = new MailMessage(from, notify)
             {
                 Subject = subject,
@@ -1968,12 +1968,12 @@ public class CertificateMonitorService : BackgroundService
         }
 
         int  port   = int.TryParse(_config["Smtp:Port"], out var p) ? p : 25;
-        bool useSsl = bool.TryParse(_config["Smtp:UseSsl"], out var s) && s;
         var  user   = _config["Smtp:Username"];
         var  pass   = _config["Smtp:Password"];
 
         try
         {
+            bool useSsl = SmtpTransportPolicy.GetUseSsl(_config, host);
             using var msg = new MailMessage(from, notify)
             {
                 Subject = subject,
@@ -1993,6 +1993,31 @@ public class CertificateMonitorService : BackgroundService
             ServiceLogger.Error($"[CERT] Failed to send alert email: {ex.Message}");
             return false;
         }
+    }
+}
+
+internal static class SmtpTransportPolicy
+{
+    internal static bool GetUseSsl(IConfiguration config, string host)
+    {
+        string? configured = config["Smtp:UseSsl"];
+        if (string.IsNullOrWhiteSpace(configured)) return true;
+        if (!bool.TryParse(configured, out bool useSsl))
+            throw new InvalidOperationException($"Smtp:UseSsl value '{configured}' is not true or false.");
+        if (!useSsl && !IsLoopbackHost(host))
+            throw new InvalidOperationException(
+                "Smtp:UseSsl may be false only for a loopback SMTP relay (localhost, 127.0.0.0/8, or ::1).");
+        return useSsl;
+    }
+
+    private static bool IsLoopbackHost(string host)
+    {
+        string candidate = host.Trim().TrimEnd('.');
+        if (candidate.Equals("localhost", StringComparison.OrdinalIgnoreCase)) return true;
+
+        candidate = candidate.TrimStart('[').TrimEnd(']');
+        return System.Net.IPAddress.TryParse(candidate, out var address)
+            && System.Net.IPAddress.IsLoopback(address);
     }
 }
 

@@ -419,12 +419,28 @@ namespace MFAAdmin
             throw new InvalidOperationException($"Smtp:Port value '{v}' is not a valid port (1-65535).");
         }
 
-        static bool SmtpUseSsl()
+        static bool SmtpUseSsl(string host)
         {
             string? v = Config["Smtp:UseSsl"];
-            if (string.IsNullOrWhiteSpace(v)) return false;
-            if (bool.TryParse(v, out var b)) return b;
-            throw new InvalidOperationException($"Smtp:UseSsl value '{v}' is not true or false.");
+            if (string.IsNullOrWhiteSpace(v)) return true;
+            if (!bool.TryParse(v, out var b))
+                throw new InvalidOperationException($"Smtp:UseSsl value '{v}' is not true or false.");
+
+            if (!b && !IsLoopbackSmtpHost(host))
+                throw new InvalidOperationException(
+                    "Smtp:UseSsl may be false only for a loopback SMTP relay (localhost, 127.0.0.0/8, or ::1).");
+
+            return b;
+        }
+
+        static bool IsLoopbackSmtpHost(string host)
+        {
+            string candidate = host.Trim().TrimEnd('.');
+            if (candidate.Equals("localhost", StringComparison.OrdinalIgnoreCase)) return true;
+
+            candidate = candidate.TrimStart('[').TrimEnd(']');
+            return System.Net.IPAddress.TryParse(candidate, out var address)
+                && System.Net.IPAddress.IsLoopback(address);
         }
 
         static bool SendProvisioningEmail(string userEmail, string tempPassword, string totpUrl, string passkeyUrl)
@@ -440,7 +456,7 @@ namespace MFAAdmin
             {
                 host = SmtpRequired("Host");
                 port = SmtpPort();
-                useSsl = SmtpUseSsl();
+                useSsl = SmtpUseSsl(host);
                 smtpUsername = Config["Smtp:Username"];
                 smtpPassword = Config["Smtp:Password"];
                 fromAddress = SmtpRequired("FromAddress");
@@ -966,7 +982,7 @@ namespace MFAAdmin
             {
                 host = SmtpRequired("Host");
                 port = SmtpPort();
-                useSsl = SmtpUseSsl();
+                useSsl = SmtpUseSsl(host);
                 username = Config["Smtp:Username"];
                 password = Config["Smtp:Password"];
                 fromAddress = SmtpRequired("FromAddress");
