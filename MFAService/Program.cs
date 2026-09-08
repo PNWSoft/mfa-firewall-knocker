@@ -1786,6 +1786,20 @@ public class DatabaseLockService : BackgroundService
             var cred = user.PasskeyCredentials.FirstOrDefault(c => c.CredentialId == credentialId);
             if (cred != null)
             {
+                // Compare-and-only-increase under the lock this method already holds, not a
+                // blind overwrite. Two concurrent logins with the same cloned credential each
+                // read the stored count before either writes; a blind overwrite lets the second
+                // write silently clobber the first, and whichever count "wins" is essentially
+                // arbitrary -- the clone signal (a non-increasing count) is lost either way. This
+                // makes the second writer lose outright instead, so the count this method
+                // actually persists is honest, and a rejection here is itself informative: it
+                // means something submitted a count that was not larger than what's on record.
+                if (newCount <= cred.SignCount)
+                {
+                    ServiceLogger.Warn($"[SECURITY] Rejected non-increasing sign count for credential " +
+                        $"'{credentialId}': stored={cred.SignCount}, received={newCount}.");
+                    return "SUCCESS"; // detection, not prevention -- do not block the login over this
+                }
                 cred.SignCount = newCount;
                 SaveUsers(users);
                 ServiceLogger.Log($"[DB] Sign count updated for credential '{credentialId}'");
@@ -1815,6 +1829,19 @@ public class DatabaseLockService : BackgroundService
         {
             ServiceLogger.Warn($"[DB] Rejected passkey registration for '{user.Username}': token not password-verified");
             return "ERROR: Registration not authorized";
+        }
+
+        // MFAWeb's registration handler already checks this across all users before ever
+        // reaching here, but that check runs against a separate, earlier LoadUsers snapshot --
+        // two registrations racing the same credential ID (vanishingly unlikely given it's a
+        // large random value, but cheap to close outright) could both pass it and both reach
+        // this authoritative writer. Re-check under the lock this method already holds, so the
+        // actual write is the one place this is guaranteed correct, not just probably correct.
+        if (users.Any(u => u.PasskeyCredentials.Any(c => c.CredentialId == credentialId)))
+        {
+            ServiceLogger.Error($"[SECURITY] Rejected passkey registration for '{user.Username}': " +
+                $"credential ID already registered to another account.");
+            return "ERROR: Credential already registered";
         }
 
         user.PasskeyCredentials.Add(new StoredPasskeyCredential
