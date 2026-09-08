@@ -684,8 +684,49 @@ namespace MFAAdmin
                 using (AcquireDbLock()) { users = LoadUsers(); }
 
                 string json = JsonSerializer.Serialize(users, new JsonSerializerOptions { WriteIndented = true });
-                File.WriteAllText(outputPath, json, Encoding.UTF8);
+
+                // The warning above is real: this file holds password hashes, TOTP secrets (if
+                // enabled), and any currently-live provisioning tokens in the clear. Writing it
+                // with File.WriteAllText created it with the process's default permissions --
+                // running as root with a typical umask, that's world-readable (0644), and a live
+                // token plus an observed enrollment password is a full account takeover during
+                // its window. Restrict it from the instant it exists rather than tightening it
+                // afterward, which would leave a window where the plaintext secrets are exposed.
+                // FileMode.CreateNew also refuses to write through an existing file or symlink at
+                // this path instead of silently following or overwriting it.
+                using (var stream = new FileStream(outputPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+                {
+                    // The handle overload, not the path overload: it chmods the file descriptor
+                    // already open above, not whatever the path currently resolves to. The path
+                    // overload would re-resolve outputPath on disk, reopening a symlink-race
+                    // window in the moment between CreateNew and the chmod that CreateNew itself
+                    // was chosen to close.
+                    if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                        File.SetUnixFileMode(stream.SafeFileHandle, UnixFileMode.UserRead | UnixFileMode.UserWrite); // 600
+                    else
+                    {
+                        // FileInfo.SetAccessControl, not the handle-based FileStream overload:
+                        // the stream above was opened with plain FileAccess.Write, which does not
+                        // include WRITE_DAC, and SetSecurityInfo on that handle fails with
+                        // UnauthorizedAccessException regardless of running elevated. The FileInfo
+                        // overload opens its own handle with the access it needs internally.
+                        var security = new FileSecurity();
+                        security.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
+                        security.AddAccessRule(new FileSystemAccessRule(
+                            WindowsIdentity.GetCurrent().User!, FileSystemRights.FullControl, AccessControlType.Allow));
+                        new FileInfo(outputPath).SetAccessControl(security);
+                    }
+
+                    byte[] bytes = Encoding.UTF8.GetBytes(json);
+                    stream.Write(bytes, 0, bytes.Length);
+                }
+
                 AdminLogger.Log($"[SUCCESS] Exported {users.Count} user(s) to '{Path.GetFullPath(outputPath)}'");
+            }
+            catch (IOException) when (File.Exists(outputPath))
+            {
+                AdminLogger.Error($"[ERROR] Export failed: '{Path.GetFullPath(outputPath)}' already exists. " +
+                    "Remove it or choose a different path -- export refuses to write through an existing file.");
             }
             catch (Exception ex)
             {
