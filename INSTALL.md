@@ -80,7 +80,7 @@ All three components read from their own `appsettings.json`. Copy the
 | `DpapiEntropy` | **Required.** A deployment-specific value mixed into the DPAPI key derivation on Windows. It prevents other processes on the same machine from reading the database without knowing this value — keep it consistent across all three components. Startup fails if it is missing, under 16 characters, or still the placeholder from `appsettings.example.json` (that placeholder is published in the public repository and protects nothing). On Linux it is unused for encryption (the database is plain JSON) but is still validated at startup. See [step 3](#3-configure-appsettingsjson-and-restrict-permissions) for how to generate one. |
 | `RateLimitPerWindow` | Maximum requests per IP per 5-minute window across all endpoints. Default: 20. |
 | `AllowedDomains` | Email address domains permitted to use the system. Enforced in both MFAWeb (login form rejects other domains) and MFAAdmin (`add` refuses to provision an account outside these domains). |
-| `FirewallService:GmsaAccount` | The gMSA account name that MFAWeb runs as (Windows only). Used to set the named pipe ACL so only that account can send IPC requests. |
+| `FirewallService:GmsaAccount` | Required IPC client identity. On Windows, the gMSA account that MFAWeb runs as. On Linux, set this to the local account `mfaweb` in MFAService's config. The service rejects clients whose identity does not match. |
 
 ### MFAService — `appsettings.json`
 
@@ -104,7 +104,7 @@ All three components read from their own `appsettings.json`. Copy the
 | `BouncerConfig:AllowedPorts` | Ports opened for each authenticated IP, in `port/protocol` format. Examples: `"22/TCP"`, `"51820/UDP"`. |
 | `BouncerConfig:ExpirationHours` | How long firewall rules stay open. Rules are automatically removed by the sweeper when they expire. **Clamped to 1-48 on the privileged side**, so a larger value is silently reduced to 48 and logged with a `[CONFIG]` warning — a slipped digit turns time-limited access into a standing grant, so the cap is enforced where it cannot be configured away. The port must likewise be 1-65535 and the protocol TCP or UDP; anything else is skipped with the same warning. |
 | `BouncerConfig:RulePrefix` | Prefix applied to every firewall rule name. Must also match the value in MFAAdmin's config so the `diag` and `reset` commands can find the rules. |
-| `HttpsCert:PemPath` | **Linux only, and required for expiry alerts there.** Full path to the certificate MFAWeb serves (e.g. `/etc/letsencrypt/live/your.domain.com/fullchain.pem`). There is no certificate store on Linux, so without this the expiry watchdog is silently disabled — and an expired certificate means no passkey sign-in at all. |
+| `HttpsCert:PemPath` | **Linux only, and required for expiry alerts there.** Full path to the certificate MFAWeb serves (e.g. `/etc/mfa-auth/tls/current/fullchain.pem`). There is no certificate store on Linux, so without this the expiry watchdog is silently disabled — and an expired certificate means no passkey sign-in at all. |
 
 ### MFAAdmin — `appsettings.json`
 
@@ -389,12 +389,13 @@ Check the logs at `C:\ProgramData\MFAAuth\Logs\` to verify startup.
 ```bash
 # MFAService runs as root (required for firewall management)
 # MFAWeb runs as a dedicated low-privilege user
-sudo useradd --system --no-create-home --shell /usr/sbin/nologin mfaweb
+sudo useradd --system --user-group --no-create-home --shell /usr/sbin/nologin mfaweb
+sudo groupadd --system mfaipc
+sudo usermod -aG mfaipc mfaweb
 
-# Create the data directory
-sudo mkdir -p /etc/mfa-auth
-sudo chown root:mfaweb /etc/mfa-auth
-sudo chmod 750 /etc/mfa-auth
+# Setgid keeps the mfaweb reader group on new database files written by either
+# the root admin CLI or the service. The web account cannot write this directory.
+sudo install -d -o root -g mfaweb -m 2750 /etc/mfa-auth
 ```
 
 ### 2. Publish the Applications
@@ -408,7 +409,10 @@ dotnet publish MFAAdmin/MFAAdmin.csproj -c Release -r linux-x64 --self-contained
 Copy the outputs to:
 - `/opt/mfa-service/`
 - `/opt/mfa-web/`
-- `/usr/local/bin/mfaadmin` (single binary)
+- `/opt/mfa-admin/` (the complete MFAAdmin publish output, including its config)
+
+Keep these installation directories and their executables owned by root, without group or
+other write permission. Run the admin tool as `sudo /opt/mfa-admin/MFAAdmin ...`.
 
 ### 3. Configure appsettings.json
 
@@ -423,6 +427,21 @@ Set the same value for `DpapiEntropy` in all three config files. On Linux, DPAPI
 used — the user database is stored as plain JSON — but the value is still required by
 the application to start.
 
+In **MFAService's** config, replace the Windows account placeholder with the local web account:
+
+```json
+"FirewallService": { "GmsaAccount": "mfaweb" }
+```
+
+If this account is missing or cannot be resolved, MFAService rejects every IPC request and
+logs/emails an error. It keeps running so existing firewall grants can still expire. Correct
+the setting and restart `mfa-service` before retrying a login. Removing the setting does not
+disable the identity check.
+
+In **MFAWeb's** config, set `"LogPath": "/var/log/mfa-web"`. The systemd unit below creates this
+dedicated directory so the web account can write its own logs without modifying the privileged
+service's logs in `/var/log/mfa-auth`.
+
 On Linux you **must** keep the `Kestrel:Endpoints:Https:Certificate` block and point `Path`
 and `KeyPath` at your PEM files — there is no Windows certificate store, so it is the only
 source of a certificate. See [TLS Options](#tls-options).
@@ -430,16 +449,28 @@ source of a certificate. See [TLS Options](#tls-options).
 ### 4. Set File Permissions
 
 ```bash
-# Config files should not be world-readable
-sudo chmod 640 /opt/mfa-service/appsettings.json
+# Only the web config needs to be readable by mfaweb.
+sudo chown root:root /opt/mfa-service/appsettings.json /opt/mfa-admin/appsettings.json
+sudo chmod 600 /opt/mfa-service/appsettings.json /opt/mfa-admin/appsettings.json
+sudo chown root:mfaweb /opt/mfa-web/appsettings.json
 sudo chmod 640 /opt/mfa-web/appsettings.json
 
-# User database (created on first MFAAdmin add — set group ownership now)
-# MFAService will enforce mode 640 at runtime, but chown must be done manually
-sudo touch /etc/mfa-auth/users.json
-sudo chown root:mfaweb /etc/mfa-auth/users.json
-sudo chmod 640 /etc/mfa-auth/users.json
+# Existing databases and backups need the same reader group. Do not create an empty
+# JSON file: MFAAdmin creates the database on the first add.
+for file in /etc/mfa-auth/users.json /etc/mfa-auth/users.json.bak; do
+    if [ -f "$file" ]; then
+        sudo chown root:mfaweb "$file"
+        sudo chmod 640 "$file"
+    fi
+done
+
+sudo -u mfaweb test -r /opt/mfa-web/appsettings.json
 ```
+
+Both database writers create a temporary file and rename it into place. The directory's
+**setgid bit (`2750`) is required**: chmod `640` alone does not preserve the reader group after
+a root admin write. After provisioning and reprovisioning, verify `stat -c '%U:%G %a' /etc/mfa-auth/users.json`
+reports `root:mfaweb 640`, and `sudo -u mfaweb test -r /etc/mfa-auth/users.json` succeeds.
 
 ### 5. Create systemd Service Units
 
@@ -468,6 +499,10 @@ RestartSec=5
 
 # Root is required for firewall rule management
 User=root
+Group=mfaipc
+UMask=0027
+NoNewPrivileges=true
+ProtectHome=true
 
 # Logging
 StandardOutput=journal
@@ -501,6 +536,16 @@ Restart=on-failure
 RestartSec=5
 User=mfaweb
 Group=mfaweb
+SupplementaryGroups=mfaipc
+UMask=0027
+NoNewPrivileges=true
+ProtectHome=true
+ProtectSystem=strict
+# .NET's cross-process database mutex uses the shared /tmp namespace.
+# Do not enable PrivateTmp: the admin CLI and privileged service must see it too.
+ReadWritePaths=/tmp
+LogsDirectory=mfa-web
+LogsDirectoryMode=0750
 
 # Allow binding to ports below 1024 if using port 443
 AmbientCapabilities=CAP_NET_BIND_SERVICE
@@ -513,7 +558,8 @@ SyslogIdentifier=mfa-web
 WantedBy=multi-user.target
 ```
 
-Enable and start:
+Complete the Linux [TLS setup](#linux--pem-files-from-certbot), including the initial
+certificate copy, before starting MFAWeb. Then enable and start:
 
 ```bash
 sudo systemctl daemon-reload
@@ -531,8 +577,9 @@ sudo journalctl -u mfa-service -u mfa-web -f
 ### 6. Socket Permissions
 
 MFAService creates the Unix domain socket at `/run/mfafirewall.sock` with mode `0660`,
-owned by root, group root by default. Add the `mfaweb` user to the socket's group so
-MFAWeb can connect:
+owned by root and the service's primary group. The account and unit steps above set
+`Group=mfaipc` on MFAService and add `mfaweb` to that group. A supplemental group alone
+does not change the group assigned to a newly created socket.
 
 > **Keep the socket in a root-owned, non-world-writable directory.** This is a security
 > invariant, not a convention. `/run` is root-owned, so an unprivileged user cannot create or
@@ -543,20 +590,14 @@ MFAWeb can connect:
 > `SO_PEERCRED` (MFAService requires the `mfaweb` uid; MFAWeb requires uid 0), but treat that as
 > defence in depth rather than as permission to move the socket.
 
-The simplest approach is to set the socket group at runtime. In the MFAService source,
-the socket is set to mode `0660`. To allow `mfaweb` to connect, either:
+Verify the live socket after starting the service:
 
-- Run MFAService with a supplemental group that `mfaweb` also belongs to, **or**
-- Add the `mfaweb` user to the `root` group *(not recommended)*, **or**
-- Create a shared group: `sudo groupadd mfaipc`, add both root and mfaweb:
-  ```bash
-  sudo usermod -aG mfaipc mfaweb
-  ```
-  Then configure MFAService's service unit to run with that group:
-  ```ini
-  Group=mfaipc
-  SupplementaryGroups=mfaipc
-  ```
+```bash
+stat -c '%U:%G %a' /run/mfafirewall.sock   # root:mfaipc 660
+id mfaweb                               # includes mfaipc, not root
+```
+
+Keep the `mfaipc` group limited to the web service account. Do not add it to the root group.
 
 ### 7. Linux Firewall Commands
 
@@ -622,10 +663,68 @@ sudo apt-get install -y certbot
 # MFAWeb does not listen on :80, so certbot --standalone can use it for the HTTP-01 challenge.
 # Port 80 must be open in the firewall and reachable from the internet.
 sudo certbot certonly --standalone --non-interactive --agree-tos \
-    -m admin@your-domain.com -d your.domain.com
+    --cert-name your.domain.com -m admin@your-domain.com -d your.domain.com
 ```
 
-Point Kestrel at the result in MFAWeb's `appsettings.json`:
+Use a deploy hook to copy **only this certificate lineage** into a directory dedicated to
+MFAWeb. Keep Certbot's own directories and every other site's private keys restricted to root.
+Replace `your.domain.com` consistently in the command above and the hook below. If Certbot
+already manages that hostname under another certificate name, use its exact existing lineage
+path (shown by `sudo certbot certificates`).
+
+```bash
+sudo install -d -o root -g mfaweb -m 750 /etc/mfa-auth/tls
+sudo tee /etc/letsencrypt/renewal-hooks/deploy/10-mfaweb-certificate.sh >/dev/null <<'HOOK'
+#!/bin/sh
+set -eu
+umask 077
+
+# Certbot invokes deploy hooks for every renewed certificate. Ignore all other lineages.
+lineage=/etc/letsencrypt/live/your.domain.com
+[ "${RENEWED_LINEAGE:-}" = "$lineage" ] || exit 0
+
+# Prepare a new generation on the same filesystem. Until publication, current still
+# selects the complete old pair, including if this hook fails or the service restarts.
+tls_dir=/etc/mfa-auth/tls
+generation=$(mktemp -d "$tls_dir/generation.XXXXXXXXXX")
+pending_link="$tls_dir/.current.${generation##*/}"
+trap 'rm -f -- "$pending_link"' 0
+trap 'exit 1' 1 2 15
+install -o root -g mfaweb -m 640 "$lineage/fullchain.pem" "$generation/fullchain.pem"
+install -o root -g mfaweb -m 640 "$lineage/privkey.pem" "$generation/privkey.pem"
+
+# Compare the public keys in canonical DER form. pkey supports both RSA and ECDSA;
+# separate commands ensure a failed OpenSSL step cannot be hidden by a pipeline.
+openssl x509 -in "$generation/fullchain.pem" -pubkey -noout > "$generation/certificate-public.pem"
+openssl pkey -pubin -in "$generation/certificate-public.pem" -outform DER -out "$generation/certificate-public.der"
+openssl pkey -in "$generation/privkey.pem" -passin pass: -pubout -outform DER -out "$generation/private-public.der"
+openssl dgst -sha256 -binary -out "$generation/certificate-public.sha256" "$generation/certificate-public.der"
+openssl dgst -sha256 -binary -out "$generation/private-public.sha256" "$generation/private-public.der"
+if ! cmp -s "$generation/certificate-public.sha256" "$generation/private-public.sha256"; then
+    echo 'MFAWeb certificate and private key do not match; current generation unchanged.' >&2
+    exit 1
+fi
+rm -f -- "$generation/certificate-public.pem" "$generation/certificate-public.der" \
+    "$generation/private-public.der" "$generation/certificate-public.sha256" "$generation/private-public.sha256"
+chown root:mfaweb "$generation"
+chmod 750 "$generation"
+
+# Rename a sibling symlink atomically. Keep earlier generation directories for rollback.
+previous=$(readlink "$tls_dir/current" 2>/dev/null || true)
+ln -s "${generation##*/}" "$pending_link"
+mv -Tf -- "$pending_link" "$tls_dir/current"
+printf 'MFAWeb certificate generation: %s (previous: %s)\n' "${generation##*/}" "$previous"
+HOOK
+sudo chown root:root /etc/letsencrypt/renewal-hooks/deploy/10-mfaweb-certificate.sh
+sudo chmod 700 /etc/letsencrypt/renewal-hooks/deploy/10-mfaweb-certificate.sh
+
+# Install the existing certificate now; subsequent successful renewals call the hook.
+sudo env RENEWED_LINEAGE=/etc/letsencrypt/live/your.domain.com \
+    /etc/letsencrypt/renewal-hooks/deploy/10-mfaweb-certificate.sh
+sudo -u mfaweb test -r /etc/mfa-auth/tls/current/privkey.pem && echo OK
+```
+
+Point Kestrel at these copies in MFAWeb's `appsettings.json`:
 
 ```json
 "Kestrel": {
@@ -633,43 +732,56 @@ Point Kestrel at the result in MFAWeb's `appsettings.json`:
     "Https": {
       "Url": "https://*:8443",
       "Certificate": {
-        "Path":    "/etc/letsencrypt/live/your.domain.com/fullchain.pem",
-        "KeyPath": "/etc/letsencrypt/live/your.domain.com/privkey.pem"
+        "Path":    "/etc/mfa-auth/tls/current/fullchain.pem",
+        "KeyPath": "/etc/mfa-auth/tls/current/privkey.pem"
       }
     }
   }
 }
 ```
 
-MFAWeb runs unprivileged, so it needs read access to the key. Grant it via the shared group:
-
-```bash
-sudo chgrp -R mfaipc /etc/letsencrypt/live /etc/letsencrypt/archive
-sudo chmod -R g+rX  /etc/letsencrypt/live /etc/letsencrypt/archive
-sudo -u mfaweb test -r /etc/letsencrypt/live/your.domain.com/privkey.pem && echo OK
-```
+Set MFAService's `HttpsCert:PemPath` to `/etc/mfa-auth/tls/current/fullchain.pem` too, so expiry alerts
+monitor the certificate actually served. Test that a renewal of an unrelated lineage leaves
+these files unchanged and that `mfaweb` cannot read that other lineage's private key.
 
 MFAWeb re-reads the PEM once a minute and swaps it in when the thumbprint changes, so a renewal
 takes effect **without a restart and without downtime** — verified against a real forced renewal:
-the served certificate changed while the process ID stayed the same.
+the served certificate changed while the process ID stayed the same. A failed copy, key check,
+or symlink replacement leaves the previous complete pair on disk for both reload and restart.
+A reload that straddles the symlink switch can still retry on the next poll; it retains the
+last working certificate in memory. Investigate a failed deploy hook before the old certificate
+expires.
+
+The hook prints the new and previous generation names and retains the previous directories.
+For rollback, select a known-good, still-valid generation from that record and atomically
+switch `current` back (replace `generation.KNOWN_GOOD` before running):
+
+```bash
+(
+set -eu
+sudo test -s /etc/mfa-auth/tls/generation.KNOWN_GOOD/privkey.pem
+sudo openssl x509 -in /etc/mfa-auth/tls/generation.KNOWN_GOOD/fullchain.pem -checkend 0 -noout
+sudo ln -s generation.KNOWN_GOOD /etc/mfa-auth/tls/current.rollback
+sudo mv -Tf -- /etc/mfa-auth/tls/current.rollback /etc/mfa-auth/tls/current
+)
+```
+
+Never edit a published generation in place. Old and failed generations remain protected under
+`/etc/mfa-auth/tls`; periodically remove only inspected generations that are neither current
+nor needed for rollback. Do not automate removal during certificate publication.
 
 **Do not add a `--pre-hook` that stops MFAWeb.** MFAWeb never binds port 80, so certbot
 `--standalone` does not conflict with it; stopping the service would be pure downtime, and
 certbot persists such hooks into `/etc/letsencrypt/renewal/<domain>.conf` where they silently
 run on every future renewal.
 
-The deploy hook below is still worth installing — it re-applies the group grant after certbot
-rewrites the files:
-
-```bash
-sudo tee /etc/letsencrypt/renewal-hooks/deploy/10-restart-mfaweb.sh >/dev/null <<'HOOK'
-#!/bin/sh
-chgrp -R mfaipc /etc/letsencrypt/live /etc/letsencrypt/archive 2>/dev/null || true
-chmod -R g+rX  /etc/letsencrypt/live /etc/letsencrypt/archive 2>/dev/null || true
-systemctl restart mfaweb.service
-HOOK
-sudo chmod +x /etc/letsencrypt/renewal-hooks/deploy/10-restart-mfaweb.sh
-```
+The deploy hook performs no restart. The unit is named **`mfa-web.service`**; if an operator
+needs to restart it for a configuration change, use `sudo systemctl restart mfa-web`.
+If upgrading from the older guide, remove its exact legacy hook
+`/etc/letsencrypt/renewal-hooks/deploy/10-restart-mfaweb.sh` after installing and testing this
+replacement. Review the group access that the old recursive commands granted to other
+certificate lineages and restore each lineage's intended permissions without disrupting its
+other consumers.
 
 Verify from outside the network — `ssl_verify_result` must be `0`:
 
@@ -822,8 +934,20 @@ Then:
    ```
    ```bash
    # Linux
-   sudo cp -a /opt/mfa /opt/mfa.backup-$(date +%Y%m%d)
-   sudo cp -a /var/lib/mfa/users.dat /opt/mfa.backup-$(date +%Y%m%d)/
+   (
+   set -eu
+   # Stop database writers before taking a consistent application/config snapshot.
+   # Existing firewall grants remain until the service is running and sweeping again.
+   sudo systemctl stop mfa-web mfa-service
+   backup=/var/backups/mfa-$(date -u +%Y%m%dT%H%M%SZ)
+   sudo install -d -o root -g root -m 700 "$backup"
+   sudo cp -a /opt/mfa-service /opt/mfa-web /opt/mfa-admin /etc/mfa-auth "$backup/"
+   sudo cp -a /etc/systemd/system/mfa-service.service /etc/systemd/system/mfa-web.service "$backup/"
+   if sudo test -f /etc/letsencrypt/renewal-hooks/deploy/10-mfaweb-certificate.sh; then
+       sudo cp -a /etc/letsencrypt/renewal-hooks/deploy/10-mfaweb-certificate.sh "$backup/"
+   fi
+   printf 'Backup: %s\n' "$backup"
+   )
    ```
 
 2. **Keep your `appsettings.json`.** Release archives ship only `appsettings.example.json`, so
@@ -845,6 +969,15 @@ Then:
 
 6. **If it fails**, stop both services, restore the backed-up directory, and start them again —
    privileged service first.
+
+   On Linux, first move the failed installation directories aside under distinct names. Restore
+   each snapshot directory to its now-absent original path (`mfa-service`, `mfa-web`, and
+   `mfa-admin` under `/opt`; `mfa-auth` under `/etc`), preserving ownership and modes with `cp -a`.
+   Do not overlay the old release onto new files. Restore the two unit files and, if backed up,
+   the certificate hook to the paths above, run `sudo systemctl daemon-reload`,
+   then `sudo systemctl start mfa-service mfa-web`. Do not run MFAAdmin or a certificate deployment
+   concurrently with backup/restore. Keep the root-only backup permissions: it contains private keys,
+   account data, and configuration secrets.
 
 ---
 
