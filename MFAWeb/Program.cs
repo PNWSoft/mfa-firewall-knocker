@@ -1931,14 +1931,59 @@ public static class LoginFailureMonitor
     private static bool _sendEmail = false;
     private static IConfiguration? _config;
 
+    // The per-account threshold only dedupes *within* one account -- it does nothing to stop an
+    // attacker driving the threshold for many different accounts in the same window. Reaching
+    // this requires no credential: /passkey/challenge discloses a target's credential ID (load-
+    // bearing for non-resident WebAuthn login, not a bug to fix here), and a shape-valid assertion
+    // built from it fails signature verification the same way a real attack attempt would, so it
+    // cannot be excluded from counting without also hiding genuine attacks. Bound the consequence
+    // instead of the detection: cap how many alert *emails* go out per window, globally, so
+    // iterating through a list of victim emails floods logs, not the operator's inbox. The
+    // per-account [SECURITY] log line below is never suppressed by this -- only the email is.
+    private static int _maxEmailsPerWindow = 10;
+    private static int _emailsSentInWindow = 0;
+    private static DateTime _emailWindowStartUtc = DateTime.MinValue;
+    private static bool _suppressionLogged = false;
+    private static readonly object _emailWindowLock = new();
+
     public static void Configure(IConfiguration config)
     {
         _config = config;
         int t = config.GetValue<int>("AccountAlert:Threshold", 10);
         int w = config.GetValue<int>("AccountAlert:WindowMinutes", 15);
+        int m = config.GetValue<int>("AccountAlert:MaxEmailsPerWindow", 10);
         _sendEmail = config.GetValue<bool>("AccountAlert:SendEmail", false);
         if (t > 0) _threshold = t;
         if (w > 0) _window = TimeSpan.FromMinutes(w);
+        if (m > 0) _maxEmailsPerWindow = m;
+    }
+
+    // Returns true if this alert may be emailed, having reserved a slot in the current window.
+    private static bool TryReserveEmailSlot()
+    {
+        lock (_emailWindowLock)
+        {
+            var now = DateTime.UtcNow;
+            if (now - _emailWindowStartUtc >= _window)
+            {
+                _emailWindowStartUtc = now;
+                _emailsSentInWindow = 0;
+                _suppressionLogged = false;
+            }
+            if (_emailsSentInWindow >= _maxEmailsPerWindow)
+            {
+                if (!_suppressionLogged)
+                {
+                    _suppressionLogged = true;
+                    AuditLogger.Warn($"[SECURITY] Suppressing further failed-login alert emails for the " +
+                        $"rest of this {_window.TotalMinutes:0}-minute window ({_maxEmailsPerWindow} already " +
+                        "sent). Threshold crossings are still logged above, per account, regardless.");
+                }
+                return false;
+            }
+            _emailsSentInWindow++;
+            return true;
+        }
     }
 
     public static void RecordSuccess(string username) => _state.TryRemove(username.ToLowerInvariant(), out _);
@@ -1965,7 +2010,7 @@ public static class LoginFailureMonitor
             && _state.TryUpdate(key, (result.Failures, result.WindowStartUtc, true), result))
         {
             AuditLogger.Warn($"[SECURITY] {result.Failures} failed logins for '{username}' within {_window.TotalMinutes:0} min (latest from {clientIp})");
-            if (_sendEmail)
+            if (_sendEmail && TryReserveEmailSlot())
                 _ = Task.Run(() => TrySendAlert(username, result.Failures, clientIp)); // don't block the auth response
         }
     }

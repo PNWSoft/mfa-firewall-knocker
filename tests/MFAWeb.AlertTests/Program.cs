@@ -118,6 +118,40 @@ try
         return Task.CompletedTask;
     });
 
+    await Run("failed-login alert emails are capped globally across accounts, not just per account", async () =>
+    {
+        // /passkey/challenge discloses a target's credential ID by design (non-resident
+        // credentials need it), so an attacker needs no secret to make many different
+        // accounts each cross the per-account threshold in the same window. The per-account
+        // dedupe above does nothing to stop that turning into a mass alert-email flood
+        // against the operator. MaxEmailsPerWindow bounds the email channel specifically;
+        // detection itself (the per-account log line) must not be silenced by it.
+        AuditLogger.LogDirectory = Path.Combine(root, "direct-monitor-cap");
+        LoginFailureMonitor.Configure(new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?>
+        {
+            ["AccountAlert:Threshold"] = "1",
+            ["AccountAlert:SendEmail"] = "true",
+            ["AccountAlert:MaxEmailsPerWindow"] = "2"
+            // Smtp:Host is deliberately left unset, so each reserved attempt fails fast on
+            // the "not fully configured" check rather than a real, slow SMTP connection --
+            // this exercises the reservation/cap logic without needing a mail server.
+        }).Build());
+
+        LoginFailureMonitor.RecordFailure("cap-a@example.test", "192.0.2.10");
+        LoginFailureMonitor.RecordFailure("cap-b@example.test", "192.0.2.11");
+        LoginFailureMonitor.RecordFailure("cap-c@example.test", "192.0.2.12");
+        await Task.Delay(500); // let the fire-and-forget email-attempt tasks run
+
+        string log = string.Join("\n", Directory.EnumerateFiles(AuditLogger.LogDirectory).Select(File.ReadAllText));
+        int attempted = log.Split('\n').Count(l => l.Contains("Smtp Host/FromAddress/NotifyAddress is not fully configured"));
+        int suppressed = log.Split('\n').Count(l => l.Contains("Suppressing further failed-login alert emails"));
+        Assert(attempted == 2, $"Expected exactly 2 email attempts within the cap, saw {attempted}.");
+        Assert(suppressed == 1, $"Expected exactly 1 suppression notice for the account beyond the cap, saw {suppressed}.");
+        foreach (var name in new[] { "cap-a", "cap-b", "cap-c" })
+            Assert(log.Contains($"failed logins for '{name}@example.test'"),
+                $"Per-account threshold logging was suppressed for {name} -- only the email channel should be capped.");
+    });
+
     Console.WriteLine($"PASS: {passed} authentication alert regression checks.");
 }
 finally
@@ -256,7 +290,8 @@ sealed class TestWeb : IAsyncDisposable
         };
     }
 
-    public static async Task<TestWeb> StartAsync(string root, IEnumerable<Fixture> fixtures)
+    public static async Task<TestWeb> StartAsync(string root, IEnumerable<Fixture> fixtures,
+        IReadOnlyDictionary<string, string>? extraEnv = null)
     {
         string entropy = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32));
         string dbPath = Path.Combine(root, "users.dat");
@@ -289,6 +324,9 @@ sealed class TestWeb : IAsyncDisposable
         start.Environment["AccountAlert__Threshold"] = "2";
         start.Environment["AccountAlert__SendEmail"] = "false";
         start.Environment["Logging__LogLevel__Microsoft.Hosting.Lifetime"] = "Information";
+        if (extraEnv != null)
+            foreach (var (key, value) in extraEnv)
+                start.Environment[key] = value;
         var listening = new TaskCompletionSource<Uri>(TaskCreationOptions.RunContinuationsAsynchronously);
         var diagnostics = new StringBuilder();
         var process = new Process { StartInfo = start, EnableRaisingEvents = true };
