@@ -68,6 +68,10 @@ All three components read from their own `appsettings.json`. Copy the
     "Host": "your-smtp-server",  "Port": 587,  "UseSsl": true,
     "FromAddress": "security@your-domain.com",
     "NotifyAddress": "admins@your-domain.com"
+  },
+  "AccountAlert": {
+    "Threshold": 10,  "WindowMinutes": 15,
+    "SendEmail": false,  "MaxEmailsPerWindow": 10
   }
 }
 ```
@@ -82,6 +86,10 @@ All three components read from their own `appsettings.json`. Copy the
 | `GlobalRateLimitPerWindow` | A single aggregate cap shared across every partition combined, as a backstop independent of the per-partition key. Default: 200. |
 | `AllowedDomains` | Email address domains permitted to use the system. Enforced in both MFAWeb (login form rejects other domains) and MFAAdmin (`add` refuses to provision an account outside these domains). |
 | `FirewallService:GmsaAccount` | Required IPC client identity. On Windows, the gMSA account that MFAWeb runs as. On Linux, set this to the local account `mfaweb` in MFAService's config. The service rejects clients whose identity does not match. |
+| `AccountAlert:Threshold` | Failed login attempts for one account, within `WindowMinutes`, before a `[SECURITY]` log line fires (and an email, if `SendEmail` is on). Detection only — the account is never locked. Default: 10. |
+| `AccountAlert:WindowMinutes` | The window `Threshold` and `MaxEmailsPerWindow` are measured over. Default: 15. |
+| `AccountAlert:SendEmail` | Off by default. When on, requires `Smtp:{Host,FromAddress,NotifyAddress}` to be fully configured or nothing is sent (logged as a warning instead). |
+| `AccountAlert:MaxEmailsPerWindow` | A cap on alert **emails** sent across every account combined in one window, independent of the per-account threshold. `/passkey/challenge` discloses a target's credential ID by design (non-resident WebAuthn credentials require it), so driving many different accounts past `Threshold` needs no secret — only a list of email addresses. The per-account log line above is never suppressed by this cap; only the email attempt is. Default: 10. |
 
 ### MFAService — `appsettings.json`
 
