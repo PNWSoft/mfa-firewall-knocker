@@ -160,12 +160,9 @@ namespace MFAAdmin
 
         private static string RulePrefix => Config?["RulePrefix"] ?? "MFA_Temp_";
 
-        // RulePrefix comes from appsettings.json, not user input, so this is defence in depth --
-        // write access to that file already means admin-level compromise. But it's interpolated
-        // into single-quoted PowerShell command strings at several sites, and a stray "'" in a
-        // misconfigured value would break out of that quoting into arbitrary PowerShell, the same
-        // way an unescaped username once could (see the '' escaping used for that). Use this,
-        // never the raw property, anywhere RulePrefix is interpolated into a PowerShell command.
+        // Defence in depth: RulePrefix comes from appsettings.json, not user input, but it's
+        // interpolated into single-quoted PowerShell strings, so a stray "'" in a misconfigured
+        // value would break out of that quoting. Use this, never the raw property, in PowerShell.
         private static string RulePrefixPsEscaped => RulePrefix.Replace("'", "''");
 
         // TOTP support is a COMPILE-TIME decision (-p:AllowTotp=true), not a config value, so
@@ -693,31 +690,22 @@ namespace MFAAdmin
 
                 string json = JsonSerializer.Serialize(users, new JsonSerializerOptions { WriteIndented = true });
 
-                // The warning above is real: this file holds password hashes, TOTP secrets (if
-                // enabled), and any currently-live provisioning tokens in the clear. Writing it
-                // with File.WriteAllText created it with the process's default permissions --
-                // running as root with a typical umask, that's world-readable (0644), and a live
-                // token plus an observed enrollment password is a full account takeover during
-                // its window. Restrict it from the instant it exists rather than tightening it
-                // afterward, which would leave a window where the plaintext secrets are exposed.
-                // FileMode.CreateNew also refuses to write through an existing file or symlink at
-                // this path instead of silently following or overwriting it.
+                // This file holds password hashes, TOTP secrets, and any live provisioning tokens
+                // in the clear -- restrict it from the instant it exists rather than tightening it
+                // afterward. FileMode.CreateNew also refuses to follow an existing file or symlink
+                // at this path instead of silently overwriting it.
                 using (var stream = new FileStream(outputPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
                 {
-                    // The handle overload, not the path overload: it chmods the file descriptor
-                    // already open above, not whatever the path currently resolves to. The path
-                    // overload would re-resolve outputPath on disk, reopening a symlink-race
-                    // window in the moment between CreateNew and the chmod that CreateNew itself
-                    // was chosen to close.
+                    // The handle overload, not the path overload: it chmods the descriptor already
+                    // open above instead of re-resolving outputPath on disk, which would reopen a
+                    // symlink-race window between CreateNew and the chmod.
                     if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
                         File.SetUnixFileMode(stream.SafeFileHandle, UnixFileMode.UserRead | UnixFileMode.UserWrite); // 600
                     else
                     {
-                        // FileInfo.SetAccessControl, not the handle-based FileStream overload:
-                        // the stream above was opened with plain FileAccess.Write, which does not
-                        // include WRITE_DAC, and SetSecurityInfo on that handle fails with
-                        // UnauthorizedAccessException regardless of running elevated. The FileInfo
-                        // overload opens its own handle with the access it needs internally.
+                        // FileInfo.SetAccessControl, not the handle-based FileStream overload: the
+                        // stream above was opened without WRITE_DAC, so SetSecurityInfo on that
+                        // handle fails even when elevated. FileInfo opens its own handle instead.
                         var security = new FileSecurity();
                         security.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
                         security.AddAccessRule(new FileSystemAccessRule(
@@ -768,13 +756,10 @@ namespace MFAAdmin
                 return;
             }
 
-            // add/reprovision never produce a record with PasskeyRegistrationReady=true except
-            // together with a fresh, unexpired token minted at the same moment, after the
-            // password gate. An imported file is untrusted input by comparison -- a tampered or
-            // hand-edited one could claim that state directly, paired with any token, and skip
-            // the password check entirely at the next registration attempt. Force it false
-            // unconditionally on import; a legitimate pending registration just re-does the
-            // password step, which is not a real cost for what this closes.
+            // An imported file is untrusted input -- a tampered or hand-edited one could set
+            // PasskeyRegistrationReady=true directly, paired with any token, and skip the password
+            // gate at the next registration attempt. Force it false unconditionally on import; a
+            // legitimate pending registration just re-does the password step.
             int strippedReady = imported.Count(u => u.PasskeyRegistrationReady);
             foreach (var u in imported) u.PasskeyRegistrationReady = false;
             if (strippedReady > 0)
@@ -893,11 +878,8 @@ namespace MFAAdmin
             {
                 AdminLogger.Log($"[SUCCESS] User '{username}' deleted.");
 
-                // Deleting the account does not by itself touch any firewall rule already open
-                // for this user -- a still-active grant persists until it naturally expires
-                // (up to ExpirationHours) regardless. "All VPN/SSH access revoked" used to be
-                // logged unconditionally here, which was true of the account but not of any
-                // grant already in effect. Say only what actually happened.
+                // Deleting the account doesn't touch a firewall rule already open for this user --
+                // it persists until it naturally expires. Say only what actually happened.
                 string revocationNote;
                 if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
                 {
@@ -908,18 +890,15 @@ namespace MFAAdmin
                 }
                 else
                 {
-                    // Unlike Windows' rule Description, the Linux iptables comment carries only
-                    // the IP, port and expiry (see OpenFirewallPort) -- no username -- so there
-                    // is no way to find "this user's rules" here. Say so rather than silently
-                    // doing nothing while implying revocation happened.
+                    // Unlike Windows, the Linux iptables comment carries no username (see
+                    // OpenFirewallPort), so there's no way to find "this user's rules" here.
                     revocationNote = "Any active firewall rule for this user was NOT removed -- " +
                         "Linux rules are not tracked by username. It will expire naturally " +
                         "(within ExpirationHours) or can be found and removed by IP via 'diag'.";
                 }
-                // Even where a rule is removed, closing the firewall only blocks *new*
-                // connections -- it does not end a session this user already has established.
-                // See README.md's "Revoking access does not end active sessions" for why this
-                // project deliberately does not attempt to guess at ending one itself.
+                // Closing the firewall only blocks *new* connections -- it doesn't end a session
+                // this user already has established (see README.md's "Revoking access does not
+                // end active sessions").
                 const string sessionCaveat = "This closes the firewall to new connections. It does " +
                     "NOT end any session, tunnel, or process this user already has running. If " +
                     "removing them needs to be immediate and complete, separately verify -- and if " +
@@ -1356,11 +1335,9 @@ namespace MFAAdmin
             return output;
         }
 
-        // Matches MFAService's own OpenFirewallPort/SweepExpiredRules parsing exactly: the
-        // declared rule name is whatever the quoted comment says it is, not any text that
-        // happens to appear elsewhere on the line. A prior version matched the whole line
-        // against RulePrefix as a substring, which could delete an unrelated operator rule
-        // whose IP, port, or own comment happened to contain the same text as the prefix.
+        // Matches MFAService's own parsing exactly: the rule name is whatever the quoted comment
+        // says, not any text elsewhere on the line. A prior substring match against RulePrefix
+        // could delete an unrelated operator rule whose IP, port, or comment contained that text.
         static readonly Regex ManagedRuleComment =
             new(@"(?:^|\s)--comment ""(?<name>[^""]+) exp:\d+""(?:\s|$)", RegexOptions.Compiled);
 

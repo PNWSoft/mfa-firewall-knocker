@@ -38,10 +38,9 @@ var builder = WebApplication.CreateBuilder(args);
 
 // --- Security: Rate Limiting ---
 int rateLimitPerWindow = builder.Configuration.GetValue<int>("RateLimitPerWindow", 20);
-// Backstop across every partition combined, so no single mechanism is the only thing standing
-// between the login endpoints and an unbounded flood -- see the partition-key comment below for
-// the specific gap this covers. Deliberately generous: sized well above what any real login
-// burst from a small number of legitimate users would produce.
+// Backstop across every partition combined, so partitioning (see RateLimitPartitionKey below)
+// isn't the only thing standing between the login endpoints and a flood. Deliberately generous --
+// sized well above what a real login burst from a few legitimate users would produce.
 int globalRateLimitPerWindow = builder.Configuration.GetValue<int>("GlobalRateLimitPerWindow", 200);
 builder.Services.AddRateLimiter(options =>
 {
@@ -75,14 +74,9 @@ builder.Services.AddRateLimiter(options =>
     });
 });
 
-// A residential or small-business IPv6 allocation commonly gives one customer a whole /56 or
-// /64 block -- 2^72 or 2^64 addresses. Partitioning on the full 128-bit address, as the naive
-// per-IP approach does, lets anyone inside their own allocation get an effectively fresh
-// rate-limit bucket on every request just by flipping host bits, making the limiter a no-op
-// against that attacker while doing nothing for anyone else. Bucket IPv6 on the /56 network
-// prefix instead: coarse enough to catch in-allocation rotation, still far narrower than
-// grouping unrelated customers together. IPv4 addresses are scarce enough that the full address
-// remains the right partition key.
+// A residential IPv6 allocation is often a whole /56 or /64 -- partitioning on the full 128-bit
+// address lets an attacker get a fresh bucket on every request just by flipping host bits. Bucket
+// IPv6 on the /56 prefix instead. IPv4 addresses are scarce enough that the full address is fine.
 static string RateLimitPartitionKey(System.Net.IPAddress? address)
 {
     if (address == null) return "unknown";
@@ -715,12 +709,9 @@ app.MapPost("/setup", async (HttpContext context, IAntiforgery antiforgery) =>
         {
             setupInvalid = true;
         }
-        // An empty hash means this account's shared enrollment password was already burned --
-        // either by completing passkey registration first, or by the expiry sweep, both of
-        // which only clear it for an account that never confirmed TOTP (the case reaching this
-        // branch at all). Short-circuits before Verify: BCrypt.Verify throws ArgumentException
-        // on an empty hash rather than returning false, matching the same defensive pattern
-        // already used for TotpSecret above.
+        // Empty hash means the enrollment password was already burned (passkey registered, or
+        // expiry swept) for this never-TOTP-confirmed account. Short-circuits before Verify,
+        // which throws on an empty hash instead of returning false -- same pattern as TotpSecret above.
         else if (string.IsNullOrEmpty(user.PasswordHash) || !BCrypt.Net.BCrypt.Verify(password, user.PasswordHash))
         {
             setupBadPassword = true;
@@ -779,10 +770,8 @@ app.MapPost("/setup", async (HttpContext context, IAntiforgery antiforgery) =>
 
     // Display the QR Code (rendered client-side via locally hosted qrious.min.js)
     context.Response.ContentType = "text/html";
-    // This page is the one place the raw TOTP secret is ever rendered -- the on-page warning
-    // says it's shown once, but nothing enforced that: a browser's back-button cache or disk
-    // cache could resurface it on a shared machine after leaving the page. No proxy or browser
-    // may store this response at all.
+    // This page renders the raw TOTP secret once -- enforce that server-side too, so a browser's
+    // back-button or disk cache can't resurface it on a shared machine.
     context.Response.Headers.CacheControl = "no-store";
     context.Response.Headers.Pragma = "no-cache";
     await context.Response.WriteAsync($@"
@@ -900,12 +889,10 @@ app.MapPost("/setup-passkey", async (HttpContext context, IAntiforgery antiforge
         else
         {
             provisionUsername = user.Username;
-            // Not reachable today by construction -- AddPasskey and the expiry sweep only ever
-            // clear PasswordHash together with PasskeyProvisioningToken, so a live, matching
-            // token here should always mean a real hash. Guarded anyway, the same defensive
-            // pattern used at the other two password checks: BCrypt.Verify throws rather than
-            // returning false on an empty hash, and a 500 here is worse than treating it as a
-            // wrong password if that invariant is ever broken by a future change.
+            // Not reachable today -- AddPasskey and the expiry sweep only ever clear PasswordHash
+            // together with PasskeyProvisioningToken, so a live token should mean a real hash.
+            // Guarded anyway, same pattern as the other two password checks: BCrypt.Verify throws
+            // rather than returning false on an empty hash.
             pkBadPassword = string.IsNullOrEmpty(user.PasswordHash) || !BCrypt.Net.BCrypt.Verify(password, user.PasswordHash);
         }
     }
@@ -1949,15 +1936,11 @@ public static class LoginFailureMonitor
     private static bool _sendEmail = false;
     private static IConfiguration? _config;
 
-    // The per-account threshold only dedupes *within* one account -- it does nothing to stop an
-    // attacker driving the threshold for many different accounts in the same window. Reaching
-    // this requires no credential: /passkey/challenge discloses a target's credential ID (load-
-    // bearing for non-resident WebAuthn login, not a bug to fix here), and a shape-valid assertion
-    // built from it fails signature verification the same way a real attack attempt would, so it
-    // cannot be excluded from counting without also hiding genuine attacks. Bound the consequence
-    // instead of the detection: cap how many alert *emails* go out per window, globally, so
-    // iterating through a list of victim emails floods logs, not the operator's inbox. The
-    // per-account [SECURITY] log line below is never suppressed by this -- only the email is.
+    // The per-account threshold doesn't stop an attacker driving it for many different accounts
+    // (/passkey/challenge discloses credential IDs by design, so a shape-valid assertion can't be
+    // excluded from counting without hiding real attacks too). Bound the consequence instead: cap
+    // alert *emails* per window, globally, so a swept victim list floods logs, not the operator's
+    // inbox. The per-account [SECURITY] log line below is never suppressed -- only the email is.
     private static int _maxEmailsPerWindow = 10;
     private static int _emailsSentInWindow = 0;
     private static DateTime _emailWindowStartUtc = DateTime.MinValue;

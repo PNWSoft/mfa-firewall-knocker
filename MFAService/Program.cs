@@ -979,14 +979,11 @@ public class FirewallWorkerService : BackgroundService
 
         // 2. VALIDATE INPUTS
         //
-        // IPAddress.TryParse accepts an IPv6 zone ID (the "%..." suffix, RFC 4007) containing
-        // arbitrary characters -- including shell metacharacters -- and its own ToString() drops
-        // that suffix silently rather than validating it. Using the raw input string beyond this
-        // point let a crafted zone ID (e.g. "2001:db8::1%$(id)") survive into the privileged
-        // bash -c / PowerShell command built in OpenFirewallPort, as root/SYSTEM. A zone ID has
-        // no legitimate meaning here regardless: it only qualifies link-local/scoped addresses,
-        // which IsPublicIpAddress already rejects. Reject it outright, and from here on use only
-        // the parsed, canonical form -- never the original attacker-supplied string.
+        // IPAddress.TryParse accepts an IPv6 zone ID ("%...", RFC 4007) with arbitrary characters
+        // and silently drops it in ToString() rather than validating it -- so a crafted zone ID
+        // like "2001:db8::1%$(id)" could survive into the privileged shell command built below.
+        // No legitimate address here needs one (that's only link-local/scoped, already rejected
+        // by IsPublicIpAddress), so reject it outright and use only the parsed form from here on.
         if (ip.Contains('%'))
         {
             ServiceLogger.Warn("[SECURITY] Rejected IP containing a zone ID.");
@@ -1485,13 +1482,9 @@ public class DatabaseLockService : BackgroundService
             }
         }
 
-        // Mirrors FirewallWorkerService's own sweep: a periodic cleanup here, not just a
-        // reactive check at request time. A passkey provisioning window that expires unused
-        // otherwise leaves its one-time enrollment password sitting in the database
-        // indefinitely -- not usable by anything (every check site still enforces the
-        // expiry), but there for no reason once its window has passed, on the same
-        // "an absent secret cannot be misused, even by a future code path" principle the
-        // rest of this project already follows.
+        // Mirrors FirewallWorkerService's rule sweep above: periodic cleanup, not just a
+        // reactive check at request time, so an unused enrollment password doesn't linger
+        // in the database once its window has passed.
         try { SweepExpiredProvisioning(); }
         catch (Exception ex) { ServiceLogger.Error($"[DB SWEEPER ERROR] {ex.Message}"); }
         using var timer = new PeriodicTimer(TimeSpan.FromMinutes(5));
@@ -1503,18 +1496,13 @@ public class DatabaseLockService : BackgroundService
         }
     }
 
-    // add/reprovision mint the TOTP link, the passkey link, and the one-time enrollment
-    // password together, all in one call, and give the TOTP and passkey windows the exact
-    // same expiry timestamp (see the shared `expiresUtc` local in both). PasskeyProvisioningExpiresUtc
-    // is always set, unlike the TOTP-only field, so it is the canonical check for "has this
-    // account's shared 60-minute enrollment window closed" -- true regardless of whether TOTP
-    // is even compiled in. Once it has, and whichever path wasn't completed, that path's own
-    // token/state serves no further purpose -- the same as if it HAD succeeded (AddPasskey and
-    // BurnTotpToken each already clear their own token on that path for the same reason). The
-    // password is the one field shared by both paths, so it is only cleared when TOTP is not
-    // confirmed: in a TOTP-enabled build a confirmed account still needs it for every future
-    // /auth login, and burning it there would lock the user out over something this expiry has
-    // nothing to do with.
+    // add/reprovision give the TOTP and passkey links the same expiry (one shared `expiresUtc`
+    // local in both), so PasskeyProvisioningExpiresUtc -- always set, unlike the TOTP-only field
+    // -- is the right check for "has this account's window closed" regardless of whether TOTP is
+    // compiled in. Whichever path wasn't completed gets cleaned up as if it had been (AddPasskey
+    // and BurnTotpToken already do this on their own success paths). The password is only
+    // cleared when TOTP isn't confirmed: a confirmed account needs it for every future /auth
+    // login, and this expiry has nothing to do with that.
     private static void SweepExpiredProvisioning()
     {
         using var lk = AcquireDbLock();
@@ -1786,14 +1774,11 @@ public class DatabaseLockService : BackgroundService
             var cred = user.PasskeyCredentials.FirstOrDefault(c => c.CredentialId == credentialId);
             if (cred != null)
             {
-                // Compare-and-only-increase under the lock this method already holds, not a
-                // blind overwrite. Two concurrent logins with the same cloned credential each
-                // read the stored count before either writes; a blind overwrite lets the second
-                // write silently clobber the first, and whichever count "wins" is essentially
-                // arbitrary -- the clone signal (a non-increasing count) is lost either way. This
-                // makes the second writer lose outright instead, so the count this method
-                // actually persists is honest, and a rejection here is itself informative: it
-                // means something submitted a count that was not larger than what's on record.
+                // Compare-and-only-increase, not a blind overwrite: two concurrent logins with
+                // the same cloned credential each read the count before either writes, so a
+                // blind overwrite lets the second silently clobber the first and loses the
+                // non-increasing-count signal that would flag the clone. A rejection here is
+                // itself informative, not just a no-op.
                 if (newCount <= cred.SignCount)
                 {
                     ServiceLogger.Warn($"[SECURITY] Rejected non-increasing sign count for credential " +
@@ -1831,12 +1816,9 @@ public class DatabaseLockService : BackgroundService
             return "ERROR: Registration not authorized";
         }
 
-        // MFAWeb's registration handler already checks this across all users before ever
-        // reaching here, but that check runs against a separate, earlier LoadUsers snapshot --
-        // two registrations racing the same credential ID (vanishingly unlikely given it's a
-        // large random value, but cheap to close outright) could both pass it and both reach
-        // this authoritative writer. Re-check under the lock this method already holds, so the
-        // actual write is the one place this is guaranteed correct, not just probably correct.
+        // MFAWeb already checks this, but against an earlier LoadUsers snapshot -- two
+        // registrations racing the same credential ID (vanishingly unlikely, but cheap to close)
+        // could both pass that and reach this authoritative writer. Re-check under the lock.
         if (users.Any(u => u.PasskeyCredentials.Any(c => c.CredentialId == credentialId)))
         {
             ServiceLogger.Error($"[SECURITY] Rejected passkey registration for '{user.Username}': " +
