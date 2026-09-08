@@ -211,7 +211,8 @@ separating `users.dat` from any other process on the host. `C:\ProgramData` and 
 created folders under `C:\` grant **Authenticated Users** read access by default — which
 would let any local non-admin read the entropy out of `appsettings.json`, read `users.dat`,
 and call `ProtectedData.Unprotect` to recover the **plaintext TOTP secrets** and the current
-one-time enrollment password hash of every user.
+password hash of every user — which, for any account that has confirmed TOTP, is that account's
+actual ongoing login credential, not a one-time value.
 
 Restrict the data directory and each `appsettings.json` to SYSTEM, Administrators, and the
 gMSA only:
@@ -1017,9 +1018,12 @@ Then:
   enrolled user. Protect the file with filesystem permissions as documented above.
   Passkey credentials stored in the database are public keys, not private keys — but the
   database is not "not sensitive" even without TOTP: it holds usernames, the current
-  one-time enrollment password hash of every account, and, during an active enrollment
-  or reprovisioning window, a short-lived registration token. See SECURITY.md's "A note
-  on the user database" for the full breakdown.
+  enrollment password hash of every account, and, during an active enrollment or
+  reprovisioning window, a short-lived registration token. In the default passkey-only
+  build that password hash is one-time — burned on successful registration or once its
+  window expires unused. **In a TOTP-enabled build, once an account confirms TOTP, the
+  same hash becomes that account's ongoing login credential** and is no longer burned by
+  either path. See SECURITY.md's "A note on the user database" for the full breakdown.
 - MFAWeb **only accepts authentication requests from public (internet) IP addresses**.
   Requests from RFC-1918 private ranges are rejected with HTTP 403. This prevents
   internal-only deployments from accidentally being used as a pivot point.

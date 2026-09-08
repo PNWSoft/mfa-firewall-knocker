@@ -205,10 +205,13 @@ In the default passkey-only build, enrolled WebAuthn credentials are **public ke
 no recoverable TOTP secret. The store still contains usernames and the hash of each account's
 current **one-time enrollment password** — a bootstrap credential, not a persistent one: it is
 checked exactly once, at registration, never used to log in, and replaced by a fresh one on every
-`add` or `reprovision`. During enrollment or reprovisioning the store also contains a short-lived
-passkey registration token and the registration-ready state. A reader who can watch an active
-enrollment can race the legitimate user after the password gate has made that token ready, so
-confidentiality still matters during those windows.
+`add` or `reprovision`. This is enforced at the data layer, not only by the check sites that use
+it: the password is cleared the moment registration succeeds, and a periodic sweep also clears it
+if the 60-minute enrollment window closes unused, so it does not persist beyond the window it was
+minted for even if nobody ever completes registration with it. During enrollment or reprovisioning
+the store also contains a short-lived passkey registration token and the registration-ready state.
+A reader who can watch an active enrollment can race the legitimate user after the password gate
+has made that token ready, so confidentiality still matters during those windows.
 
 Integrity is always critical: someone who can write the store can add their own passkey credential
 and become that user. For an already-enrolled account with no active provisioning state, a read
@@ -237,7 +240,7 @@ That produces a sharp asymmetry between the two build modes:
 | | What the server stores | What a full database breach yields |
 |---|---|---|
 | Passkey-only | public keys, usernames, the current one-time enrollment password hash, and any active enrollment state | account data, the enrollment password hash, and usable enrollment tokens during their short validity window, but no private passkey key |
-| **TOTP-enabled** | **all passkey-only data plus each TOTP secret** | **all of the above plus valid codes for every TOTP user until each secret is re-enrolled** |
+| **TOTP-enabled** | **all passkey-only data plus each TOTP secret** — and once an account confirms TOTP, its password hash stops being one-time: it becomes that account's ongoing login credential, checked on every `/auth` request, and the burn-after-use/expiry handling described above no longer applies to it | **all of the above plus valid codes for every TOTP user until each secret is re-enrolled** |
 
 A TOTP database breach is a mass-compromise event: every enrolled user's second factor becomes
 forgeable at once, silently, and stays that way until every secret is re-enrolled. A passkey-only

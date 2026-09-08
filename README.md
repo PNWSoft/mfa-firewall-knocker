@@ -466,9 +466,13 @@ revoke, you know whether you have closed the door or actually removed the person
   enrollment password hash, and active enrollment tokens still make the database confidential.
   Protect it with the filesystem permissions documented in INSTALL.md.
 - Firewall rules expire after `ExpirationHours`; the sweeper runs every 5 minutes.
-- Passkey registration always requires proof of the one-time enrollment password or a post-login
-  token — never a persistent, reusable password, and never anything checked again after
-  registration. That check is a deliberate invariant rather than an incidental one — treat any
+- Passkey registration always requires proof of the enrollment password or a post-login token —
+  in the default passkey-only build that password is never anything else: it's checked once, at
+  registration, then burned on success or once its 60-minute window expires unused, whichever
+  comes first. **That changes once an account confirms TOTP** — from then on the same password is
+  also that account's persistent login credential, checked on every `/auth` request, and stops
+  being burned by either path. The registration check itself doesn't change; what the field means
+  afterward does. That check is a deliberate invariant rather than an incidental one — treat any
   change to that path with care.
 - This software is provided as-is under the MIT license, with no warranty. It manipulates firewall
   rules on a privileged host. **Review the code and test in a non-production environment first.**
