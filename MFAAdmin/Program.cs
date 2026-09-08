@@ -160,6 +160,14 @@ namespace MFAAdmin
 
         private static string RulePrefix => Config?["RulePrefix"] ?? "MFA_Temp_";
 
+        // RulePrefix comes from appsettings.json, not user input, so this is defence in depth --
+        // write access to that file already means admin-level compromise. But it's interpolated
+        // into single-quoted PowerShell command strings at several sites, and a stray "'" in a
+        // misconfigured value would break out of that quoting into arbitrary PowerShell, the same
+        // way an unescaped username once could (see the '' escaping used for that). Use this,
+        // never the raw property, anywhere RulePrefix is interpolated into a PowerShell command.
+        private static string RulePrefixPsEscaped => RulePrefix.Replace("'", "''");
+
         // TOTP support is a COMPILE-TIME decision (-p:AllowTotp=true), not a config value, so
         // it cannot drift out of step with MFAWeb at runtime. Without the flag no TOTP secret
         // is ever generated and users.dat holds no recoverable shared secret — only passkey
@@ -760,6 +768,19 @@ namespace MFAAdmin
                 return;
             }
 
+            // add/reprovision never produce a record with PasskeyRegistrationReady=true except
+            // together with a fresh, unexpired token minted at the same moment, after the
+            // password gate. An imported file is untrusted input by comparison -- a tampered or
+            // hand-edited one could claim that state directly, paired with any token, and skip
+            // the password check entirely at the next registration attempt. Force it false
+            // unconditionally on import; a legitimate pending registration just re-does the
+            // password step, which is not a real cost for what this closes.
+            int strippedReady = imported.Count(u => u.PasskeyRegistrationReady);
+            foreach (var u in imported) u.PasskeyRegistrationReady = false;
+            if (strippedReady > 0)
+                Console.WriteLine($"  Note: cleared PasskeyRegistrationReady on {strippedReady} record(s) -- " +
+                    "imported data cannot claim that state directly.");
+
             int existingCount;
             using (AcquireDbLock()) { existingCount = LoadUsers().Count; }
 
@@ -918,7 +939,7 @@ namespace MFAAdmin
         // it currently is not on Linux. Returns the number of rules removed.
         static int RevokeWindowsRulesForUser(string username)
         {
-            string psQuery = $"-NoProfile -Command \"Get-NetFirewallRule -DisplayName '{RulePrefix}*' " +
+            string psQuery = $"-NoProfile -Command \"Get-NetFirewallRule -DisplayName '{RulePrefixPsEscaped}*' " +
                 "-ErrorAction SilentlyContinue | ForEach-Object { $_.Name + '||' + $_.Description }\"";
             var queryPsi = new ProcessStartInfo("powershell", psQuery)
             {
@@ -1189,7 +1210,7 @@ namespace MFAAdmin
                 Console.WriteLine($"{"IP Address",-15} | {"Port",-6} | {"User",-25} | {"Expires (Local)",-20}");
                 Console.WriteLine(new string('-', 75));
 
-                string psCommand = $"-NoProfile -Command \"Get-NetFirewallRule -DisplayName '{RulePrefix}*' -ErrorAction SilentlyContinue | ForEach-Object {{ $_.DisplayName + '||' + $_.Description }}\"";
+                string psCommand = $"-NoProfile -Command \"Get-NetFirewallRule -DisplayName '{RulePrefixPsEscaped}*' -ErrorAction SilentlyContinue | ForEach-Object {{ $_.DisplayName + '||' + $_.Description }}\"";
 
                 var psi = new ProcessStartInfo("powershell", psCommand)
                 {
@@ -1264,7 +1285,7 @@ namespace MFAAdmin
 
                 string rules = RunBash("iptables -S INPUT 2>/dev/null", out _);
                 var mine = rules.Split('\n', StringSplitOptions.RemoveEmptyEntries)
-                                .Where(l => l.Contains(RulePrefix))
+                                .Where(IsManagedRule)
                                 .ToList();
 
                 if (mine.Count == 0)
@@ -1373,7 +1394,7 @@ namespace MFAAdmin
                 if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
                 {
                     // WINDOWS: Delete all temporary Web API rules
-                    string psCommand = $"-NoProfile -Command \"Remove-NetFirewallRule -DisplayName '{RulePrefix}*' -ErrorAction SilentlyContinue\"";
+                    string psCommand = $"-NoProfile -Command \"Remove-NetFirewallRule -DisplayName '{RulePrefixPsEscaped}*' -ErrorAction SilentlyContinue\"";
 
                     var psi = new ProcessStartInfo("powershell", psCommand)
                     {
