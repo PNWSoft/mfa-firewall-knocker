@@ -435,8 +435,10 @@ They do not remove the need for a second way in.
 
 ## Revoking access does not end active sessions
 
-Rules disappear two ways: they expire, or an admin runs `MFAAdmin reset`. Both **close the
-firewall to new connections**. Neither reliably ends a session that is already connected.
+Rules disappear a few ways: they expire, an admin runs `MFAAdmin reset`, or (on Windows)
+`MFAAdmin delete` removes a deleted user's own rules as part of removing the account. All of
+them **close the firewall to new connections**. None reliably ends a session that is already
+connected.
 
 Whether an established session survives depends on your platform, your firewall, and what is
 listening behind the port — and a client reaching that port through some *other* rule (a

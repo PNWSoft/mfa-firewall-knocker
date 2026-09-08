@@ -871,12 +871,85 @@ namespace MFAAdmin
             if (removed > 0)
             {
                 AdminLogger.Log($"[SUCCESS] User '{username}' deleted.");
-                AuditNotify("USER DELETED", $"User '{username}' was removed. All VPN/SSH access revoked.");
+
+                // Deleting the account does not by itself touch any firewall rule already open
+                // for this user -- a still-active grant persists until it naturally expires
+                // (up to ExpirationHours) regardless. "All VPN/SSH access revoked" used to be
+                // logged unconditionally here, which was true of the account but not of any
+                // grant already in effect. Say only what actually happened.
+                string revocationNote;
+                if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                {
+                    int revoked = RevokeWindowsRulesForUser(username);
+                    revocationNote = revoked > 0
+                        ? $"{revoked} active firewall rule(s) for this user were also removed."
+                        : "No active firewall rule was found for this user to remove.";
+                }
+                else
+                {
+                    // Unlike Windows' rule Description, the Linux iptables comment carries only
+                    // the IP, port and expiry (see OpenFirewallPort) -- no username -- so there
+                    // is no way to find "this user's rules" here. Say so rather than silently
+                    // doing nothing while implying revocation happened.
+                    revocationNote = "Any active firewall rule for this user was NOT removed -- " +
+                        "Linux rules are not tracked by username. It will expire naturally " +
+                        "(within ExpirationHours) or can be found and removed by IP via 'diag'.";
+                }
+                // Even where a rule is removed, closing the firewall only blocks *new*
+                // connections -- it does not end a session this user already has established.
+                // See README.md's "Revoking access does not end active sessions" for why this
+                // project deliberately does not attempt to guess at ending one itself.
+                const string sessionCaveat = "This closes the firewall to new connections. It does " +
+                    "NOT end any session, tunnel, or process this user already has running. If " +
+                    "removing them needs to be immediate and complete, separately verify -- and if " +
+                    "necessary terminate -- their existing sessions on every system they could reach.";
+                AdminLogger.Log($"[INFO] {revocationNote} {sessionCaveat}");
+                AuditNotify("USER DELETED",
+                    $"User '{username}' was removed from the database. {revocationNote} {sessionCaveat}");
             }
             else
             {
                 AdminLogger.Error($"[ERROR] User '{username}' not found.");
             }
+        }
+
+        // Windows only: MFAService writes each rule's Description as "User: <email> Exp: <time>"
+        // (see OpenFirewallPort), so a targeted per-user revocation is possible there in a way
+        // it currently is not on Linux. Returns the number of rules removed.
+        static int RevokeWindowsRulesForUser(string username)
+        {
+            string psQuery = $"-NoProfile -Command \"Get-NetFirewallRule -DisplayName '{RulePrefix}*' " +
+                "-ErrorAction SilentlyContinue | ForEach-Object { $_.Name + '||' + $_.Description }\"";
+            var queryPsi = new ProcessStartInfo("powershell", psQuery)
+            {
+                RedirectStandardOutput = true, UseShellExecute = false, CreateNoWindow = true
+            };
+            using var queryProc = Process.Start(queryPsi);
+            if (queryProc is null) return 0;
+            string output = queryProc.StandardOutput.ReadToEnd();
+            queryProc.WaitForExit();
+
+            int removed = 0;
+            foreach (string line in output.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+            {
+                var parts = line.Split("||", 2);
+                if (parts.Length != 2) continue;
+                string ruleName = parts[0].Trim();
+                // Same shape diag already parses: "User: someone@example.com Exp: ...".
+                var match = Regex.Match(parts[1], @"User:\s*(?<user>\S+)\s+Exp:");
+                if (!match.Success || !match.Groups["user"].Value.Equals(username, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                var removePsi = new ProcessStartInfo("powershell",
+                    $"-NoProfile -Command \"Remove-NetFirewallRule -Name '{ruleName}' -ErrorAction SilentlyContinue\"")
+                {
+                    CreateNoWindow = true, UseShellExecute = false
+                };
+                using var removeProc = Process.Start(removePsi);
+                removeProc?.WaitForExit();
+                removed++;
+            }
+            return removed;
         }
 
         // --- Core Security & OS-Aware IO ---
@@ -1262,6 +1335,20 @@ namespace MFAAdmin
             return output;
         }
 
+        // Matches MFAService's own OpenFirewallPort/SweepExpiredRules parsing exactly: the
+        // declared rule name is whatever the quoted comment says it is, not any text that
+        // happens to appear elsewhere on the line. A prior version matched the whole line
+        // against RulePrefix as a substring, which could delete an unrelated operator rule
+        // whose IP, port, or own comment happened to contain the same text as the prefix.
+        static readonly Regex ManagedRuleComment =
+            new(@"(?:^|\s)--comment ""(?<name>[^""]+) exp:\d+""(?:\s|$)", RegexOptions.Compiled);
+
+        static bool IsManagedRule(string iptablesLine)
+        {
+            var match = ManagedRuleComment.Match(iptablesLine);
+            return match.Success && match.Groups["name"].Value.StartsWith(RulePrefix, StringComparison.Ordinal);
+        }
+
         static void ResetFirewall()
         {
             Console.WriteLine("\n[WARNING] This removes every MFA-granted firewall rule.");
@@ -1315,8 +1402,8 @@ namespace MFAAdmin
 
                     foreach (string line in rules.Split('\n', StringSplitOptions.RemoveEmptyEntries))
                     {
-                        if (!line.Contains(RulePrefix)) continue;
                         if (!line.TrimStart().StartsWith("-A INPUT")) continue;
+                        if (!IsManagedRule(line)) continue;
 
                         attempted++;
                         RunBash("iptables " + line.TrimStart().Replace("-A INPUT", "-D INPUT"), out int rc);
@@ -1325,7 +1412,7 @@ namespace MFAAdmin
 
                     string after = RunBash("iptables -S INPUT 2>/dev/null", out _);
                     int remaining = after.Split('\n', StringSplitOptions.RemoveEmptyEntries)
-                                         .Count(l => l.Contains(RulePrefix));
+                                         .Count(IsManagedRule);
 
                     if (remaining > 0)
                         AdminLogger.Error(
