@@ -773,6 +773,12 @@ app.MapPost("/setup", async (HttpContext context, IAntiforgery antiforgery) =>
 
     // Display the QR Code (rendered client-side via locally hosted qrious.min.js)
     context.Response.ContentType = "text/html";
+    // This page is the one place the raw TOTP secret is ever rendered -- the on-page warning
+    // says it's shown once, but nothing enforced that: a browser's back-button cache or disk
+    // cache could resurface it on a shared machine after leaving the page. No proxy or browser
+    // may store this response at all.
+    context.Response.Headers.CacheControl = "no-store";
+    context.Response.Headers.Pragma = "no-cache";
     await context.Response.WriteAsync($@"
             <!DOCTYPE html>
             <html>
