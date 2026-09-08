@@ -235,10 +235,11 @@ forgeable at once, silently, and stays that way until every secret is re-enrolle
 database breach is a user list.
 
 This is the second independent reason TOTP is not compiled into the default build — the first
-being that codes are phishable and replayable within their window. Neither is a criticism of TOTP
-as a technology; it is a reasonable second factor where the alternative is a password alone. It
-is simply a poor fit for a component whose stored state is otherwise worth nothing to an
-attacker.
+being that codes are phishable and a captured, unused code can be raced within its validity
+window. Accepted time-steps are persisted and cannot be used a second time. Neither limitation is
+a criticism of TOTP as a technology; it is a reasonable second factor where the alternative is a
+password alone. It is simply a poor fit for a component whose stored state is otherwise worth
+nothing to an attacker.
 
 If you do enable it, weigh it especially carefully on Linux, where the store is not encrypted at
 rest.
@@ -274,8 +275,8 @@ logs, or bypass the passkey-registration password gate.
   radius (public IPs only, configured ports only, time-limited) rather than preventing it.
   Reports that assume arbitrary code execution as the MFAWeb service account are describing
   this known boundary.
-- **TOTP code replay** within the code's validity window, when TOTP is explicitly enabled.
-  This is inherent to TOTP and is why TOTP is not compiled into the default build.
+- **First use of a phished TOTP code**, when TOTP is explicitly enabled. A captured, unused code
+  can be submitted before its owner; successful time-steps are persisted and rejected on reuse.
 - **Anything requiring Administrator or root** on the host. Those principals already own the
   database and the firewall.
 

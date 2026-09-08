@@ -502,6 +502,8 @@ app.MapPost("/auth", async (HttpContext context, IAntiforgery antiforgery, IConf
     bool monitorTotpFailure = false;
     bool hadNoPasskeys = false;
     string authedUsername = "";
+    long matchedTimeStep = 0;
+    string secretFingerprint = "";
 
     {
         var users = LoadUsers(DbPath, Entropy);
@@ -516,11 +518,14 @@ app.MapPost("/auth", async (HttpContext context, IAntiforgery antiforgery, IConf
             && BCrypt.Net.BCrypt.Verify(password, user.PasswordHash))
         {
             var totp = new Totp(Base32Encoding.ToBytes(user.TotpSecret));
-            if (totp.VerifyTotp(totpCode, out _, new VerificationWindow(1, 1)))
+            if (totp.VerifyTotp(totpCode, out matchedTimeStep, new VerificationWindow(1, 1)))
             {
                 credentialsValid = true;
                 hadNoPasskeys = user.PasskeyCredentials.Count == 0;
                 authedUsername = user.Username;
+                // Bind consumption to the exact secret just verified. A concurrent
+                // reprovision must not let an assertion against the old secret through.
+                secretFingerprint = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(user.TotpSecret)));
             }
         }
     }
@@ -530,6 +535,16 @@ app.MapPost("/auth", async (HttpContext context, IAntiforgery antiforgery, IConf
         if (monitorTotpFailure) LoginFailureMonitor.RecordFailure(username, clientIp);
         AuditLogger.Warn("Failed - Invalid credentials or expired code");
         await SendDenyResponse(context, "Invalid credentials or expired code.");
+        return;
+    }
+
+    // The privileged DB writer serializes and persists replay state before any grant.
+    // Never fall back to opening the port when consumption fails or the reply is lost.
+    if (!await IpcFirewallClient.ConsumeTotpAsync(authedUsername, matchedTimeStep, secretFingerprint))
+    {
+        LoginFailureMonitor.RecordFailure(username, clientIp);
+        AuditLogger.Warn("TOTP consumption failed: code reused, expired, or database unavailable");
+        await SendDenyResponse(context, "Unable to authorize this code. Wait for a new code and try again.");
         return;
     }
 
@@ -1547,6 +1562,8 @@ public class UserEntry
     // True once the user has visited the setup page and scanned their QR code.
     // MFAAdmin sets this to false on add/reprovision; BurnTotpToken sets it to true.
     public bool TotpConfirmed { get; set; } = false;
+    // Nullable for databases written before replay protection was introduced.
+    public long? LastAcceptedTotpTimeStep { get; set; }
     public string? ProvisioningToken { get; set; }
     public DateTime? ProvisioningExpiresUtc { get; set; }
     public List<StoredPasskeyCredential> PasskeyCredentials { get; set; } = new();
@@ -1604,6 +1621,11 @@ public static class IpcFirewallClient
 
     public static async Task<bool> BurnTotpTokenAsync(string token)
         => await SendDbCommandAsync($"DB:BURN_TOTP_TOKEN|{token}");
+
+#if ALLOW_TOTP
+    public static async Task<bool> ConsumeTotpAsync(string username, long timeStep, string secretFingerprint)
+        => await SendDbCommandAsync(FormattableString.Invariant($"DB:CONSUME_TOTP|{username}|{timeStep}|{secretFingerprint}"));
+#endif
 
     /// <summary>
     /// Atomically replaces the old passkey provisioning token with a new short-lived one.

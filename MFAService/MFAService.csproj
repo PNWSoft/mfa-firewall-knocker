@@ -15,6 +15,7 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="MFAService.RegressionTests" />
+    <InternalsVisibleTo Include="MFAService.ReplayTests" />
   </ItemGroup>
 
   <ItemGroup>

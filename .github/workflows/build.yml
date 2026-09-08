@@ -49,6 +49,9 @@ jobs:
       - name: Firewall command regression checks
         run: dotnet run --project tests/MFAService.RegressionTests -c Release --no-build --no-restore -p:AllowTotp=${{ matrix.allow_totp }}
 
+      - name: TOTP replay regression checks
+        run: dotnet run --project tests/MFAService.ReplayTests -c Release --no-build --no-restore -p:AllowTotp=${{ matrix.allow_totp }}
+
   audit:
     name: Dependency audit
     runs-on: ubuntu-latest
