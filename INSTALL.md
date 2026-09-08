@@ -645,6 +645,14 @@ MFAWeb serves **HTTPS only** and never binds a cleartext listener. Certificates 
 a dedicated ACME client, not by MFAWeb itself — the internet-facing service is deliberately not
 also an ACME client.
 
+> **Securing the TLS listener itself — protocol version, cipher suites — is the operator's
+> responsibility, not something this project configures.** MFAWeb sets no minimum TLS version and
+> no cipher suite policy; Kestrel uses whatever the OS (SChannel on Windows, OpenSSL on Linux)
+> allows by default. On an unpatched or default-configured older host that can include weak or
+> deprecated protocol versions. Harden this the same way you would for any other internet-facing
+> web service on the host — OS-level TLS/cipher policy (registry settings on Windows, crypto
+> policy on Linux), not an MFA Firewall Knocker setting, because there isn't one.
+
 ### Windows — certificate from the Windows store
 
 Install into `LocalMachine\My` (win-acme, Certify, or an internal CA) and set
@@ -996,10 +1004,14 @@ Then:
   use the default or a publicly known value. On Linux it is unused for encryption (the
   database is plain JSON) but is still validated at startup — a missing value will
   prevent the service from starting.
-- The user database contains **TOTP secrets** (not hashed). A compromised database file
-  allows an attacker to generate valid TOTP codes. Protect the file with filesystem
-  permissions as documented above. Passkey credentials stored in the database are
-  public keys and are not sensitive.
+- The user database contains **TOTP secrets** (not hashed) when TOTP is compiled in. A
+  compromised database file allows an attacker to generate valid TOTP codes for every
+  enrolled user. Protect the file with filesystem permissions as documented above.
+  Passkey credentials stored in the database are public keys, not private keys — but the
+  database is not "not sensitive" even without TOTP: it holds usernames, the current
+  one-time enrollment password hash of every account, and, during an active enrollment
+  or reprovisioning window, a short-lived registration token. See SECURITY.md's "A note
+  on the user database" for the full breakdown.
 - MFAWeb **only accepts authentication requests from public (internet) IP addresses**.
   Requests from RFC-1918 private ranges are rejected with HTTP 403. This prevents
   internal-only deployments from accidentally being used as a pivot point.
