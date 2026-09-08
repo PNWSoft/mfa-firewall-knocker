@@ -549,7 +549,7 @@ app.MapPost("/auth", async (HttpContext context, IAntiforgery antiforgery, IConf
         // future refactor), Base32Encoding.ToBytes("") throws and a valid password would
         // surface as a 500 instead of a clean denial. Treat an empty secret as invalid.
         if (user != null && user.TotpConfirmed && !string.IsNullOrWhiteSpace(user.TotpSecret)
-            && BCrypt.Net.BCrypt.Verify(password, user.PasswordHash))
+            && !string.IsNullOrEmpty(user.PasswordHash) && BCrypt.Net.BCrypt.Verify(password, user.PasswordHash))
         {
             var totp = new Totp(Base32Encoding.ToBytes(user.TotpSecret));
             if (totp.VerifyTotp(totpCode, out matchedTimeStep, new VerificationWindow(1, 1)))
@@ -715,7 +715,13 @@ app.MapPost("/setup", async (HttpContext context, IAntiforgery antiforgery) =>
         {
             setupInvalid = true;
         }
-        else if (!BCrypt.Net.BCrypt.Verify(password, user.PasswordHash))
+        // An empty hash means this account's shared enrollment password was already burned --
+        // either by completing passkey registration first, or by the expiry sweep, both of
+        // which only clear it for an account that never confirmed TOTP (the case reaching this
+        // branch at all). Short-circuits before Verify: BCrypt.Verify throws ArgumentException
+        // on an empty hash rather than returning false, matching the same defensive pattern
+        // already used for TotpSecret above.
+        else if (string.IsNullOrEmpty(user.PasswordHash) || !BCrypt.Net.BCrypt.Verify(password, user.PasswordHash))
         {
             setupBadPassword = true;
             authedUsername = user.Username;
@@ -894,7 +900,13 @@ app.MapPost("/setup-passkey", async (HttpContext context, IAntiforgery antiforge
         else
         {
             provisionUsername = user.Username;
-            pkBadPassword = !BCrypt.Net.BCrypt.Verify(password, user.PasswordHash);
+            // Not reachable today by construction -- AddPasskey and the expiry sweep only ever
+            // clear PasswordHash together with PasskeyProvisioningToken, so a live, matching
+            // token here should always mean a real hash. Guarded anyway, the same defensive
+            // pattern used at the other two password checks: BCrypt.Verify throws rather than
+            // returning false on an empty hash, and a 500 here is worse than treating it as a
+            // wrong password if that invariant is ever broken by a future change.
+            pkBadPassword = string.IsNullOrEmpty(user.PasswordHash) || !BCrypt.Net.BCrypt.Verify(password, user.PasswordHash);
         }
     }
 

@@ -1484,6 +1484,74 @@ public class DatabaseLockService : BackgroundService
                 }
             }
         }
+
+        // Mirrors FirewallWorkerService's own sweep: a periodic cleanup here, not just a
+        // reactive check at request time. A passkey provisioning window that expires unused
+        // otherwise leaves its one-time enrollment password sitting in the database
+        // indefinitely -- not usable by anything (every check site still enforces the
+        // expiry), but there for no reason once its window has passed, on the same
+        // "an absent secret cannot be misused, even by a future code path" principle the
+        // rest of this project already follows.
+        try { SweepExpiredProvisioning(); }
+        catch (Exception ex) { ServiceLogger.Error($"[DB SWEEPER ERROR] {ex.Message}"); }
+        using var timer = new PeriodicTimer(TimeSpan.FromMinutes(5));
+
+        while (await timer.WaitForNextTickAsync(stoppingToken))
+        {
+            try { SweepExpiredProvisioning(); }
+            catch (Exception ex) { ServiceLogger.Error($"[DB SWEEPER ERROR] {ex.Message}"); }
+        }
+    }
+
+    // add/reprovision mint the TOTP link, the passkey link, and the one-time enrollment
+    // password together, all in one call, and give the TOTP and passkey windows the exact
+    // same expiry timestamp (see the shared `expiresUtc` local in both). PasskeyProvisioningExpiresUtc
+    // is always set, unlike the TOTP-only field, so it is the canonical check for "has this
+    // account's shared 60-minute enrollment window closed" -- true regardless of whether TOTP
+    // is even compiled in. Once it has, and whichever path wasn't completed, that path's own
+    // token/state serves no further purpose -- the same as if it HAD succeeded (AddPasskey and
+    // BurnTotpToken each already clear their own token on that path for the same reason). The
+    // password is the one field shared by both paths, so it is only cleared when TOTP is not
+    // confirmed: in a TOTP-enabled build a confirmed account still needs it for every future
+    // /auth login, and burning it there would lock the user out over something this expiry has
+    // nothing to do with.
+    private static void SweepExpiredProvisioning()
+    {
+        using var lk = AcquireDbLock();
+        if (lk == null) { ServiceLogger.Warn("[DB SWEEPER] Timed out waiting for the database lock."); return; }
+
+        var users = LoadUsers();
+        var now = DateTime.UtcNow;
+        int cleared = users.Count(user => TryCleanExpiredProvisioning(user, now));
+
+        if (cleared > 0)
+        {
+            SaveUsers(users);
+            ServiceLogger.Log($"[DB SWEEPER] Cleared expired provisioning state for {cleared} account(s).");
+        }
+    }
+
+    // Pure decision logic, deliberately factored out of the file I/O above: given one user's
+    // state and the current time, does anything need clearing, and what. No DB/file dependency,
+    // so it's directly testable against constructed UserEntry values rather than needing a real
+    // users.dat and the full sweep/lock/save path around it. Returns whether it changed anything.
+    internal static bool TryCleanExpiredProvisioning(UserEntry user, DateTime now)
+    {
+        if (user.PasskeyProvisioningExpiresUtc is not { } expiry || now <= expiry) return false;
+        bool alreadyClean = user.PasskeyProvisioningToken == null && !user.PasskeyRegistrationReady
+            && user.ProvisioningToken == null
+            && (user.TotpConfirmed || string.IsNullOrEmpty(user.PasswordHash));
+        if (alreadyClean) return false;
+
+        user.PasskeyProvisioningToken      = null;
+        user.PasskeyProvisioningExpiresUtc = null;
+        user.PasskeyRegistrationReady      = false;
+        // BurnTotpToken already nulls these on the confirmed path, so this only ever has
+        // something to do on a TOTP link that also expired unused.
+        user.ProvisioningToken      = null;
+        user.ProvisioningExpiresUtc = null;
+        if (!user.TotpConfirmed) user.PasswordHash = "";
+        return true;
     }
 
     // -----------------------------------------------------------------------
@@ -1759,6 +1827,11 @@ public class DatabaseLockService : BackgroundService
         user.PasskeyProvisioningToken      = null;
         user.PasskeyProvisioningExpiresUtc = null;
         user.PasskeyRegistrationReady      = false;
+        // The enrollment password's only job is proving identity for this one registration --
+        // in a build with TOTP confirmed for this account, it doubles as the account's ongoing
+        // login credential (checked on every /auth request), so only burn it where that's not
+        // the case. Same condition the expiry sweep below uses, for the same reason.
+        if (!user.TotpConfirmed) user.PasswordHash = "";
         SaveUsers(users);
         ServiceLogger.Log($"[DB] Passkey credential registered for '{user.Username}'");
         return "SUCCESS";

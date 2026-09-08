@@ -151,7 +151,48 @@ Test("IPv6 zone ID is rejected before it can reach a shell command", () =>
         Check(commands.SeenScripts.Count == 0);
     }
 });
-Console.WriteLine(failed == 0 ? "All 17 regression checks passed." : $"{failed} regression check(s) failed.");
+Test("expired provisioning is cleared, but the password only when TOTP was never confirmed", () =>
+{
+    var now = DateTime.UtcNow;
+    var expired = now.AddMinutes(-1);
+
+    // Unused window, TOTP never confirmed: the password has no further purpose either.
+    var neverConfirmed = new UserEntry
+    {
+        PasswordHash = "real-hash", TotpConfirmed = false,
+        ProvisioningToken = "totp-token", ProvisioningExpiresUtc = expired,
+        PasskeyProvisioningToken = "passkey-token", PasskeyProvisioningExpiresUtc = expired,
+        PasskeyRegistrationReady = true
+    };
+    Check(DatabaseLockService.TryCleanExpiredProvisioning(neverConfirmed, now));
+    Check(neverConfirmed.PasswordHash == "" && neverConfirmed.ProvisioningToken == null
+        && neverConfirmed.ProvisioningExpiresUtc == null && neverConfirmed.PasskeyProvisioningToken == null
+        && neverConfirmed.PasskeyProvisioningExpiresUtc == null && !neverConfirmed.PasskeyRegistrationReady);
+
+    // Same expired window, but TOTP WAS confirmed: the password is this account's ongoing
+    // /auth login credential now, not just a registration bootstrap -- must survive.
+    var totpConfirmed = new UserEntry
+    {
+        PasswordHash = "real-hash", TotpConfirmed = true,
+        PasskeyProvisioningToken = "passkey-token", PasskeyProvisioningExpiresUtc = expired,
+        PasskeyRegistrationReady = true
+    };
+    Check(DatabaseLockService.TryCleanExpiredProvisioning(totpConfirmed, now));
+    Check(totpConfirmed.PasswordHash == "real-hash"); // must survive -- it's the ongoing /auth login credential
+    Check(totpConfirmed.PasskeyProvisioningToken == null && !totpConfirmed.PasskeyRegistrationReady);
+
+    // Not yet expired: nothing should change.
+    var stillLive = new UserEntry
+    {
+        PasswordHash = "real-hash", PasskeyProvisioningToken = "t", PasskeyProvisioningExpiresUtc = now.AddMinutes(30)
+    };
+    Check(!DatabaseLockService.TryCleanExpiredProvisioning(stillLive, now));
+    Check(stillLive.PasswordHash == "real-hash" && stillLive.PasskeyProvisioningToken == "t");
+
+    // Already clean and expired: idempotent, reports no change on a second pass.
+    Check(!DatabaseLockService.TryCleanExpiredProvisioning(neverConfirmed, now));
+});
+Console.WriteLine(failed == 0 ? "All 18 regression checks passed." : $"{failed} regression check(s) failed.");
 return failed == 0 ? 0 : 1;
 
 void Test(string name, Action action)
