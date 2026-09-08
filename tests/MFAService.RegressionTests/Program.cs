@@ -132,7 +132,26 @@ Test("invalid port configuration never reports success", () =>
     Check(Worker(commands, "invalid", "0/TCP", "22/OTHER").ProcessFirewallRequest(Request).StartsWith("ERROR:"));
     Check(commands.Rules.Count == 0);
 });
-Console.WriteLine(failed == 0 ? "All 16 regression checks passed." : $"{failed} regression check(s) failed.");
+Test("IPv6 zone ID is rejected before it can reach a shell command", () =>
+{
+    // IPAddress.TryParse accepts a zone ID (RFC 4007) containing arbitrary characters, including
+    // shell metacharacters, and its own ToString() silently drops it -- so using the raw input
+    // string past validation let a crafted zone ID survive into the privileged bash -c /
+    // PowerShell command built for the actual grant. FakeCommands.Bash/PowerShell receive the
+    // exact script that would have run, so this proves the payload never reaches that far, not
+    // just that the response happens to be an error.
+    var commands = new FakeCommands();
+    var worker = Worker(commands);
+    foreach (var payload in new[] { "2001:db8::1%$(id)", "2001:db8::1%';calc;#", "2001:db8::1%eth0" })
+    {
+        Check(worker.ProcessFirewallRequest($"{payload}|review@example.com").StartsWith("ERROR:"));
+        Check(commands.Rules.Count == 0);
+        // Rejected before OpenFirewallPort runs at all -- no shell command is ever built,
+        // not merely one that happens not to contain the payload.
+        Check(commands.SeenScripts.Count == 0);
+    }
+});
+Console.WriteLine(failed == 0 ? "All 17 regression checks passed." : $"{failed} regression check(s) failed.");
 return failed == 0 ? 0 : 1;
 
 void Test(string name, Action action)
@@ -184,9 +203,11 @@ sealed class FakeCommands : IFirewallCommands
     public bool IgnoreDelete { get; init; }
     public List<string> Rules { get; } = new();
     public HashSet<string> WindowsNames { get; } = new();
+    public List<string> SeenScripts { get; } = new();
 
     public string PowerShell(string script)
     {
+        SeenScripts.Add(script);
         if (script.Contains("Remove-NetFirewallRule"))
         {
             if (FailDelete) throw new InvalidOperationException("Expired rule remains after deletion");
@@ -204,6 +225,7 @@ sealed class FakeCommands : IFirewallCommands
 
     public string Bash(string script)
     {
+        SeenScripts.Add(script);
         if (script == "iptables -S INPUT") return string.Join('\n', Rules);
         if (script.StartsWith("iptables -D INPUT"))
         {

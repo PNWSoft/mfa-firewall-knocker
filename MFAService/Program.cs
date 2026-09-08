@@ -978,8 +978,23 @@ public class FirewallWorkerService : BackgroundService
         }
 
         // 2. VALIDATE INPUTS
-        if (!System.Net.IPAddress.TryParse(ip, out _))
+        //
+        // IPAddress.TryParse accepts an IPv6 zone ID (the "%..." suffix, RFC 4007) containing
+        // arbitrary characters -- including shell metacharacters -- and its own ToString() drops
+        // that suffix silently rather than validating it. Using the raw input string beyond this
+        // point let a crafted zone ID (e.g. "2001:db8::1%$(id)") survive into the privileged
+        // bash -c / PowerShell command built in OpenFirewallPort, as root/SYSTEM. A zone ID has
+        // no legitimate meaning here regardless: it only qualifies link-local/scoped addresses,
+        // which IsPublicIpAddress already rejects. Reject it outright, and from here on use only
+        // the parsed, canonical form -- never the original attacker-supplied string.
+        if (ip.Contains('%'))
+        {
+            ServiceLogger.Warn("[SECURITY] Rejected IP containing a zone ID.");
             return "ERROR: Invalid IP address";
+        }
+        if (!System.Net.IPAddress.TryParse(ip, out var parsedIp))
+            return "ERROR: Invalid IP address";
+        ip = parsedIp.ToString();
         // Defense in depth: re-enforce the "external addresses only" policy on the
         // privileged side, so a compromised/bypassed MFAWeb cannot make SYSTEM open
         // a firewall rule for a private/loopback source. MFAWeb checks this too.
