@@ -43,6 +43,9 @@ jobs:
       - name: Test
         run: dotnet test MFA.slnx -c Release --no-build --no-restore -p:AllowTotp=${{ matrix.allow_totp }} -p:SourceRevisionId=${{ github.sha }}
 
+      - name: Authentication alert regression checks
+        run: dotnet run --project tests/MFAWeb.AlertTests -c Release -p:RestoreLockedMode=true -p:AllowTotp=${{ matrix.allow_totp }}
+
   audit:
     name: Dependency audit
     runs-on: ubuntu-latest
