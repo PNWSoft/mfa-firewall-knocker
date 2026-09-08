@@ -28,14 +28,14 @@ Communication between MFAWeb and MFAService uses a **named pipe** (Windows) or *
 - .NET 10 Runtime (or Self-Contained publish)
 - Active Directory domain (required for gMSA)
 - PowerShell 5.1+ with the `NetSecurity` module (included in Windows Server)
-- An SMTP relay accessible from the server
+- An SMTP relay accessible from the server that supports authenticated STARTTLS
 - A TLS certificate for MFAWeb (see [TLS Options](#tls-options))
 
 ### Linux
 - Ubuntu 22.04 LTS / Debian 12 / RHEL 9 (or equivalent)
 - .NET 10 Runtime (or Self-Contained publish)
 - `systemd`
-- An SMTP relay accessible from the server
+- An SMTP relay accessible from the server that supports authenticated STARTTLS
 - A TLS certificate, obtained with an external ACME client such as certbot (see [TLS Options](#tls-options))
 
 > **Linux firewall backend note:** MFAService has separate Windows (PowerShell /
@@ -65,7 +65,7 @@ All three components read from their own `appsettings.json`. Copy the
     "GmsaAccount": "YOURDOMAIN\\MFA_Service$"
   },
   "Smtp": {
-    "Host": "your-smtp-server",  "Port": 25,
+    "Host": "your-smtp-server",  "Port": 587,  "UseSsl": true,
     "FromAddress": "security@your-domain.com",
     "NotifyAddress": "admins@your-domain.com"
   }
@@ -119,7 +119,7 @@ All three components read from their own `appsettings.json`. Copy the
     "GmsaAccount": "YOURDOMAIN\\MFA_Service$"
   },
   "Smtp": {
-    "Host": "your-smtp-server",  "Port": 25,
+    "Host": "your-smtp-server",  "Port": 587,  "UseSsl": true,
     "FromAddress": "security@your-domain.com",
     "NotifyAddress": "admins@your-domain.com"
   }
@@ -130,6 +130,12 @@ All three components read from their own `appsettings.json`. Copy the
 |-----|-------------|
 | `BouncerUrl` | Base URL of MFAWeb. Used to generate the provisioning links sent in welcome emails. |
 | `RulePrefix` | Must match `BouncerConfig:RulePrefix` in MFAService. Used by `diag` and `reset` commands. |
+
+`Smtp:UseSsl` defaults to `true` and requires a validated STARTTLS connection. Set it to
+`false` only when the SMTP relay is reached through `localhost`, `127.0.0.0/8`, or `::1`;
+the applications reject plaintext delivery to any non-loopback host. Provisioning messages
+contain the temporary password and enrollment link, so the SMTP hop is part of the enrollment
+security boundary.
 
 ---
 
