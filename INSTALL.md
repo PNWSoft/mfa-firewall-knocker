@@ -1022,21 +1022,31 @@ Then:
 2. **Keep your `appsettings.json`.** Release archives ship only `appsettings.example.json`, so
    copy your existing config into the new directory rather than re-deriving it.
 
-3. **Upgrade MFAService before MFAWeb.** From 0.2.0 the client verifies the privileged service's
+3. **If upgrading from before 0.2.0, add `FirewallService:GmsaAccount` to MFAService's config.**
+   The IPC identity check added in that release (see the next step) rejects every client —
+   including a correctly upgraded MFAWeb — until this is set, because an older config simply
+   doesn't have the key (see `FirewallService:GmsaAccount` under MFAWeb's configuration reference
+   above — the same value belongs in MFAService's own config). On Windows this is the gMSA account
+   MFAWeb runs as; on Linux it's the local account MFAWeb runs as (`mfaweb` in this guide's
+   example). Restart MFAService after adding it and confirm the log line
+   `[IPC] Peer verification enabled: only uid <n> ('mfaweb') may connect.` (Linux) or
+   `[IPC] Claiming pipe name for gMSA '<name>'...` (Windows, `Debug` log level) before moving on.
+
+4. **Upgrade MFAService before MFAWeb.** From 0.2.0 the client verifies the privileged service's
    identity before sending anything, so a newer MFAWeb against an older MFAService is the
    combination most likely to fail. The reverse order is safe.
 
-4. **Deploy all three components together** when the release changes `users.dat`'s schema — they
+5. **Deploy all three components together** when the release changes `users.dat`'s schema — they
    share it. Release notes say when that applies.
 
-5. **Verify before you disconnect**, while you still have the independent path open:
+6. **Verify before you disconnect**, while you still have the independent path open:
    - both services are running, and the logs show the expected version at startup
    - MFAWeb serves HTTPS and selects a certificate
    - **a real passkey login opens a rule** — this is the only test that exercises the whole
      chain, including the IPC identity check added in 0.2.0
    - the rule disappears at expiry (or shorten `ExpirationHours` temporarily to watch it)
 
-6. **If it fails**, stop both services, restore the backed-up directory, and start them again —
+7. **If it fails**, stop both services, restore the backed-up directory, and start them again —
    privileged service first.
 
    On Linux, first move the failed installation directories aside under distinct names. Restore
