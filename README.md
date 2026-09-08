@@ -199,7 +199,7 @@ authenticator with user verification** — the built-in kind, unlocked by biomet
 
 | Setting | Value | Consequence |
 |---------|-------|-------------|
-| `AuthenticatorAttachment` | `Platform` | Only built-in authenticators: Windows Hello, Touch ID / Face ID, Android biometric. **Roaming security keys — YubiKey, Titan, SoloKeys — are rejected at registration.** |
+| `AuthenticatorAttachment` | `Platform` | Only built-in authenticators: Windows Hello, Touch ID / Face ID, Android biometric. **The browser refuses a roaming security key — YubiKey, Titan, SoloKeys — at registration.** This is client-enforced, not server-verified: with `attestationPreference: None` the server has no attestation statement to check attachment type against, so it's trusting the browser's own ceremony, not independently confirming what registered. The registrant only weakens their own account by working around it, so the practical risk is low — but it means this line is a request the client honors, not a guarantee the server can make on its own. |
 | `UserVerification` | `Required` | Biometric or device PIN on **every** registration and **every** login. A tap-only key is not enough. Enforced server-side on each assertion. |
 | `RequireResidentKey` | `false` | Non-discoverable credential: the user types their email address first. No usernameless "just tap" login. |
 | `attestationPreference` | `None` | The server does not verify authenticator make or model. |

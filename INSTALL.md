@@ -519,6 +519,31 @@ Group=mfaipc
 UMask=0027
 NoNewPrivileges=true
 ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/etc/mfa-auth /var/log/mfa-auth /run
+
+# Sandboxing that doesn't depend on which capabilities this process happens to use, so it's
+# safe regardless: this service never loads kernel modules, joins namespaces, execs a SUID
+# binary, needs realtime scheduling, or changes its personality.
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+ProtectProc=invisible
+
+# Narrowed to what this process actually does: manage iptables (NET_ADMIN/NET_RAW, and
+# NETLINK for the address family below) and own files across users (DAC_OVERRIDE, CHOWN,
+# FOWNER). CapabilityBoundingSet limits descendant processes too, including the iptables
+# subprocess this service shells out to -- test a real login end to end after applying this,
+# the same way INSTALL.md already asks for the gate itself (see "Verify the gate is actually
+# gating"), since a too-narrow set fails firewall commands rather than refusing to start.
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_DAC_OVERRIDE CAP_CHOWN CAP_FOWNER
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
 
 # Logging
 StandardOutput=journal
@@ -563,8 +588,28 @@ ReadWritePaths=/tmp
 LogsDirectory=mfa-web
 LogsDirectoryMode=0750
 
-# Allow binding to ports below 1024 if using port 443
+# Same rationale as MFAService's unit: these don't depend on which capabilities this process
+# happens to use, so they're safe regardless. This is the internet-facing half and the one
+# SECURITY.md names as the residual risk if MFAWeb itself is ever compromised -- worth applying
+# here at least as much as on the privileged side.
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+ProtectProc=invisible
+
+# Allow binding to ports below 1024 if using port 443. CapabilityBoundingSet narrows this to
+# exactly that capability; RestrictAddressFamilies to the HTTPS listener and the Unix socket
+# this process actually opens. Test a real login end to end after applying this, the same as
+# for MFAService's unit above -- do not assume it's right just because the service starts.
 AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 
 StandardOutput=journal
 StandardError=journal
