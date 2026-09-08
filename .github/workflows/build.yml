@@ -52,6 +52,9 @@ jobs:
       - name: TOTP replay regression checks
         run: dotnet run --project tests/MFAService.ReplayTests -c Release --no-build --no-restore -p:AllowTotp=${{ matrix.allow_totp }}
 
+      - name: Passkey registration authorization checks
+        run: dotnet run --project tests/MFAWeb.RegistrationTests -c Release -p:RestoreLockedMode=true
+
   audit:
     name: Dependency audit
     runs-on: ubuntu-latest

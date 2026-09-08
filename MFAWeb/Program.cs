@@ -1305,8 +1305,9 @@ app.MapPost("/passkey/register/complete", async (HttpContext context) =>
         var users = LoadUsers(DbPath, Entropy);
         var user = users.FirstOrDefault(u => TokenEquals(u.PasskeyProvisioningToken, token));
 
-        if (user == null || user.PasskeyProvisioningExpiresUtc == null || DateTime.UtcNow > user.PasskeyProvisioningExpiresUtc
-            || !user.PasskeyRegistrationReady)
+        // The challenge was already consumed above. Both names came from the canonical
+        // database account, so require an exact match before attestation verification or IPC.
+        if (!PasskeyRegistrationAuthorization.IsAuthorized(stored.Username, user, DateTime.UtcNow))
         {
             context.Response.StatusCode = 401;
             await context.Response.WriteAsync("Registration link is invalid or has expired.");
@@ -1552,6 +1553,19 @@ static bool IsPublicIpAddress(string ipString)
 
     // If it passed all the traps, it's a real public internet IP
     return true;
+}
+
+internal static class PasskeyRegistrationAuthorization
+{
+    internal static bool IsAuthorized(
+        string challengeUsername,
+        [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] UserEntry? tokenUser,
+        DateTime utcNow)
+        => tokenUser is not null
+            && tokenUser.PasskeyProvisioningExpiresUtc is DateTime expires
+            && utcNow <= expires
+            && tokenUser.PasskeyRegistrationReady
+            && string.Equals(challengeUsername, tokenUser.Username, StringComparison.Ordinal);
 }
 
 public class UserEntry
