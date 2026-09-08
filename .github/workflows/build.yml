@@ -46,6 +46,9 @@ jobs:
       - name: Authentication alert regression checks
         run: dotnet run --project tests/MFAWeb.AlertTests -c Release -p:RestoreLockedMode=true -p:AllowTotp=${{ matrix.allow_totp }}
 
+      - name: Firewall command regression checks
+        run: dotnet run --project tests/MFAService.RegressionTests -c Release --no-build --no-restore -p:AllowTotp=${{ matrix.allow_totp }}
+
   audit:
     name: Dependency audit
     runs-on: ubuntu-latest

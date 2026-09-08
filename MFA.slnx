@@ -5,4 +5,5 @@
   <Project Path="MFAAdmin/MFAAdmin.csproj" />
   <Project Path="MFAService/MFAService.csproj" />
   <Project Path="MFAWeb/MFAWeb.csproj" />
+  <Project Path="tests/MFAService.RegressionTests/MFAService.RegressionTests.csproj" />
 </Solution>
