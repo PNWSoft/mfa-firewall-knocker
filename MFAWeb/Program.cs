@@ -38,9 +38,23 @@ var builder = WebApplication.CreateBuilder(args);
 
 // --- Security: Rate Limiting ---
 int rateLimitPerWindow = builder.Configuration.GetValue<int>("RateLimitPerWindow", 20);
+// Backstop across every partition combined, so no single mechanism is the only thing standing
+// between the login endpoints and an unbounded flood -- see the partition-key comment below for
+// the specific gap this covers. Deliberately generous: sized well above what any real login
+// burst from a small number of legitimate users would produce.
+int globalRateLimitPerWindow = builder.Configuration.GetValue<int>("GlobalRateLimitPerWindow", 200);
 builder.Services.AddRateLimiter(options =>
 {
     options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+
+    options.GlobalLimiter = System.Threading.RateLimiting.PartitionedRateLimiter.Create<HttpContext, string>(_ =>
+        RateLimitPartition.GetFixedWindowLimiter("global", _ =>
+            new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = globalRateLimitPerWindow,
+                Window = TimeSpan.FromMinutes(5),
+                QueueLimit = 0
+            }));
 
     options.AddPolicy("LoginRateLimit", httpContext =>
     {
@@ -49,7 +63,7 @@ builder.Services.AddRateLimiter(options =>
         // their IP and bypass rate limiting and the public-IP enforcement below.
         // By design, MFAWeb is deployed directly on the internet without a reverse
         // proxy so that Connection.RemoteIpAddress is always the true client address.
-        string clientIp = httpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+        string clientIp = RateLimitPartitionKey(httpContext.Connection.RemoteIpAddress);
 
         return RateLimitPartition.GetFixedWindowLimiter(clientIp, _ =>
             new FixedWindowRateLimiterOptions
@@ -60,6 +74,26 @@ builder.Services.AddRateLimiter(options =>
             });
     });
 });
+
+// A residential or small-business IPv6 allocation commonly gives one customer a whole /56 or
+// /64 block -- 2^72 or 2^64 addresses. Partitioning on the full 128-bit address, as the naive
+// per-IP approach does, lets anyone inside their own allocation get an effectively fresh
+// rate-limit bucket on every request just by flipping host bits, making the limiter a no-op
+// against that attacker while doing nothing for anyone else. Bucket IPv6 on the /56 network
+// prefix instead: coarse enough to catch in-allocation rotation, still far narrower than
+// grouping unrelated customers together. IPv4 addresses are scarce enough that the full address
+// remains the right partition key.
+static string RateLimitPartitionKey(System.Net.IPAddress? address)
+{
+    if (address == null) return "unknown";
+    if (address.IsIPv4MappedToIPv6) address = address.MapToIPv4();
+    if (address.AddressFamily != System.Net.Sockets.AddressFamily.InterNetworkV6)
+        return address.ToString();
+
+    byte[] bytes = address.GetAddressBytes();
+    return "v6:" + Convert.ToHexString(bytes, 0, 7); // first 56 bits
+}
+
 builder.Services.AddAntiforgery();
 // Required for systemd units declaring Type=notify -- see the note in MFAService.
 builder.Services.AddSystemd();
