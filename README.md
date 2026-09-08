@@ -160,11 +160,13 @@ than trusting its caller.
   lockout would be a trivial DoS. Throttling is per-IP; failed logins are detected and alerted on
   instead
 - **In the default passkey-only build, enrolled passkeys add no private key to the user store.**
-  The file holds public keys, a user list, and BCrypt password hashes. During enrollment and
-  reprovisioning it also holds short-lived registration tokens and state, so both read and write
-  access need protection: a reader can disclose hashes or race an active enrollment, while a
-  writer can enroll their own credential. Both platforms serialize access through a cross-process
-  mutex, and the internet-facing MFAWeb cannot write it directly
+  The file holds public keys and a user list. Alongside a one-time enrollment password —
+  a bootstrap credential checked exactly once, at registration, never used to log in, and
+  regenerated fresh by every `add` or `reprovision` — enrollment and reprovisioning also mint a
+  short-lived registration token and readiness state. Both read and write access need
+  protection: a reader can disclose hashes or race an active enrollment, while a writer can
+  enroll their own credential. Both platforms serialize access through a cross-process mutex,
+  and the internet-facing MFAWeb cannot write it directly
 - **Building with `-p:AllowTotp=true` changes that**, and it is the main reason the flag is not
   the default. TOTP verification is `HMAC-SHA1(secret, timestep)`, so the server must keep each
   shared secret in recoverable form — it cannot be hashed, because a hash cannot generate codes.
@@ -458,12 +460,14 @@ revoke, you know whether you have closed the door or actually removed the person
 ## Security notes
 
 - The user database stores **TOTP secrets in recoverable form** when TOTP is compiled in. In the
-  default build, passkey credentials are public keys, but usernames, password hashes, and active
-  enrollment tokens still make the database confidential. Protect it with the filesystem
-  permissions documented in INSTALL.md.
+  default build, passkey credentials are public keys, but usernames, the current one-time
+  enrollment password hash, and active enrollment tokens still make the database confidential.
+  Protect it with the filesystem permissions documented in INSTALL.md.
 - Firewall rules expire after `ExpirationHours`; the sweeper runs every 5 minutes.
-- Passkey registration always requires proof of password or a post-login token. That check is a
-  deliberate invariant rather than an incidental one — treat any change to that path with care.
+- Passkey registration always requires proof of the one-time enrollment password or a post-login
+  token — never a persistent, reusable password, and never anything checked again after
+  registration. That check is a deliberate invariant rather than an incidental one — treat any
+  change to that path with care.
 - This software is provided as-is under the MIT license, with no warranty. It manipulates firewall
   rules on a privileged host. **Review the code and test in a non-production environment first.**
 

@@ -202,16 +202,18 @@ security; no network gate can be one.
 ### A note on the user database
 
 In the default passkey-only build, enrolled WebAuthn credentials are **public keys** and there is
-no recoverable TOTP secret. The store still contains usernames and BCrypt password hashes. During
-enrollment or reprovisioning it also contains short-lived passkey registration tokens and the
-registration-ready state. A reader who can watch an active enrollment can race the legitimate
-user after the password gate has made that token ready, so confidentiality still matters during
-those windows.
+no recoverable TOTP secret. The store still contains usernames and the hash of each account's
+current **one-time enrollment password** — a bootstrap credential, not a persistent one: it is
+checked exactly once, at registration, never used to log in, and replaced by a fresh one on every
+`add` or `reprovision`. During enrollment or reprovisioning the store also contains a short-lived
+passkey registration token and the registration-ready state. A reader who can watch an active
+enrollment can race the legitimate user after the password gate has made that token ready, so
+confidentiality still matters during those windows.
 
 Integrity is always critical: someone who can write the store can add their own passkey credential
 and become that user. For an already-enrolled account with no active provisioning state, a read
-does not reveal a credential that can produce a WebAuthn assertion, but it still discloses the user
-list and password hashes.
+does not reveal a credential that can produce a WebAuthn assertion, but it still discloses the
+user list and the enrollment password hash.
 
 The file permissions in INSTALL.md protect both properties. DPAPI encryption on Windows raises the
 bar on reads, while filesystem permissions remain the primary boundary against unauthorized reads
@@ -234,7 +236,7 @@ That produces a sharp asymmetry between the two build modes:
 
 | | What the server stores | What a full database breach yields |
 |---|---|---|
-| Passkey-only | public keys, usernames, BCrypt password hashes, and any active enrollment state | account data, hashes, and usable enrollment tokens during their short validity window, but no private passkey key |
+| Passkey-only | public keys, usernames, the current one-time enrollment password hash, and any active enrollment state | account data, the enrollment password hash, and usable enrollment tokens during their short validity window, but no private passkey key |
 | **TOTP-enabled** | **all passkey-only data plus each TOTP secret** | **all of the above plus valid codes for every TOTP user until each secret is re-enrolled** |
 
 A TOTP database breach is a mass-compromise event: every enrolled user's second factor becomes
@@ -270,7 +272,7 @@ rest.
 **In scope:** anything that lets someone open a firewall rule without completing
 authentication, authenticate as another user, escalate from MFAWeb to MFAService, read or
 modify `users.dat` without the required privileges, recover credentials from the database or
-logs, or bypass the passkey-registration password gate.
+logs, or bypass the passkey-registration one-time-password gate.
 
 **Out of scope** — these are documented design decisions, not oversights:
 

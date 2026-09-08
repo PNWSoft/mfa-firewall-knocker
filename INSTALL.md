@@ -201,8 +201,8 @@ On Windows, DPAPI is used at `LocalMachine` scope, so `DpapiEntropy` is the only
 separating `users.dat` from any other process on the host. `C:\ProgramData` and newly
 created folders under `C:\` grant **Authenticated Users** read access by default — which
 would let any local non-admin read the entropy out of `appsettings.json`, read `users.dat`,
-and call `ProtectedData.Unprotect` to recover the **plaintext TOTP secrets** and password
-hashes of every user.
+and call `ProtectedData.Unprotect` to recover the **plaintext TOTP secrets** and the current
+one-time enrollment password hash of every user.
 
 Restrict the data directory and each `appsettings.json` to SYSTEM, Administrators, and the
 gMSA only:
