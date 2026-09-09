@@ -16,6 +16,7 @@ if (args.FirstOrDefault() == "child")
 
 ServiceLogger.LogDirectory = Path.Combine(AppContext.BaseDirectory, "test-logs");
 const string Request = "8.8.8.8|review@example.com";
+const string RequestV6 = "2001:4860:4860::8888|review@example.com";
 int failed = 0;
 Test("subprocess exit failure includes stderr", () =>
 {
@@ -151,6 +152,36 @@ Test("IPv6 zone ID is rejected before it can reach a shell command", () =>
         Check(commands.SeenScripts.Count == 0);
     }
 });
+Test("IPv6 grant lands in ip6tables, never iptables", () =>
+{
+    var commands = new FakeCommands();
+    Check(Worker(commands).ProcessFirewallRequest(RequestV6) == "SUCCESS");
+    Check(commands.Rules.Count == 0);
+    Check(commands.Rules6.Count == 1);
+    Check(commands.Rules6[0].Contains("2001:4860:4860::8888") && commands.Rules6[0].Contains("_22_TCP exp:"));
+});
+Test("IPv4 and IPv6 grants coexist in their own tables without cross-deleting", () =>
+{
+    var commands = new FakeCommands();
+    var worker = Worker(commands);
+    Check(worker.ProcessFirewallRequest(Request) == "SUCCESS");
+    Check(worker.ProcessFirewallRequest(RequestV6) == "SUCCESS");
+    Check(commands.Rules.Count == 1 && commands.Rules6.Count == 1);
+    // Renewing the IPv4 grant must not touch the IPv6 table, and vice versa.
+    Check(worker.ProcessFirewallRequest(Request) == "SUCCESS");
+    Check(commands.Rules.Count == 1 && commands.Rules6.Count == 1);
+});
+Test("Linux expiry sweeps both iptables and ip6tables tables", () =>
+{
+    var commands = new FakeCommands();
+    commands.Rules.Add(Rule("MFA_Temp_8.8.8.8_22_TCP", 1));
+    commands.Rules.Add(Rule("MFA_Temp_8.8.8.8_2222_TCP", DateTimeOffset.UtcNow.AddHours(1).ToUnixTimeSeconds()));
+    commands.Rules6.Add(Rule6("MFA_Temp_2001:4860:4860::8888_22_TCP", 1));
+    commands.Rules6.Add(Rule6("MFA_Temp_2001:4860:4860::8888_2222_TCP", DateTimeOffset.UtcNow.AddHours(1).ToUnixTimeSeconds()));
+    Worker(commands).SweepExpiredRules();
+    Check(commands.Rules.Count == 1 && commands.Rules.Any(r => r.Contains("_2222_TCP")));
+    Check(commands.Rules6.Count == 1 && commands.Rules6.Any(r => r.Contains("_2222_TCP")));
+});
 Test("expired provisioning is cleared, but the password only when TOTP was never confirmed", () =>
 {
     var now = DateTime.UtcNow;
@@ -192,7 +223,7 @@ Test("expired provisioning is cleared, but the password only when TOTP was never
     // Already clean and expired: idempotent, reports no change on a second pass.
     Check(!DatabaseLockService.TryCleanExpiredProvisioning(neverConfirmed, now));
 });
-Console.WriteLine(failed == 0 ? "All 18 regression checks passed." : $"{failed} regression check(s) failed.");
+Console.WriteLine(failed == 0 ? "All 21 regression checks passed." : $"{failed} regression check(s) failed.");
 return failed == 0 ? 0 : 1;
 
 void Test(string name, Action action)
@@ -234,6 +265,8 @@ static FirewallWorkerService WorkerWithPrefix(FakeCommands commands, string pref
 }
 static string Rule(string name, long expiry)
     => $"-A INPUT -s 8.8.8.8/32 -p tcp -m tcp --dport 22 -m comment --comment \"{name} exp:{expiry}\" -j ACCEPT";
+static string Rule6(string name, long expiry)
+    => $"-A INPUT -s 2001:4860:4860::8888/128 -p tcp -m tcp --dport 22 -m comment --comment \"{name} exp:{expiry}\" -j ACCEPT";
 
 sealed class FakeCommands : IFirewallCommands
 {
@@ -243,6 +276,7 @@ sealed class FakeCommands : IFirewallCommands
     public bool FailDelete { get; init; }
     public bool IgnoreDelete { get; init; }
     public List<string> Rules { get; } = new();
+    public List<string> Rules6 { get; } = new();
     public HashSet<string> WindowsNames { get; } = new();
     public List<string> SeenScripts { get; } = new();
 
@@ -267,23 +301,27 @@ sealed class FakeCommands : IFirewallCommands
     public string Bash(string script)
     {
         SeenScripts.Add(script);
-        if (script == "iptables -S INPUT") return string.Join('\n', Rules);
-        if (script.StartsWith("iptables -D INPUT"))
+        foreach (var (table, rules, mask) in new (string, List<string>, string)[]
+                 { ("iptables", Rules, "32"), ("ip6tables", Rules6, "128") })
         {
-            if (FailDelete) throw new InvalidOperationException("Command failed with code 1");
-            if (!IgnoreDelete) Rules.Remove("-A INPUT" + script["iptables -D INPUT".Length..]);
-            return "";
-        }
-        if (script.StartsWith("iptables -I INPUT"))
-        {
-            if (FailInsert) throw new InvalidOperationException("Command failed with code 1");
-            if (!IgnoreInsert)
+            if (script == $"{table} -S INPUT") return string.Join('\n', rules);
+            if (script.StartsWith($"{table} -D INPUT"))
             {
-                var match = Regex.Match(script, @"-p (\w+) --dport (\d+) -s (\S+).*--comment '([^']+)'$");
-                if (!match.Success) throw new Exception("Unexpected insertion format");
-                Rules.Add($"-A INPUT -s {match.Groups[3].Value}/32 -p {match.Groups[1].Value} -m {match.Groups[1].Value} --dport {match.Groups[2].Value} -m comment --comment \"{match.Groups[4].Value}\" -j ACCEPT");
+                if (FailDelete) throw new InvalidOperationException("Command failed with code 1");
+                if (!IgnoreDelete) rules.Remove("-A INPUT" + script[$"{table} -D INPUT".Length..]);
+                return "";
             }
-            return "";
+            if (script.StartsWith($"{table} -I INPUT"))
+            {
+                if (FailInsert) throw new InvalidOperationException("Command failed with code 1");
+                if (!IgnoreInsert)
+                {
+                    var match = Regex.Match(script, @"-p (\w+) --dport (\d+) -s (\S+).*--comment '([^']+)'$");
+                    if (!match.Success) throw new Exception("Unexpected insertion format");
+                    rules.Add($"-A INPUT -s {match.Groups[3].Value}/{mask} -p {match.Groups[1].Value} -m {match.Groups[1].Value} --dport {match.Groups[2].Value} -m comment --comment \"{match.Groups[4].Value}\" -j ACCEPT");
+                }
+                return "";
+            }
         }
         throw new Exception("Unexpected firewall operation");
     }

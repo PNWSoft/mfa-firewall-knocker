@@ -1256,14 +1256,16 @@ namespace MFAAdmin
             }
             else
             {
-                // LINUX: read the iptables rules MFAService actually writes. An earlier version
-                // queried 'ipset list', which this service never populates, so diag always
-                // showed nothing regardless of how many sessions were open.
-                // The Linux rule comment carries only "<RulePrefix><ip>_<port> exp:<epoch>" --
-                // no username -- so that column is unavailable here, unlike on Windows.
-                Console.WriteLine("Querying iptables for active MFA sessions...\n");
+                // LINUX: read the iptables (IPv4) and ip6tables (IPv6) rules MFAService actually
+                // writes -- a grant can land in either table depending on the client's address
+                // family. An earlier version queried 'ipset list', which this service never
+                // populates, so diag always showed nothing regardless of how many sessions were
+                // open. The Linux rule comment carries only "<RulePrefix><ip>_<port> exp:<epoch>"
+                // -- no username -- so that column is unavailable here, unlike on Windows.
+                Console.WriteLine("Querying iptables/ip6tables for active MFA sessions...\n");
 
-                string rules = RunBash("iptables -S INPUT 2>/dev/null", out _);
+                string rules = RunBash("iptables -S INPUT 2>/dev/null", out _)
+                             + "\n" + RunBash("ip6tables -S INPUT 2>/dev/null", out _);
                 var mine = rules.Split('\n', StringSplitOptions.RemoveEmptyEntries)
                                 .Where(IsManagedRule)
                                 .ToList();
@@ -1388,39 +1390,46 @@ namespace MFAAdmin
                 }
                 else
                 {
-                    // LINUX: MFAService writes plain iptables rules tagged with RulePrefix -- it
-                    // never creates ipsets. An earlier version of this flushed 'auth_*' ipsets and
-                    // reported success unconditionally, so emergency revocation silently removed
-                    // nothing while telling the operator access was closed.
+                    // LINUX: MFAService writes plain iptables (IPv4) / ip6tables (IPv6) rules
+                    // tagged with RulePrefix -- it never creates ipsets. An earlier version of
+                    // this flushed 'auth_*' ipsets and reported success unconditionally, so
+                    // emergency revocation silently removed nothing while telling the operator
+                    // access was closed.
                     //
-                    // Mirror MFAService's sweeper: enumerate 'iptables -S INPUT' and delete each
-                    // matching rule by replaying it with -D instead of -A. Then RE-READ the chain
-                    // and report what actually happened rather than assuming it worked.
-                    string rules = RunBash("iptables -S INPUT 2>/dev/null", out _);
-                    int attempted = 0, failed = 0;
+                    // Mirror MFAService's sweeper: enumerate '<table> -S INPUT' for both tables
+                    // and delete each matching rule by replaying it with -D instead of -A. Then
+                    // RE-READ each chain and report what actually happened rather than assuming
+                    // it worked.
+                    int attempted = 0, failed = 0, remaining = 0;
 
-                    foreach (string line in rules.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+                    foreach (string table in new[] { "iptables", "ip6tables" })
                     {
-                        if (!line.TrimStart().StartsWith("-A INPUT")) continue;
-                        if (!IsManagedRule(line)) continue;
+                        string rules = RunBash($"{table} -S INPUT 2>/dev/null", out _);
 
-                        attempted++;
-                        RunBash("iptables " + line.TrimStart().Replace("-A INPUT", "-D INPUT"), out int rc);
-                        if (rc != 0) failed++;
+                        foreach (string line in rules.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+                        {
+                            if (!line.TrimStart().StartsWith("-A INPUT")) continue;
+                            if (!IsManagedRule(line)) continue;
+
+                            attempted++;
+                            RunBash($"{table} " + line.TrimStart().Replace("-A INPUT", "-D INPUT"), out int rc);
+                            if (rc != 0) failed++;
+                        }
+
+                        string after = RunBash($"{table} -S INPUT 2>/dev/null", out _);
+                        remaining += after.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                                          .Count(IsManagedRule);
                     }
-
-                    string after = RunBash("iptables -S INPUT 2>/dev/null", out _);
-                    int remaining = after.Split('\n', StringSplitOptions.RemoveEmptyEntries)
-                                         .Count(IsManagedRule);
 
                     if (remaining > 0)
                         AdminLogger.Error(
-                            $"[ERROR] {remaining} MFA-managed iptables rule(s) REMAIN after reset ({failed} delete(s) failed). " +
-                            "Access is still open. Remove them manually: iptables -S INPUT | grep " + RulePrefix);
+                            $"[ERROR] {remaining} MFA-managed iptables/ip6tables rule(s) REMAIN after reset ({failed} delete(s) failed). " +
+                            "Access is still open. Remove them manually: iptables -S INPUT | grep " + RulePrefix +
+                            " (and ip6tables -S INPUT for IPv6).");
                     else if (attempted == 0)
-                        AdminLogger.Log("[INFO] No MFA-managed iptables rules were present. Nothing to remove.");
+                        AdminLogger.Log("[INFO] No MFA-managed iptables/ip6tables rules were present. Nothing to remove.");
                     else
-                        AdminLogger.Log($"[SUCCESS] Removed {attempted} MFA-managed iptables rule(s); chain verified clear.");
+                        AdminLogger.Log($"[SUCCESS] Removed {attempted} MFA-managed iptables/ip6tables rule(s); chains verified clear.");
                 }
 
                 // Optional: Send an Audit Email that a global reset was triggered

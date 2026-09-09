@@ -1177,27 +1177,31 @@ public class FirewallWorkerService : BackgroundService
         }
         else
         {
-            // Linux: iptables-based implementation.
+            // Linux: iptables (IPv4) / ip6tables (IPv6) implementation. Which table depends on
+            // the grant's own address family -- ip is already validated/parsed upstream, so this
+            // reflects the family IsPublicIpAddress already accepted, not user-controlled text.
             // If your distro uses nftables, ufw, or firewalld instead, replace the
-            // iptables calls below with the equivalent commands for your backend.
+            // iptables/ip6tables calls below with the equivalent commands for your backend.
             // The rule name and expiry format used in the comment must stay consistent
             // with SweepExpiredRules so the sweeper can find and remove them.
+            string table    = LinuxTable(ip);
             string proto    = protocol.ToLowerInvariant();
             long   expEpoch = DateTimeOffset.UtcNow.AddHours(expirationHours).ToUnixTimeSeconds();
             string comment  = $"{ruleName} exp:{expEpoch}";
 
             // Upsert: remove any existing rule for this IP+port, then insert a fresh one.
             // iptables -I is not idempotent on its own — without the delete step it would
-            // stack duplicate rules on repeated logins from the same IP.
-            string existing = _commands.Bash("iptables -S INPUT");
+            // stack duplicate rules on repeated logins from the same IP. A prior rule for this
+            // exact ruleName is necessarily in the same table, since the name embeds this IP.
+            string existing = _commands.Bash($"{table} -S INPUT");
             foreach (string line in existing.Split('\n', StringSplitOptions.RemoveEmptyEntries))
             {
                 if (TryGetManagedRule(line, out var name, out _) && name == ruleName)
-                    DeleteLinuxRule(line);
+                    DeleteLinuxRule(table, line);
             }
 
-            _commands.Bash($"iptables -I INPUT -p {proto} --dport {port} -s {ip} -j ACCEPT -m comment --comment '{comment}'");
-            ServiceLogger.Debug($"[FIREWALL] iptables rule inserted in {fw.ElapsedMilliseconds}ms. Verifying...");
+            _commands.Bash($"{table} -I INPUT -p {proto} --dport {port} -s {ip} -j ACCEPT -m comment --comment '{comment}'");
+            ServiceLogger.Debug($"[FIREWALL] {table} rule inserted in {fw.ElapsedMilliseconds}ms. Verifying...");
 
             // Verify by scanning the rule list for our comment, not with `iptables -C`.
             // -C requires the specification to match exactly, including every match module, and
@@ -1205,17 +1209,22 @@ public class FirewallWorkerService : BackgroundService
             // comment therefore never matches a rule that exists, which reported every
             // successful Linux grant as [FAILED] while the rule was in fact present and working.
             // Scanning also matches how the upsert above and SweepExpiredRules locate rules.
-            string after = _commands.Bash("iptables -S INPUT");
+            string after = _commands.Bash($"{table} -S INPUT");
             bool verified = after
                 .Split('\n', StringSplitOptions.RemoveEmptyEntries)
                 .Any(l => TryGetManagedRule(l, out var name, out var expiry) && name == ruleName && expiry == expEpoch);
 
             if (verified)
-                ServiceLogger.Log($"[SUCCESS] iptables rule verified: {protocol}/{port} OPEN for {ip}.");
+                ServiceLogger.Log($"[SUCCESS] {table} rule verified: {protocol}/{port} OPEN for {ip}.");
             else
-                throw new InvalidOperationException($"iptables rule could not be verified: {protocol}/{port} for {ip}.");
+                throw new InvalidOperationException($"{table} rule could not be verified: {protocol}/{port} for {ip}.");
         }
     }
+
+    // ip is already validated/parsed by the caller (IsPublicIpAddress), so Parse here reflects an
+    // address family already accepted, never unvalidated user input.
+    private static string LinuxTable(string ip)
+        => System.Net.IPAddress.Parse(ip).AddressFamily == AddressFamily.InterNetworkV6 ? "ip6tables" : "iptables";
 
     internal static string RunPowerShell(string script)
     {
@@ -1330,25 +1339,23 @@ public class FirewallWorkerService : BackgroundService
         }
         else
         {
-            // Linux: parse 'iptables -S INPUT' and delete any of our rules whose
-            // stored expiry epoch has passed.  Update these commands if your distro
-            // uses nftables, ufw, or firewalld instead of iptables.
-            string rules = _commands.Bash("iptables -S INPUT");
-            if (string.IsNullOrWhiteSpace(rules))
-            {
-                ServiceLogger.Log("[SWEEPER] No iptables rules found.");
-                return;
-            }
-
+            // Linux: parse both 'iptables -S INPUT' (IPv4) and 'ip6tables -S INPUT' (IPv6) and
+            // delete any of our rules whose stored expiry epoch has passed. Grants can land in
+            // either table depending on the client's address family, so both must be swept every
+            // pass. Update these commands if your distro uses nftables, ufw, or firewalld instead.
             long nowEpoch = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
             int  count    = 0;
 
-            foreach (string line in rules.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+            foreach (string table in new[] { "iptables", "ip6tables" })
             {
-                if (!TryGetManagedRule(line, out var name, out var expiry) || nowEpoch < expiry) continue;
-                DeleteLinuxRule(line);
-                ServiceLogger.Log($"[SWEEPER] Expired iptables rule removed: {name}");
-                count++;
+                string rules = _commands.Bash($"{table} -S INPUT");
+                foreach (string line in rules.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+                {
+                    if (!TryGetManagedRule(line, out var name, out var expiry) || nowEpoch < expiry) continue;
+                    DeleteLinuxRule(table, line);
+                    ServiceLogger.Log($"[SWEEPER] Expired {table} rule removed: {name}");
+                    count++;
+                }
             }
 
             ServiceLogger.Log(count > 0
@@ -1372,13 +1379,13 @@ public class FirewallWorkerService : BackgroundService
         return true;
     }
 
-    private void DeleteLinuxRule(string line)
+    private void DeleteLinuxRule(string table, string line)
     {
         string rule = line.Trim();
-        _commands.Bash("iptables -D INPUT" + rule["-A INPUT".Length..]);
-        string remaining = _commands.Bash("iptables -S INPUT");
+        _commands.Bash($"{table} -D INPUT" + rule["-A INPUT".Length..]);
+        string remaining = _commands.Bash($"{table} -S INPUT");
         if (remaining.Split('\n', StringSplitOptions.RemoveEmptyEntries).Any(l => l.Trim() == rule))
-            throw new InvalidOperationException("iptables rule remains after deletion.");
+            throw new InvalidOperationException($"{table} rule remains after deletion.");
     }
 }
 

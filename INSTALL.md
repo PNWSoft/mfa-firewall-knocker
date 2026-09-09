@@ -39,10 +39,11 @@ Communication between MFAWeb and MFAService uses a **named pipe** (Windows) or *
 - A TLS certificate, obtained with an external ACME client such as certbot (see [TLS Options](#tls-options))
 
 > **Linux firewall backend note:** MFAService has separate Windows (PowerShell /
-> `NetSecurity`) and Linux (`iptables`) code paths built in. The default Linux
-> implementation uses `iptables`. If your distro uses `nftables`, `ufw`, or `firewalld`
-> instead, update the two clearly-marked sections in `OpenFirewallPort` and
-> `SweepExpiredRules` in `MFAService/Program.cs`. See [Linux Firewall Commands](#7-linux-firewall-commands).
+> `NetSecurity`) and Linux (`iptables`/`ip6tables`) code paths built in. The default Linux
+> implementation uses `iptables` for IPv4 grants and `ip6tables` for IPv6 ones. If your distro
+> uses `nftables`, `ufw`, or `firewalld` instead, update the clearly-marked sections in
+> `OpenFirewallPort` and `SweepExpiredRules` in `MFAService/Program.cs`, and MFAAdmin's `diag`/
+> `reset` — for both address families. See [Linux Firewall Commands](#7-linux-firewall-commands).
 
 > **SDK version note:** `global.json` pins the exact .NET SDK version used to build this
 > repo. That's for reproducible builds/testing, not a security requirement — feel free to
@@ -552,10 +553,11 @@ LockPersonality=true
 # Everything else in this unit was verified working together with a real end-to-end login on the
 # same host.
 
-# Narrowed to what this process actually does: manage iptables (NET_ADMIN/NET_RAW, and
-# NETLINK for the address family below) and own files across users (DAC_OVERRIDE, CHOWN,
-# FOWNER). CapabilityBoundingSet limits descendant processes too, including the iptables
-# subprocess this service shells out to -- test a real login end to end after applying this,
+# Narrowed to what this process actually does: manage iptables/ip6tables (NET_ADMIN/NET_RAW, and
+# NETLINK for the address family below -- the same capabilities cover both tables) and own files
+# across users (DAC_OVERRIDE, CHOWN, FOWNER). CapabilityBoundingSet limits descendant processes
+# too, including the iptables/ip6tables subprocess this service shells out to -- test a real login
+# end to end (both an IPv4 and an IPv6 client, if you have one) after applying this,
 # the same way INSTALL.md already asks for the gate itself (see "Verify the gate is actually
 # gating"), since a too-narrow set fails firewall commands rather than refusing to start.
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_DAC_OVERRIDE CAP_CHOWN CAP_FOWNER
@@ -680,32 +682,43 @@ Keep the `mfaipc` group limited to the web service account. Do not add it to the
 ### 7. Linux Firewall Commands
 
 MFAService contains separate code paths for Windows (PowerShell / `NetSecurity`) and
-Linux (`iptables`). The Linux path is active automatically when running on Linux — no
-source changes are required for a standard `iptables` setup.
+Linux (`iptables` for IPv4 grants, `ip6tables` for IPv6 ones). The Linux path is active
+automatically when running on Linux — no source changes are required for a standard
+`iptables`/`ip6tables` setup.
 
-Rules are tracked using an `iptables` comment that embeds the rule name and expiry
-timestamp (e.g. `MFA_Temp_1.2.3.4_22_TCP exp:1746000000`). The sweeper reads
-`iptables -S INPUT`, finds rules whose expiry has passed, and deletes them.
+Rules are tracked using an `iptables`/`ip6tables` comment that embeds the rule name and
+expiry timestamp (e.g. `MFA_Temp_1.2.3.4_22_TCP exp:1746000000`). Which table a grant's
+rule lands in is decided by the client's own address family, not a config setting. The
+sweeper reads `iptables -S INPUT` **and** `ip6tables -S INPUT` on every pass, finds rules
+whose expiry has passed in either table, and deletes them. `MFAAdmin diag`/`reset` read
+and clear both tables the same way.
 
-**If your distro uses a different firewall backend**, replace the `iptables` calls in
-the two clearly-commented sections of `MFAService/Program.cs`:
+**If your distro uses a different firewall backend**, replace the `iptables`/`ip6tables`
+calls in the clearly-commented sections of `MFAService/Program.cs`:
 
 - `OpenFirewallPort` — the `else` branch after the Windows block
 - `SweepExpiredRules` — the `else` branch after the Windows block
 
+and their mirrors in `MFAAdmin/Program.cs`'s `diag` and `reset` commands. Handle both
+address families in your replacement, not just IPv4 — nftables and firewalld both support
+mixed IPv4/IPv6 tables natively; ufw needs separate `ufw6`-style handling per its own docs.
+
 Example equivalents for common backends:
 
 ```bash
-# nftables
-nft add rule ip filter INPUT ip saddr 1.2.3.4 tcp dport 22 accept comment "MFA_Temp_1.2.3.4_22_TCP exp:1746000000"
-nft delete rule ip filter INPUT handle <handle>
+# nftables (a single 'inet' table handles both families)
+nft add rule inet filter INPUT ip saddr 1.2.3.4 tcp dport 22 accept comment "MFA_Temp_1.2.3.4_22_TCP exp:1746000000"
+nft add rule inet filter INPUT ip6 saddr 2001:db8::1 tcp dport 22 accept comment "MFA_Temp_2001:db8::1_22_TCP exp:1746000000"
+nft delete rule inet filter INPUT handle <handle>
 
 # ufw
 ufw allow from 1.2.3.4 to any port 22 proto tcp comment "MFA_Temp_1.2.3.4_22_TCP exp:1746000000"
+ufw allow from 2001:db8::1 to any port 22 proto tcp comment "MFA_Temp_2001:db8::1_22_TCP exp:1746000000"
 ufw delete allow from 1.2.3.4 to any port 22 proto tcp
 
-# List active MFA rules (iptables)
+# List active MFA rules (iptables / ip6tables)
 iptables -S INPUT | grep MFA_Temp
+ip6tables -S INPUT | grep MFA_Temp
 ```
 
 ---
@@ -974,12 +987,15 @@ nc -vz -w 5 your-host.example.com 51820      # UDP: use `nc -vzu`
 
 Then authenticate through MFAWeb from that address and repeat: it should now succeed, and fail
 again once the grant expires. A port that is reachable *before* you authenticate means the gate is
-not in the path.
+not in the path. On a dual-stack Linux host, run the test from both an IPv4 and an IPv6 client —
+they land in separate tables (`iptables` vs `ip6tables`) and a standing rule or blanket accept in
+one doesn't imply the same in the other.
 
 Inspect the rules directly too:
 
 ```bash
 sudo iptables -S INPUT     # look for any accept for the protected port that is not MFA_Temp_*
+sudo ip6tables -S INPUT    # same check for IPv6
 ip route get 8.8.8.8       # confirms which interface is internet-facing
 ```
 ```powershell

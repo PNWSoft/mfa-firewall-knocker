@@ -291,16 +291,17 @@ database, the other offers a login that always fails — but it is not useful ei
 - .NET 10 (runtime, or publish self-contained)
 - **Windows:** Windows Server 2019+, PowerShell 5.1+ with the `NetSecurity` module, and an Active
   Directory domain if you want to run MFAWeb under a gMSA
-- **Linux:** systemd, and `iptables` (see the note below)
+- **Linux:** systemd, and `iptables`/`ip6tables` (see the note below)
 - An SMTP relay with STARTTLS, for user provisioning emails and alerts. Plaintext SMTP is
   accepted only for an explicit loopback relay.
 - A TLS certificate for MFAWeb. MFAWeb is not an ACME client; obtain it with certbot (Linux)
   or win-acme (Windows). certbot `--standalone` needs port 80 reachable during issuance only.
 
-> **Linux firewall backends:** the built-in Linux path uses `iptables`. If your distro uses
-> `nftables`, `ufw`, or `firewalld`, adapt the two clearly-marked sections in `OpenFirewallPort` and
-> `SweepExpiredRules` in `MFAService/Program.cs`. See the Linux Firewall Commands section of
-> [INSTALL.md](INSTALL.md).
+> **Linux firewall backends:** the built-in Linux path uses `iptables` for IPv4 grants and
+> `ip6tables` for IPv6 ones. If your distro uses `nftables`, `ufw`, or `firewalld`, adapt the
+> clearly-marked sections in `OpenFirewallPort` and `SweepExpiredRules` in `MFAService/Program.cs`
+> (and their mirrors in `MFAAdmin/Program.cs`'s `diag`/`reset`) — for both address families, not
+> just IPv4. See the Linux Firewall Commands section of [INSTALL.md](INSTALL.md).
 
 ## Download
 

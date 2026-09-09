@@ -336,12 +336,14 @@ Tracked, understood, and not currently considered exploitable:
   look exactly as they would if it were working. There is no symptom, so it will not be noticed by
   accident. INSTALL.md has a "Verify the gate is actually gating" section; run it after install and
   after any firewall change.
-- **On Linux the rule is created with `iptables`, so a client connecting over public IPv6 gets no
-  rule.** Both sides accept a public IPv6 address as valid, but the `iptables` call cannot create a
-  v6 rule; MFAService reports the failure back over IPC, and MFAWeb shows a 503 ("Firewall service
-  is temporarily unavailable") rather than ACCESS GRANTED. It fails closed and reports that
-  accurately — the remaining gap is availability, not a false success. Until `ip6tables` support
-  exists, publish an A record only, or disable the IPv6 listener on Linux deployments.
+- **On Linux, a client connecting over public IPv6 gets an `ip6tables` rule, not `iptables`.**
+  `OpenFirewallPort` and `SweepExpiredRules` select the table by the grant's own address family;
+  MFAAdmin's `diag` and `reset` read and clear both tables. This closes the earlier gap where a
+  v6 client was accepted as valid but the (IPv4-only) `iptables` call failed, so MFAWeb returned a
+  503 instead of ACCESS GRANTED — it failed closed, but it failed. As of this change it has been
+  exercised by the automated regression suite, not yet confirmed against a real dual-stack client
+  and a real deployment the way the IPv4 path has been; treat it as implemented but not yet
+  field-verified until that happens.
 - **Email addresses with a quoted `|` in the local part cannot authenticate.** The IPC
   protocol is `|`-delimited and the privileged side rejects requests with the wrong field
   count, so such an address fails closed rather than open. Provisioning does not currently
