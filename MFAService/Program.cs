@@ -1781,8 +1781,15 @@ public class DatabaseLockService : BackgroundService
                 // itself informative, not just a no-op.
                 if (newCount <= cred.SignCount)
                 {
-                    ServiceLogger.Warn($"[SECURITY] Rejected non-increasing sign count for credential " +
-                        $"'{credentialId}': stored={cred.SignCount}, received={newCount}.");
+                    // SignCount is a uint, so stored=0 forces received=0 too -- this branch, not a
+                    // regression. Most platform authenticators (Windows Hello, iCloud Keychain,
+                    // Android) never implement a counter and always report 0, so this is routine,
+                    // not a clone signal; only a *nonzero* count that fails to advance is one.
+                    if (cred.SignCount == 0)
+                        ServiceLogger.Debug($"[DB] Credential '{credentialId}' reports no sign counter (0).");
+                    else
+                        ServiceLogger.Warn($"[SECURITY] Rejected non-increasing sign count for credential " +
+                            $"'{credentialId}': stored={cred.SignCount}, received={newCount}.");
                     return "SUCCESS"; // detection, not prevention -- do not block the login over this
                 }
                 cred.SignCount = newCount;
