@@ -543,11 +543,14 @@ RestrictSUIDSGID=true
 RestrictRealtime=true
 LockPersonality=true
 
-# Deliberately NOT set: ProtectProc=invisible. Verified directly against a live host -- with
-# every other directive above applied, adding this one alone makes systemd wait forever for the
-# Type=notify readiness signal this app's AddSystemd() call sends, so the unit never leaves
-# "activating" and cycles through StartLimitBurst until it gives up. Everything else in this
-# unit was verified working together with a real end-to-end login on the same host.
+# Deliberately NOT set: ProtectProc=invisible. Verified directly against a live host (Ubuntu
+# 24.04, kernel 6.8, systemd 255) -- with every other directive above applied, adding this one
+# alone makes systemd wait forever for the Type=notify readiness signal this app's AddSystemd()
+# call sends, so the unit never leaves "activating" and cycles through StartLimitBurst until it
+# gives up. This maps to procfs's hidepid=invisible (systemd 247+, kernel 5.8+), not an Ubuntu
+# quirk -- Debian 12 and RHEL 9 both clear those thresholds too, so expect the same failure there.
+# Everything else in this unit was verified working together with a real end-to-end login on the
+# same host.
 
 # Narrowed to what this process actually does: manage iptables (NET_ADMIN/NET_RAW, and
 # NETLINK for the address family below) and own files across users (DAC_OVERRIDE, CHOWN,
