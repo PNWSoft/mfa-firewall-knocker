@@ -10,11 +10,13 @@
       deployment and makes logs look careless.
 
       ContinuousIntegrationBuild normalises embedded paths to deterministic, repository-relative
-      ones. It also makes builds reproducible, which matters for a signed security tool: two people
-      building the same commit should be able to compare hashes.
+      ones. Together with the pinned SDK, lock files, and reproducibility CI job, this lets two
+      people building the same commit compare the managed assembly hashes. CI supplies the
+      immutable Git commit as SourceRevisionId, which the SDK appends to InformationalVersion.
     -->
     <ContinuousIntegrationBuild>true</ContinuousIntegrationBuild>
     <Deterministic>true</Deterministic>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
 
     <!-- Stack traces stay useful; only the recorded paths change. -->
     <DebugType>portable</DebugType>

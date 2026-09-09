@@ -91,6 +91,8 @@ namespace MFAAdmin
         // True once the user has visited the setup page and scanned their QR code.
         // MFAAdmin sets this to false on add/reprovision; BurnTotpToken sets it to true.
         public bool TotpConfirmed { get; set; } = false;
+        // Preserve the service's replay watermark on every unrelated admin DB write.
+        public long? LastAcceptedTotpTimeStep { get; set; }
         public string? ProvisioningToken { get; set; }
         public DateTime? ProvisioningExpiresUtc { get; set; }
         public List<StoredPasskeyCredential> PasskeyCredentials { get; set; } = new();
@@ -113,7 +115,8 @@ namespace MFAAdmin
 
     class Program
     {
-        // Cross-process mutex — shared by MFAWeb, MFAService, and MFAAdmin to serialize all DB reads/writes.
+        // Cross-process mutex — shared by MFAService and MFAAdmin, the only two writers, to serialize
+        // their writes. MFAWeb never writes the store and does not participate in this mutex.
         // ACL-restricted so only SYSTEM, Builtin Administrators, and the gMSA can acquire it.
         // Initialized in Main() after config is loaded so the service account name comes from appsettings.
         private static System.Threading.Mutex _dbMutex = null!;
@@ -157,6 +160,11 @@ namespace MFAAdmin
         private static string SiteName => Config?["SiteName"] ?? "MFA Auth";
 
         private static string RulePrefix => Config?["RulePrefix"] ?? "MFA_Temp_";
+
+        // Defence in depth: RulePrefix comes from appsettings.json, not user input, but it's
+        // interpolated into single-quoted PowerShell strings, so a stray "'" in a misconfigured
+        // value would break out of that quoting. Use this, never the raw property, in PowerShell.
+        private static string RulePrefixPsEscaped => RulePrefix.Replace("'", "''");
 
         // TOTP support is a COMPILE-TIME decision (-p:AllowTotp=true), not a config value, so
         // it cannot drift out of step with MFAWeb at runtime. Without the flag no TOTP secret
@@ -248,12 +256,11 @@ namespace MFAAdmin
             if (cleanArgs.Length == 0)
             {
                 var _asm = Assembly.GetExecutingAssembly();
-                var _ver = _asm.GetName().Version?.ToString(3) ?? "unknown";
-                var _built = _asm.GetCustomAttributes<AssemblyMetadataAttribute>()
-                    .FirstOrDefault(a => a.Key == "BuildDate")?.Value ?? "unknown";
+                var _ver = _asm.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion
+                           ?? _asm.GetName().Version?.ToString(3) ?? "unknown";
                 Console.WriteLine("========================================");
                 Console.WriteLine($"       {SiteName} MFA Admin Tool          ");
-                Console.WriteLine($"       v{_ver}  |  Built {_built} UTC");
+                Console.WriteLine($"       v{_ver}");
                 Console.WriteLine("========================================");
                 Console.WriteLine("Usage: MFAAdmin [add|list|delete|diag|reset|reprovision|export|import|purge-totp] [username|filepath]");
                 return;
@@ -419,12 +426,28 @@ namespace MFAAdmin
             throw new InvalidOperationException($"Smtp:Port value '{v}' is not a valid port (1-65535).");
         }
 
-        static bool SmtpUseSsl()
+        static bool SmtpUseSsl(string host)
         {
             string? v = Config["Smtp:UseSsl"];
-            if (string.IsNullOrWhiteSpace(v)) return false;
-            if (bool.TryParse(v, out var b)) return b;
-            throw new InvalidOperationException($"Smtp:UseSsl value '{v}' is not true or false.");
+            if (string.IsNullOrWhiteSpace(v)) return true;
+            if (!bool.TryParse(v, out var b))
+                throw new InvalidOperationException($"Smtp:UseSsl value '{v}' is not true or false.");
+
+            if (!b && !IsLoopbackSmtpHost(host))
+                throw new InvalidOperationException(
+                    "Smtp:UseSsl may be false only for a loopback SMTP relay (localhost, 127.0.0.0/8, or ::1).");
+
+            return b;
+        }
+
+        static bool IsLoopbackSmtpHost(string host)
+        {
+            string candidate = host.Trim().TrimEnd('.');
+            if (candidate.Equals("localhost", StringComparison.OrdinalIgnoreCase)) return true;
+
+            candidate = candidate.TrimStart('[').TrimEnd(']');
+            return System.Net.IPAddress.TryParse(candidate, out var address)
+                && System.Net.IPAddress.IsLoopback(address);
         }
 
         static bool SendProvisioningEmail(string userEmail, string tempPassword, string totpUrl, string passkeyUrl)
@@ -440,7 +463,7 @@ namespace MFAAdmin
             {
                 host = SmtpRequired("Host");
                 port = SmtpPort();
-                useSsl = SmtpUseSsl();
+                useSsl = SmtpUseSsl(host);
                 smtpUsername = Config["Smtp:Username"];
                 smtpPassword = Config["Smtp:Password"];
                 fromAddress = SmtpRequired("FromAddress");
@@ -543,6 +566,7 @@ namespace MFAAdmin
 
                     u.TotpSecret    = "";
                     u.TotpConfirmed = false;
+                    u.LastAcceptedTotpTimeStep = null;
                     cleared++;
                 }
 
@@ -601,6 +625,7 @@ namespace MFAAdmin
                 user.PasswordHash              = newPasswordHash;
                 user.TotpSecret                = newBase32Secret;
                 user.TotpConfirmed             = false;
+                user.LastAcceptedTotpTimeStep   = null;
                 user.ProvisioningToken         = TotpEnabled ? newTotpToken : null;
                 user.ProvisioningExpiresUtc    = TotpEnabled ? expiresUtc : (DateTime?)null;
                 user.PasskeyCredentials        = new();
@@ -665,8 +690,40 @@ namespace MFAAdmin
                 using (AcquireDbLock()) { users = LoadUsers(); }
 
                 string json = JsonSerializer.Serialize(users, new JsonSerializerOptions { WriteIndented = true });
-                File.WriteAllText(outputPath, json, Encoding.UTF8);
+
+                // This file holds password hashes, TOTP secrets, and any live provisioning tokens
+                // in the clear -- restrict it from the instant it exists rather than tightening it
+                // afterward. FileMode.CreateNew also refuses to follow an existing file or symlink
+                // at this path instead of silently overwriting it.
+                using (var stream = new FileStream(outputPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+                {
+                    // The handle overload, not the path overload: it chmods the descriptor already
+                    // open above instead of re-resolving outputPath on disk, which would reopen a
+                    // symlink-race window between CreateNew and the chmod.
+                    if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                        File.SetUnixFileMode(stream.SafeFileHandle, UnixFileMode.UserRead | UnixFileMode.UserWrite); // 600
+                    else
+                    {
+                        // FileInfo.SetAccessControl, not the handle-based FileStream overload: the
+                        // stream above was opened without WRITE_DAC, so SetSecurityInfo on that
+                        // handle fails even when elevated. FileInfo opens its own handle instead.
+                        var security = new FileSecurity();
+                        security.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
+                        security.AddAccessRule(new FileSystemAccessRule(
+                            WindowsIdentity.GetCurrent().User!, FileSystemRights.FullControl, AccessControlType.Allow));
+                        new FileInfo(outputPath).SetAccessControl(security);
+                    }
+
+                    byte[] bytes = Encoding.UTF8.GetBytes(json);
+                    stream.Write(bytes, 0, bytes.Length);
+                }
+
                 AdminLogger.Log($"[SUCCESS] Exported {users.Count} user(s) to '{Path.GetFullPath(outputPath)}'");
+            }
+            catch (IOException) when (File.Exists(outputPath))
+            {
+                AdminLogger.Error($"[ERROR] Export failed: '{Path.GetFullPath(outputPath)}' already exists. " +
+                    "Remove it or choose a different path -- export refuses to write through an existing file.");
             }
             catch (Exception ex)
             {
@@ -699,6 +756,16 @@ namespace MFAAdmin
                 AdminLogger.Error($"[ERROR] Failed to parse import file: {ex.Message}");
                 return;
             }
+
+            // An imported file is untrusted input -- a tampered or hand-edited one could set
+            // PasskeyRegistrationReady=true directly, paired with any token, and skip the password
+            // gate at the next registration attempt. Force it false unconditionally on import; a
+            // legitimate pending registration just re-does the password step.
+            int strippedReady = imported.Count(u => u.PasskeyRegistrationReady);
+            foreach (var u in imported) u.PasskeyRegistrationReady = false;
+            if (strippedReady > 0)
+                Console.WriteLine($"  Note: cleared PasskeyRegistrationReady on {strippedReady} record(s) -- " +
+                    "imported data cannot claim that state directly.");
 
             int existingCount;
             using (AcquireDbLock()) { existingCount = LoadUsers().Count; }
@@ -811,12 +878,79 @@ namespace MFAAdmin
             if (removed > 0)
             {
                 AdminLogger.Log($"[SUCCESS] User '{username}' deleted.");
-                AuditNotify("USER DELETED", $"User '{username}' was removed. All VPN/SSH access revoked.");
+
+                // Deleting the account doesn't touch a firewall rule already open for this user --
+                // it persists until it naturally expires. Say only what actually happened.
+                string revocationNote;
+                if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                {
+                    int revoked = RevokeWindowsRulesForUser(username);
+                    revocationNote = revoked > 0
+                        ? $"{revoked} active firewall rule(s) for this user were also removed."
+                        : "No active firewall rule was found for this user to remove.";
+                }
+                else
+                {
+                    // Unlike Windows, the Linux iptables comment carries no username (see
+                    // OpenFirewallPort), so there's no way to find "this user's rules" here.
+                    revocationNote = "Any active firewall rule for this user was NOT removed -- " +
+                        "Linux rules are not tracked by username. It will expire naturally " +
+                        "(within ExpirationHours) or can be found and removed by IP via 'diag'.";
+                }
+                // Closing the firewall only blocks *new* connections -- it doesn't end a session
+                // this user already has established (see README.md's "Revoking access does not
+                // end active sessions").
+                const string sessionCaveat = "This closes the firewall to new connections. It does " +
+                    "NOT end any session, tunnel, or process this user already has running. If " +
+                    "removing them needs to be immediate and complete, separately verify -- and if " +
+                    "necessary terminate -- their existing sessions on every system they could reach.";
+                AdminLogger.Log($"[INFO] {revocationNote} {sessionCaveat}");
+                AuditNotify("USER DELETED",
+                    $"User '{username}' was removed from the database. {revocationNote} {sessionCaveat}");
             }
             else
             {
                 AdminLogger.Error($"[ERROR] User '{username}' not found.");
             }
+        }
+
+        // Windows only: MFAService writes each rule's Description as "User: <email> Exp: <time>"
+        // (see OpenFirewallPort), so a targeted per-user revocation is possible there in a way
+        // it currently is not on Linux. Returns the number of rules removed.
+        static int RevokeWindowsRulesForUser(string username)
+        {
+            string psQuery = $"-NoProfile -Command \"Get-NetFirewallRule -DisplayName '{RulePrefixPsEscaped}*' " +
+                "-ErrorAction SilentlyContinue | ForEach-Object { $_.Name + '||' + $_.Description }\"";
+            var queryPsi = new ProcessStartInfo("powershell", psQuery)
+            {
+                RedirectStandardOutput = true, UseShellExecute = false, CreateNoWindow = true
+            };
+            using var queryProc = Process.Start(queryPsi);
+            if (queryProc is null) return 0;
+            string output = queryProc.StandardOutput.ReadToEnd();
+            queryProc.WaitForExit();
+
+            int removed = 0;
+            foreach (string line in output.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+            {
+                var parts = line.Split("||", 2);
+                if (parts.Length != 2) continue;
+                string ruleName = parts[0].Trim();
+                // Same shape diag already parses: "User: someone@example.com Exp: ...".
+                var match = Regex.Match(parts[1], @"User:\s*(?<user>\S+)\s+Exp:");
+                if (!match.Success || !match.Groups["user"].Value.Equals(username, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                var removePsi = new ProcessStartInfo("powershell",
+                    $"-NoProfile -Command \"Remove-NetFirewallRule -Name '{ruleName}' -ErrorAction SilentlyContinue\"")
+                {
+                    CreateNoWindow = true, UseShellExecute = false
+                };
+                using var removeProc = Process.Start(removePsi);
+                removeProc?.WaitForExit();
+                removed++;
+            }
+            return removed;
         }
 
         // --- Core Security & OS-Aware IO ---
@@ -966,7 +1100,7 @@ namespace MFAAdmin
             {
                 host = SmtpRequired("Host");
                 port = SmtpPort();
-                useSsl = SmtpUseSsl();
+                useSsl = SmtpUseSsl(host);
                 username = Config["Smtp:Username"];
                 password = Config["Smtp:Password"];
                 fromAddress = SmtpRequired("FromAddress");
@@ -1056,7 +1190,7 @@ namespace MFAAdmin
                 Console.WriteLine($"{"IP Address",-15} | {"Port",-6} | {"User",-25} | {"Expires (Local)",-20}");
                 Console.WriteLine(new string('-', 75));
 
-                string psCommand = $"-NoProfile -Command \"Get-NetFirewallRule -DisplayName '{RulePrefix}*' -ErrorAction SilentlyContinue | ForEach-Object {{ $_.DisplayName + '||' + $_.Description }}\"";
+                string psCommand = $"-NoProfile -Command \"Get-NetFirewallRule -DisplayName '{RulePrefixPsEscaped}*' -ErrorAction SilentlyContinue | ForEach-Object {{ $_.DisplayName + '||' + $_.Description }}\"";
 
                 var psi = new ProcessStartInfo("powershell", psCommand)
                 {
@@ -1131,7 +1265,7 @@ namespace MFAAdmin
 
                 string rules = RunBash("iptables -S INPUT 2>/dev/null", out _);
                 var mine = rules.Split('\n', StringSplitOptions.RemoveEmptyEntries)
-                                .Where(l => l.Contains(RulePrefix))
+                                .Where(IsManagedRule)
                                 .ToList();
 
                 if (mine.Count == 0)
@@ -1202,6 +1336,18 @@ namespace MFAAdmin
             return output;
         }
 
+        // Matches MFAService's own parsing exactly: the rule name is whatever the quoted comment
+        // says, not any text elsewhere on the line. A prior substring match against RulePrefix
+        // could delete an unrelated operator rule whose IP, port, or comment contained that text.
+        static readonly Regex ManagedRuleComment =
+            new(@"(?:^|\s)--comment ""(?<name>[^""]+) exp:\d+""(?:\s|$)", RegexOptions.Compiled);
+
+        static bool IsManagedRule(string iptablesLine)
+        {
+            var match = ManagedRuleComment.Match(iptablesLine);
+            return match.Success && match.Groups["name"].Value.StartsWith(RulePrefix, StringComparison.Ordinal);
+        }
+
         static void ResetFirewall()
         {
             Console.WriteLine("\n[WARNING] This removes every MFA-granted firewall rule.");
@@ -1226,7 +1372,7 @@ namespace MFAAdmin
                 if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
                 {
                     // WINDOWS: Delete all temporary Web API rules
-                    string psCommand = $"-NoProfile -Command \"Remove-NetFirewallRule -DisplayName '{RulePrefix}*' -ErrorAction SilentlyContinue\"";
+                    string psCommand = $"-NoProfile -Command \"Remove-NetFirewallRule -DisplayName '{RulePrefixPsEscaped}*' -ErrorAction SilentlyContinue\"";
 
                     var psi = new ProcessStartInfo("powershell", psCommand)
                     {
@@ -1255,8 +1401,8 @@ namespace MFAAdmin
 
                     foreach (string line in rules.Split('\n', StringSplitOptions.RemoveEmptyEntries))
                     {
-                        if (!line.Contains(RulePrefix)) continue;
                         if (!line.TrimStart().StartsWith("-A INPUT")) continue;
+                        if (!IsManagedRule(line)) continue;
 
                         attempted++;
                         RunBash("iptables " + line.TrimStart().Replace("-A INPUT", "-D INPUT"), out int rc);
@@ -1265,7 +1411,7 @@ namespace MFAAdmin
 
                     string after = RunBash("iptables -S INPUT 2>/dev/null", out _);
                     int remaining = after.Split('\n', StringSplitOptions.RemoveEmptyEntries)
-                                         .Count(l => l.Contains(RulePrefix));
+                                         .Count(IsManagedRule);
 
                     if (remaining > 0)
                         AdminLogger.Error(

@@ -21,13 +21,15 @@ It's port knocking, except the knock is WebAuthn instead of a magic packet seque
 
 ## Why this exists
 
-SSH and WireGuard authenticate a *key*. Neither can answer the question that actually matters:
+WireGuard and conventional file-backed SSH credentials authenticate a *key*. They do not answer
+the question that actually matters:
 
 > **Is the authorized user the one using this key, right now?**
 
-Possession is the whole test. A copied WireGuard profile or a leaked `id_ed25519` passes it
-forever, from anywhere, and the protocol has no way to notice — which is why detecting key
-theft after the fact tends to be guesswork.
+Possession is the whole test for those files. A copied WireGuard profile or conventional
+`id_ed25519` passes from anywhere until it is revoked, and copying it does not alert the protocol.
+OpenSSH FIDO credentials (`sk-ecdsa-*` and `sk-ssh-ed25519-*`) are an existing alternative for
+SSH: their local key handles require the security key and can require touch or PIN verification.
 
 This project answers that question *before the protocol ever sees a packet*. The port is
 closed by default; it opens only for the source IP of someone who just proved who they are
@@ -46,10 +48,10 @@ Multi-factor authentication for remote network access is a control that turns up
 is checking: cyber-insurance questionnaires, NIST SP 800-171 (3.5.3) and therefore CMMC, PCI-DSS,
 and most SOC 2 programs.
 
-**A WireGuard profile or an SSH key does not satisfy it.** It is a single factor — *something you
-have* — and possession of the file is the entire test. Putting a passkey in front of the port adds
-a genuinely independent second factor: the enrolled device, plus the user's biometric or PIN,
-verified at the moment of access rather than once at enrolment.
+**A WireGuard profile or conventional file-backed SSH key is one possession factor.** OpenSSH
+FIDO keys can already add hardware presence and user verification for SSH. Putting this gate in
+front of a port adds an independent WebAuthn ceremony for WireGuard, conventional SSH keys, and
+other services, verified at the moment of access rather than only at enrollment.
 
 Whether that satisfies your particular auditor, carrier or program is a question only they can
 answer, and this project makes no compliance claim on your behalf. But if you have been asked
@@ -157,18 +159,20 @@ than trusting its caller.
 - **No account lockout by design** — usernames are email addresses and therefore guessable, so
   lockout would be a trivial DoS. Throttling is per-IP; failed logins are detected and alerted on
   instead
-- **In the default passkey-only build, the user store holds no usable secret.** Passkey
-  credentials are **public keys** — that is the point of WebAuthn — and because TOTP is not
-  compiled in, no shared secret exists to write. The file holds a user list, BCrypt password
-  hashes, and public key material. That makes **write** access the risk that matters rather than
-  read: anyone who can modify the file can enrol their own passkey. It is what INSTALL.md's
-  permission steps exist to prevent. Both platforms serialise access through a cross-process
-  mutex, and the internet-facing MFAWeb can never write it
+- **In the default passkey-only build, enrolled passkeys add no private key to the user store.**
+  The file holds public keys and a user list. Alongside a one-time enrollment password —
+  a bootstrap credential checked exactly once, at registration, never used to log in, and
+  regenerated fresh by every `add` or `reprovision` — enrollment and reprovisioning also mint a
+  short-lived registration token and readiness state. Both read and write access need
+  protection: a reader can disclose hashes or race an active enrollment, while a writer can
+  enroll their own credential. MFAService and MFAAdmin — the only two writers — serialize
+  against each other through a cross-process mutex; the internet-facing MFAWeb never writes the
+  store directly, and reads it without that same serialization
 - **Building with `-p:AllowTotp=true` changes that**, and it is the main reason the flag is not
   the default. TOTP verification is `HMAC-SHA1(secret, timestep)`, so the server must keep each
   shared secret in recoverable form — it cannot be hashed, because a hash cannot generate codes.
-  A store that was worth nothing to an attacker becomes one that yields a working second factor
-  for every enrolled user, so with TOTP enabled **read** access matters as much as write. The
+  This adds immediately usable shared authenticator secrets to the account, hash, and enrollment
+  data already present, so with TOTP enabled **read** access has a much larger blast radius. The
   store is DPAPI-encrypted on Windows and plain JSON on Linux; weigh that especially carefully on
   Linux. See [SECURITY.md](SECURITY.md) for the full comparison
 - **TLS cert resilience on both platforms** — Windows selects from the certificate store by CN
@@ -196,12 +200,16 @@ authenticator with user verification** — the built-in kind, unlocked by biomet
 
 | Setting | Value | Consequence |
 |---------|-------|-------------|
-| `AuthenticatorAttachment` | `Platform` | Only built-in authenticators: Windows Hello, Touch ID / Face ID, Android biometric. **Roaming security keys — YubiKey, Titan, SoloKeys — are rejected at registration.** |
+| `AuthenticatorAttachment` | `Platform` | Only built-in authenticators: Windows Hello, Touch ID / Face ID, Android biometric. **The browser refuses a roaming security key — YubiKey, Titan, SoloKeys — at registration.** This is client-enforced, not server-verified: with `attestationPreference: None` the server has no attestation statement to check attachment type against, so it's trusting the browser's own ceremony, not independently confirming what registered. The registrant only weakens their own account by working around it, so the practical risk is low — but it means this line is a request the client honors, not a guarantee the server can make on its own. |
 | `UserVerification` | `Required` | Biometric or device PIN on **every** registration and **every** login. A tap-only key is not enough. Enforced server-side on each assertion. |
 | `RequireResidentKey` | `false` | Non-discoverable credential: the user types their email address first. No usernameless "just tap" login. |
 | `attestationPreference` | `None` | The server does not verify authenticator make or model. |
 
 Set in `MFAWeb/Program.cs` (registration options and assertion options).
+
+This policy requires a platform authenticator and user verification, but it does not establish
+that a credential is hardware-bound or non-exportable. Passkey portability, backup, and account
+recovery follow the selected platform or credential provider.
 
 This works out of the box on **iOS/iPadOS, macOS (Touch ID / Face ID), Windows Hello, and
 Android**.
@@ -233,17 +241,18 @@ Practical consequences to plan for:
 
 Two independent reasons.
 
-**Codes are phishable and replayable.** A captured code stays valid for roughly 90 seconds, and
-an account is only as strong as its weakest enrolled method — so leaving TOTP available means the
-passkey buys you little.
+**Codes are phishable and time-sensitive.** A captured, unused code stays valid for roughly 90
+seconds. This implementation persists the accepted time-step and rejects a second use, but an
+attacker who submits a captured code first can still win the race. An account is only as strong as
+its weakest enrolled method, so leaving TOTP available gives up much of the passkey's protection.
 
 **The server must store the secret in the clear.** This one is inherent to the protocol, not to
 this implementation. Verifying a code means computing `HMAC-SHA1(secret, timestep)` and comparing,
 so the server needs the shared secret in recoverable form. You cannot hash it like a password —
 a hash cannot generate codes. Encrypting the store helps against theft of the file alone, but the
 service has to decrypt it to work, so the material stays recoverable. Enabling TOTP therefore
-turns the user database from something an attacker gains nothing from — WebAuthn credentials are
-public keys — into something that yields valid second factors for every enrolled user at once.
+turns a database breach that exposes account, hash, and enrollment data but no private WebAuthn
+key into one that also yields valid second factors for every TOTP-enrolled user at once.
 See [SECURITY.md](SECURITY.md) for the full comparison.
 
 **TOTP is therefore a compile-time decision, not a setting.** By default it is not built at
@@ -255,7 +264,7 @@ all:
   `BURN_TOTP_TOKEN` IPC verb.
 - `MFAAdmin add` and `reprovision` **mint no TOTP secret**, and the provisioning email omits
   the authenticator-app link. `users.dat` holds no recoverable shared secret — only passkey
-  public keys and BCrypt hashes.
+  public keys, account data, BCrypt hashes, and any short-lived enrollment state.
 
 There is no configuration key to get this wrong, nothing to leave in the weaker state by
 mistake, and no second code path for a reviewer to audit.
@@ -283,7 +292,8 @@ database, the other offers a login that always fails — but it is not useful ei
 - **Windows:** Windows Server 2019+, PowerShell 5.1+ with the `NetSecurity` module, and an Active
   Directory domain if you want to run MFAWeb under a gMSA
 - **Linux:** systemd, and `iptables` (see the note below)
-- An SMTP relay, for user provisioning emails and alerts
+- An SMTP relay with STARTTLS, for user provisioning emails and alerts. Plaintext SMTP is
+  accepted only for an explicit loopback relay.
 - A TLS certificate for MFAWeb. MFAWeb is not an ACME client; obtain it with certbot (Linux)
   or win-acme (Windows). certbot `--standalone` needs port 80 reachable during issuance only.
 
@@ -426,8 +436,10 @@ They do not remove the need for a second way in.
 
 ## Revoking access does not end active sessions
 
-Rules disappear two ways: they expire, or an admin runs `MFAAdmin reset`. Both **close the
-firewall to new connections**. Neither reliably ends a session that is already connected.
+Rules disappear a few ways: they expire, an admin runs `MFAAdmin reset`, or (on Windows)
+`MFAAdmin delete` removes a deleted user's own rules as part of removing the account. All of
+them **close the firewall to new connections**. None reliably ends a session that is already
+connected.
 
 Whether an established session survives depends on your platform, your firewall, and what is
 listening behind the port — and a client reaching that port through some *other* rule (a
@@ -450,13 +462,19 @@ revoke, you know whether you have closed the door or actually removed the person
 
 ## Security notes
 
-- The user database stores **TOTP secrets in recoverable form** (they have to be, to validate
-  codes). Protect the file with the filesystem permissions documented in INSTALL.md. Passkey
-  credentials are public keys and are not sensitive — passkeys are the stronger option for this
-  reason, among others.
+- The user database stores **TOTP secrets in recoverable form** when TOTP is compiled in. In the
+  default build, passkey credentials are public keys, but usernames, the current one-time
+  enrollment password hash, and active enrollment tokens still make the database confidential.
+  Protect it with the filesystem permissions documented in INSTALL.md.
 - Firewall rules expire after `ExpirationHours`; the sweeper runs every 5 minutes.
-- Passkey registration always requires proof of password or a post-login token. That check is a
-  deliberate invariant rather than an incidental one — treat any change to that path with care.
+- Passkey registration always requires proof of the enrollment password or a post-login token —
+  in the default passkey-only build that password is never anything else: it's checked once, at
+  registration, then burned on success or once its 60-minute window expires unused, whichever
+  comes first. **That changes once an account confirms TOTP** — from then on the same password is
+  also that account's persistent login credential, checked on every `/auth` request, and stops
+  being burned by either path. The registration check itself doesn't change; what the field means
+  afterward does. That check is a deliberate invariant rather than an incidental one — treat any
+  change to that path with care.
 - This software is provided as-is under the MIT license, with no warranty. It manipulates firewall
   rules on a privileged host. **Review the code and test in a non-production environment first.**
 

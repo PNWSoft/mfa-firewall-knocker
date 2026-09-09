@@ -38,9 +38,22 @@ var builder = WebApplication.CreateBuilder(args);
 
 // --- Security: Rate Limiting ---
 int rateLimitPerWindow = builder.Configuration.GetValue<int>("RateLimitPerWindow", 20);
+// Backstop across every partition combined, so partitioning (see RateLimitPartitionKey below)
+// isn't the only thing standing between the login endpoints and a flood. Deliberately generous --
+// sized well above what a real login burst from a few legitimate users would produce.
+int globalRateLimitPerWindow = builder.Configuration.GetValue<int>("GlobalRateLimitPerWindow", 200);
 builder.Services.AddRateLimiter(options =>
 {
     options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+
+    options.GlobalLimiter = System.Threading.RateLimiting.PartitionedRateLimiter.Create<HttpContext, string>(_ =>
+        RateLimitPartition.GetFixedWindowLimiter("global", _ =>
+            new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = globalRateLimitPerWindow,
+                Window = TimeSpan.FromMinutes(5),
+                QueueLimit = 0
+            }));
 
     options.AddPolicy("LoginRateLimit", httpContext =>
     {
@@ -49,7 +62,7 @@ builder.Services.AddRateLimiter(options =>
         // their IP and bypass rate limiting and the public-IP enforcement below.
         // By design, MFAWeb is deployed directly on the internet without a reverse
         // proxy so that Connection.RemoteIpAddress is always the true client address.
-        string clientIp = httpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+        string clientIp = RateLimitPartitionKey(httpContext.Connection.RemoteIpAddress);
 
         return RateLimitPartition.GetFixedWindowLimiter(clientIp, _ =>
             new FixedWindowRateLimiterOptions
@@ -60,6 +73,21 @@ builder.Services.AddRateLimiter(options =>
             });
     });
 });
+
+// A residential IPv6 allocation is often a whole /56 or /64 -- partitioning on the full 128-bit
+// address lets an attacker get a fresh bucket on every request just by flipping host bits. Bucket
+// IPv6 on the /56 prefix instead. IPv4 addresses are scarce enough that the full address is fine.
+static string RateLimitPartitionKey(System.Net.IPAddress? address)
+{
+    if (address == null) return "unknown";
+    if (address.IsIPv4MappedToIPv6) address = address.MapToIPv4();
+    if (address.AddressFamily != System.Net.Sockets.AddressFamily.InterNetworkV6)
+        return address.ToString();
+
+    byte[] bytes = address.GetAddressBytes();
+    return "v6:" + Convert.ToHexString(bytes, 0, 7); // first 56 bits
+}
+
 builder.Services.AddAntiforgery();
 // Required for systemd units declaring Type=notify -- see the note in MFAService.
 builder.Services.AddSystemd();
@@ -301,10 +329,9 @@ AuditLogger.LogDirectory = app.Configuration["LogPath"] ?? AuditLogger.LogDirect
 LoginFailureMonitor.Configure(app.Configuration);
 
 var _asm = Assembly.GetExecutingAssembly();
-var _ver = _asm.GetName().Version?.ToString(3) ?? "unknown";
-var _built = _asm.GetCustomAttributes<AssemblyMetadataAttribute>()
-    .FirstOrDefault(a => a.Key == "BuildDate")?.Value ?? "unknown";
-AuditLogger.Log($"MFAWeb v{_ver} (built {_built} UTC) starting...");
+var _ver = _asm.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion
+           ?? _asm.GetName().Version?.ToString(3) ?? "unknown";
+AuditLogger.Log($"MFAWeb v{_ver} starting...");
 
 string siteName = app.Configuration["SiteName"] ?? "MFA Secure Access";
 // HTML-escaped form for interpolation into the inline markup below. Operator-controlled
@@ -500,35 +527,52 @@ app.MapPost("/auth", async (HttpContext context, IAntiforgery antiforgery, IConf
 
     // 3. Validate credentials (read-only — MFAWeb never writes the DB)
     bool credentialsValid = false;
+    bool monitorTotpFailure = false;
     bool hadNoPasskeys = false;
     string authedUsername = "";
+    long matchedTimeStep = 0;
+    string secretFingerprint = "";
 
     {
         var users = LoadUsers(DbPath, Entropy);
         var user = users.FirstOrDefault(u => u.Username.Equals(username, StringComparison.OrdinalIgnoreCase));
+        monitorTotpFailure = user is { TotpConfirmed: true } && !string.IsNullOrWhiteSpace(user.TotpSecret);
         // The empty-secret check is defence in depth. Passkey-only accounts store
         // TotpSecret = "" and TotpConfirmed = false, so TotpConfirmed alone already blocks
         // them — but if that pairing is ever broken (a crafted 'import', DB tampering, a
         // future refactor), Base32Encoding.ToBytes("") throws and a valid password would
         // surface as a 500 instead of a clean denial. Treat an empty secret as invalid.
         if (user != null && user.TotpConfirmed && !string.IsNullOrWhiteSpace(user.TotpSecret)
-            && BCrypt.Net.BCrypt.Verify(password, user.PasswordHash))
+            && !string.IsNullOrEmpty(user.PasswordHash) && BCrypt.Net.BCrypt.Verify(password, user.PasswordHash))
         {
             var totp = new Totp(Base32Encoding.ToBytes(user.TotpSecret));
-            if (totp.VerifyTotp(totpCode, out _, new VerificationWindow(1, 1)))
+            if (totp.VerifyTotp(totpCode, out matchedTimeStep, new VerificationWindow(1, 1)))
             {
                 credentialsValid = true;
                 hadNoPasskeys = user.PasskeyCredentials.Count == 0;
                 authedUsername = user.Username;
+                // Bind consumption to the exact secret just verified. A concurrent
+                // reprovision must not let an assertion against the old secret through.
+                secretFingerprint = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(user.TotpSecret)));
             }
         }
     }
 
     if (!credentialsValid)
     {
-        LoginFailureMonitor.RecordFailure(username, clientIp);
+        if (monitorTotpFailure) LoginFailureMonitor.RecordFailure(username, clientIp);
         AuditLogger.Warn("Failed - Invalid credentials or expired code");
         await SendDenyResponse(context, "Invalid credentials or expired code.");
+        return;
+    }
+
+    // The privileged DB writer serializes and persists replay state before any grant.
+    // Never fall back to opening the port when consumption fails or the reply is lost.
+    if (!await IpcFirewallClient.ConsumeTotpAsync(authedUsername, matchedTimeStep, secretFingerprint))
+    {
+        LoginFailureMonitor.RecordFailure(username, clientIp);
+        AuditLogger.Warn("TOTP consumption failed: code reused, expired, or database unavailable");
+        await SendDenyResponse(context, "Unable to authorize this code. Wait for a new code and try again.");
         return;
     }
 
@@ -665,9 +709,13 @@ app.MapPost("/setup", async (HttpContext context, IAntiforgery antiforgery) =>
         {
             setupInvalid = true;
         }
-        else if (!BCrypt.Net.BCrypt.Verify(password, user.PasswordHash))
+        // Empty hash means the enrollment password was already burned (passkey registered, or
+        // expiry swept) for this never-TOTP-confirmed account. Short-circuits before Verify,
+        // which throws on an empty hash instead of returning false -- same pattern as TotpSecret above.
+        else if (string.IsNullOrEmpty(user.PasswordHash) || !BCrypt.Net.BCrypt.Verify(password, user.PasswordHash))
         {
             setupBadPassword = true;
+            authedUsername = user.Username;
         }
         else if (string.IsNullOrWhiteSpace(user.TotpSecret))
         {
@@ -690,6 +738,7 @@ app.MapPost("/setup", async (HttpContext context, IAntiforgery antiforgery) =>
     }
     if (setupBadPassword)
     {
+        LoginFailureMonitor.RecordFailure(authedUsername!, context.Connection.RemoteIpAddress?.ToString() ?? "unknown");
         AuditLogger.Warn("Provisioning - Invalid password");
         await SendDenyResponse(context, "Invalid password.");
         return;
@@ -700,6 +749,8 @@ app.MapPost("/setup", async (HttpContext context, IAntiforgery antiforgery) =>
         await SendDenyResponse(context, "This account has no authenticator secret. Use your passkey setup link instead.");
         return;
     }
+
+    LoginFailureMonitor.RecordSuccess(authedUsername!);
 
     // Burn the token via IPC — MFAService is the sole DB writer
     if (!await IpcFirewallClient.BurnTotpTokenAsync(token))
@@ -719,6 +770,10 @@ app.MapPost("/setup", async (HttpContext context, IAntiforgery antiforgery) =>
 
     // Display the QR Code (rendered client-side via locally hosted qrious.min.js)
     context.Response.ContentType = "text/html";
+    // This page renders the raw TOTP secret once -- enforce that server-side too, so a browser's
+    // back-button or disk cache can't resurface it on a shared machine.
+    context.Response.Headers.CacheControl = "no-store";
+    context.Response.Headers.Pragma = "no-cache";
     await context.Response.WriteAsync($@"
             <!DOCTYPE html>
             <html>
@@ -823,6 +878,7 @@ app.MapPost("/setup-passkey", async (HttpContext context, IAntiforgery antiforge
 
     bool pkInvalid = false;
     bool pkBadPassword = false;
+    string? provisionUsername = null;
     {
         var users = LoadUsers(DbPath, Entropy);
         var user = users.FirstOrDefault(u => TokenEquals(u.PasskeyProvisioningToken, token)
@@ -830,8 +886,15 @@ app.MapPost("/setup-passkey", async (HttpContext context, IAntiforgery antiforge
 
         if (user == null || user.PasskeyProvisioningExpiresUtc == null || DateTime.UtcNow > user.PasskeyProvisioningExpiresUtc)
             pkInvalid = true;
-        else if (!BCrypt.Net.BCrypt.Verify(password, user.PasswordHash))
-            pkBadPassword = true;
+        else
+        {
+            provisionUsername = user.Username;
+            // Not reachable today -- AddPasskey and the expiry sweep only ever clear PasswordHash
+            // together with PasskeyProvisioningToken, so a live token should mean a real hash.
+            // Guarded anyway, same pattern as the other two password checks: BCrypt.Verify throws
+            // rather than returning false on an empty hash.
+            pkBadPassword = string.IsNullOrEmpty(user.PasswordHash) || !BCrypt.Net.BCrypt.Verify(password, user.PasswordHash);
+        }
     }
 
     if (pkInvalid)
@@ -842,11 +905,14 @@ app.MapPost("/setup-passkey", async (HttpContext context, IAntiforgery antiforge
     }
     if (pkBadPassword)
     {
+        // A live token resolved this account. Token/username guesses never reach here.
+        LoginFailureMonitor.RecordFailure(provisionUsername!, context.Connection.RemoteIpAddress?.ToString() ?? "unknown");
         AuditLogger.Warn($"Passkey provisioning - invalid password for '{username}'");
         await SendDenyResponse(context, "Invalid password.");
         return;
     }
 
+    LoginFailureMonitor.RecordSuccess(provisionUsername!);
     AuditLogger.Log($"Passkey provisioning password verified for '{username}'");
 
     // Burn the email-link token immediately and replace it with a fresh 5-minute token.
@@ -1030,6 +1096,9 @@ app.MapPost("/passkey/verify", async (HttpContext context, IConfiguration config
     }
 
     // Async FIDO2 verification (lock not held)
+    // Only count complete assertions against the resolved account/credential. Missing
+    // challenges, unknown credentials and malformed transport data are not attributed to an account.
+    bool monitorAssertionFailure = HasCompleteAssertionData(clientAssertion);
     uint newSignCount;
     try
     {
@@ -1048,6 +1117,9 @@ app.MapPost("/passkey/verify", async (HttpContext context, IConfiguration config
     }
     catch (Exception ex)
     {
+        if (monitorAssertionFailure)
+            LoginFailureMonitor.RecordFailure(username, context.Connection.RemoteIpAddress?.ToString() ?? "unknown");
+
         // Sign-count regression means the credential counter went backwards — a strong indicator
         // of a cloned authenticator.  Log at ERROR so it surfaces in monitoring.
         bool isCounterAnomaly = ex.Message.Contains("counter", StringComparison.OrdinalIgnoreCase)
@@ -1058,6 +1130,8 @@ app.MapPost("/passkey/verify", async (HttpContext context, IConfiguration config
             AuditLogger.Warn($"Passkey assertion failed for '{username}': {ex.Message}");
         context.Response.StatusCode = 401; await context.Response.WriteAsync("Passkey verification failed."); return;
     }
+
+    LoginFailureMonitor.RecordSuccess(username);
 
     // Defense-in-depth: if the library somehow allowed a non-increasing counter, flag it.
     if (credSignCount > 0 && newSignCount <= credSignCount)
@@ -1270,8 +1344,9 @@ app.MapPost("/passkey/register/complete", async (HttpContext context) =>
         var users = LoadUsers(DbPath, Entropy);
         var user = users.FirstOrDefault(u => TokenEquals(u.PasskeyProvisioningToken, token));
 
-        if (user == null || user.PasskeyProvisioningExpiresUtc == null || DateTime.UtcNow > user.PasskeyProvisioningExpiresUtc
-            || !user.PasskeyRegistrationReady)
+        // The challenge was already consumed above. Both names came from the canonical
+        // database account, so require an exact match before attestation verification or IPC.
+        if (!PasskeyRegistrationAuthorization.IsAuthorized(stored.Username, user, DateTime.UtcNow))
         {
             context.Response.StatusCode = 401;
             await context.Response.WriteAsync("Registration link is invalid or has expired.");
@@ -1368,6 +1443,26 @@ app.MapGet("/access-granted", async context =>
 app.Run();
 
 // --- Helper Methods ---
+
+// Shape check for monitoring only; Fido2 remains the authority for authentication.
+// Do not turn syntactically valid JSON with missing assertion fields into alert mail.
+static bool HasCompleteAssertionData(AuthenticatorAssertionRawResponse assertion)
+{
+    if (assertion.Type != PublicKeyCredentialType.PublicKey || assertion.Response is not { } response
+        || response.AuthenticatorData is not { Length: >= 37 }
+        || response.Signature is not { Length: > 0 } || response.ClientDataJson is not { Length: > 0 })
+        return false;
+
+    try
+    {
+        using var data = JsonDocument.Parse(response.ClientDataJson);
+        return data.RootElement.ValueKind == JsonValueKind.Object
+            && new[] { "type", "challenge", "origin" }.All(name =>
+                data.RootElement.TryGetProperty(name, out var value)
+                && value.ValueKind == JsonValueKind.String && !string.IsNullOrEmpty(value.GetString()));
+    }
+    catch (JsonException) { return false; }
+}
 
 // Reads the request body up to maxBytes. Returns null if the body exceeds the limit.
 static async Task<string?> ReadBodyWithLimitAsync(HttpRequest request, int maxBytes = 65_536)
@@ -1499,6 +1594,19 @@ static bool IsPublicIpAddress(string ipString)
     return true;
 }
 
+internal static class PasskeyRegistrationAuthorization
+{
+    internal static bool IsAuthorized(
+        string challengeUsername,
+        [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] UserEntry? tokenUser,
+        DateTime utcNow)
+        => tokenUser is not null
+            && tokenUser.PasskeyProvisioningExpiresUtc is DateTime expires
+            && utcNow <= expires
+            && tokenUser.PasskeyRegistrationReady
+            && string.Equals(challengeUsername, tokenUser.Username, StringComparison.Ordinal);
+}
+
 public class UserEntry
 {
     public string Username { get; set; } = string.Empty;
@@ -1507,6 +1615,8 @@ public class UserEntry
     // True once the user has visited the setup page and scanned their QR code.
     // MFAAdmin sets this to false on add/reprovision; BurnTotpToken sets it to true.
     public bool TotpConfirmed { get; set; } = false;
+    // Nullable for databases written before replay protection was introduced.
+    public long? LastAcceptedTotpTimeStep { get; set; }
     public string? ProvisioningToken { get; set; }
     public DateTime? ProvisioningExpiresUtc { get; set; }
     public List<StoredPasskeyCredential> PasskeyCredentials { get; set; } = new();
@@ -1564,6 +1674,11 @@ public static class IpcFirewallClient
 
     public static async Task<bool> BurnTotpTokenAsync(string token)
         => await SendDbCommandAsync($"DB:BURN_TOTP_TOKEN|{token}");
+
+#if ALLOW_TOTP
+    public static async Task<bool> ConsumeTotpAsync(string username, long timeStep, string secretFingerprint)
+        => await SendDbCommandAsync(FormattableString.Invariant($"DB:CONSUME_TOTP|{username}|{timeStep}|{secretFingerprint}"));
+#endif
 
     /// <summary>
     /// Atomically replaces the old passkey provisioning token with a new short-lived one.
@@ -1821,14 +1936,55 @@ public static class LoginFailureMonitor
     private static bool _sendEmail = false;
     private static IConfiguration? _config;
 
+    // The per-account threshold doesn't stop an attacker driving it for many different accounts
+    // (/passkey/challenge discloses credential IDs by design, so a shape-valid assertion can't be
+    // excluded from counting without hiding real attacks too). Bound the consequence instead: cap
+    // alert *emails* per window, globally, so a swept victim list floods logs, not the operator's
+    // inbox. The per-account [SECURITY] log line below is never suppressed -- only the email is.
+    private static int _maxEmailsPerWindow = 10;
+    private static int _emailsSentInWindow = 0;
+    private static DateTime _emailWindowStartUtc = DateTime.MinValue;
+    private static bool _suppressionLogged = false;
+    private static readonly object _emailWindowLock = new();
+
     public static void Configure(IConfiguration config)
     {
         _config = config;
         int t = config.GetValue<int>("AccountAlert:Threshold", 10);
         int w = config.GetValue<int>("AccountAlert:WindowMinutes", 15);
+        int m = config.GetValue<int>("AccountAlert:MaxEmailsPerWindow", 10);
         _sendEmail = config.GetValue<bool>("AccountAlert:SendEmail", false);
         if (t > 0) _threshold = t;
         if (w > 0) _window = TimeSpan.FromMinutes(w);
+        if (m > 0) _maxEmailsPerWindow = m;
+    }
+
+    // Returns true if this alert may be emailed, having reserved a slot in the current window.
+    private static bool TryReserveEmailSlot()
+    {
+        lock (_emailWindowLock)
+        {
+            var now = DateTime.UtcNow;
+            if (now - _emailWindowStartUtc >= _window)
+            {
+                _emailWindowStartUtc = now;
+                _emailsSentInWindow = 0;
+                _suppressionLogged = false;
+            }
+            if (_emailsSentInWindow >= _maxEmailsPerWindow)
+            {
+                if (!_suppressionLogged)
+                {
+                    _suppressionLogged = true;
+                    AuditLogger.Warn($"[SECURITY] Suppressing further failed-login alert emails for the " +
+                        $"rest of this {_window.TotalMinutes:0}-minute window ({_maxEmailsPerWindow} already " +
+                        "sent). Threshold crossings are still logged above, per account, regardless.");
+                }
+                return false;
+            }
+            _emailsSentInWindow++;
+            return true;
+        }
     }
 
     public static void RecordSuccess(string username) => _state.TryRemove(username.ToLowerInvariant(), out _);
@@ -1855,7 +2011,7 @@ public static class LoginFailureMonitor
             && _state.TryUpdate(key, (result.Failures, result.WindowStartUtc, true), result))
         {
             AuditLogger.Warn($"[SECURITY] {result.Failures} failed logins for '{username}' within {_window.TotalMinutes:0} min (latest from {clientIp})");
-            if (_sendEmail)
+            if (_sendEmail && TryReserveEmailSlot())
                 _ = Task.Run(() => TrySendAlert(username, result.Failures, clientIp)); // don't block the auth response
         }
     }
@@ -1871,10 +2027,10 @@ public static class LoginFailureMonitor
             return;
         }
         int  port   = int.TryParse(cfg["Smtp:Port"], out var p) ? p : 25;
-        bool useSsl = bool.TryParse(cfg["Smtp:UseSsl"], out var s) && s;
         string? user = cfg["Smtp:Username"], pass = cfg["Smtp:Password"];
         try
         {
+            bool useSsl = GetSmtpUseSsl(cfg, host);
             using var msg = new MailMessage(from, notify)
             {
                 Subject = $"[MFA] {failures} failed logins for {username}",
@@ -1892,6 +2048,28 @@ public static class LoginFailureMonitor
         {
             AuditLogger.Error($"[SECURITY] Failed to send login-alert email: {ex.Message}");
         }
+    }
+
+    private static bool GetSmtpUseSsl(IConfiguration cfg, string host)
+    {
+        string? configured = cfg["Smtp:UseSsl"];
+        if (string.IsNullOrWhiteSpace(configured)) return true;
+        if (!bool.TryParse(configured, out bool useSsl))
+            throw new InvalidOperationException($"Smtp:UseSsl value '{configured}' is not true or false.");
+        if (!useSsl && !IsLoopbackSmtpHost(host))
+            throw new InvalidOperationException(
+                "Smtp:UseSsl may be false only for a loopback SMTP relay (localhost, 127.0.0.0/8, or ::1).");
+        return useSsl;
+    }
+
+    private static bool IsLoopbackSmtpHost(string host)
+    {
+        string candidate = host.Trim().TrimEnd('.');
+        if (candidate.Equals("localhost", StringComparison.OrdinalIgnoreCase)) return true;
+
+        candidate = candidate.TrimStart('[').TrimEnd(']');
+        return System.Net.IPAddress.TryParse(candidate, out var address)
+            && System.Net.IPAddress.IsLoopback(address);
     }
 }
 
@@ -1998,5 +2176,3 @@ public static class AuditLogger
         return safeString.ToString();
     }
 }
-
-

@@ -34,15 +34,14 @@ Directory.SetCurrentDirectory(AppContext.BaseDirectory);
 if (args.Length > 0)
 {
     var probeAsm   = Assembly.GetExecutingAssembly();
-    var probeVer   = probeAsm.GetName().Version?.ToString(3) ?? "unknown";
-    var probeBuilt = probeAsm.GetCustomAttributes<AssemblyMetadataAttribute>()
-                             .FirstOrDefault(a => a.Key == "BuildDate")?.Value ?? "unknown";
+    var probeVer   = probeAsm.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion
+                     ?? probeAsm.GetName().Version?.ToString(3) ?? "unknown";
 
     switch (args[0].ToLowerInvariant())
     {
         case "--version":
         case "-v":
-            Console.WriteLine($"MFAService {probeVer} (built {probeBuilt} UTC)");
+            Console.WriteLine($"MFAService {probeVer}");
             return 0;
 
         case "--help":
@@ -67,10 +66,9 @@ var builder = Host.CreateApplicationBuilder(args);
 ServiceLogger.SetMinLevel(builder.Configuration["Logging:AppMinLevel"]);
 
 var _asm = Assembly.GetExecutingAssembly();
-var _ver = _asm.GetName().Version?.ToString(3) ?? "unknown";
-var _built = _asm.GetCustomAttributes<AssemblyMetadataAttribute>()
-    .FirstOrDefault(a => a.Key == "BuildDate")?.Value ?? "unknown";
-ServiceLogger.Log($"MFAService v{_ver} (built {_built} UTC) starting...");
+var _ver = _asm.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion
+           ?? _asm.GetName().Version?.ToString(3) ?? "unknown";
+ServiceLogger.Log($"MFAService v{_ver} starting...");
 
 builder.Services.AddWindowsService(options =>
 {
@@ -129,7 +127,7 @@ internal static class IpcOwnership
 
 internal static class ServiceLogger
 {
-    private static readonly string LogDirectory = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
+    internal static string LogDirectory { get; set; } = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
         ? @"C:\ProgramData\MFAAuth\Logs"
         : @"/var/log/mfa-auth";
 
@@ -207,16 +205,21 @@ internal static class ServiceLogger
 public class FirewallWorkerService : BackgroundService
 {
     private readonly IConfiguration _config;
-    private static string _rulePrefix = "MFA_Temp_";
+    private readonly string _rulePrefix;
+    private readonly IFirewallCommands _commands;
+    private readonly object _firewallLock = new();
 
     // Hard ceiling on BouncerConfig:ExpirationHours. Deliberate multi-day windows are still
     // possible, but a misconfiguration cannot leave rules in the firewall indefinitely.
     private const int MaxExpirationHours = 48;
 
-    public FirewallWorkerService(IConfiguration config)
+    public FirewallWorkerService(IConfiguration config) : this(config, new SystemFirewallCommands()) { }
+
+    internal FirewallWorkerService(IConfiguration config, IFirewallCommands commands)
     {
         _config = config;
         _rulePrefix = config["BouncerConfig:RulePrefix"] ?? "MFA_Temp_";
+        _commands = commands;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -528,12 +531,12 @@ public class FirewallWorkerService : BackgroundService
         }
 
         int  port   = int.TryParse(_config["Smtp:Port"], out var p) ? p : 25;
-        bool useSsl = bool.TryParse(_config["Smtp:UseSsl"], out var s) && s;
         var  user   = _config["Smtp:Username"];
         var  pass   = _config["Smtp:Password"];
 
         try
         {
+            bool useSsl = SmtpTransportPolicy.GetUseSsl(_config, host);
             using var msg = new MailMessage(from, notify)
             {
                 Subject = subject,
@@ -703,16 +706,14 @@ public class FirewallWorkerService : BackgroundService
         // Held until shutdown: releasing it early would let a second instance through.
         using var _instanceLock = instanceLock;
 
-        // 0660: owner rw, group rw, others none. The socket is created by this process, so it
-        // ends up root:root -- there is no chgrp here. To let MFAWeb connect, give MFAService a
-        // supplementary group that the MFAWeb account also belongs to (see INSTALL.md,
-        // "Socket Permissions"). Verified on Ubuntu 24.04: srw-rw---- root root.
+        // 0660: owner rw, group rw, others none. The socket inherits this process's primary
+        // group; use Group=mfaipc in the service unit and add MFAWeb to that group.
         File.SetUnixFileMode(socketPath,
             UnixFileMode.UserRead  | UnixFileMode.UserWrite |
             UnixFileMode.GroupRead | UnixFileMode.GroupWrite);
 
-        // Resolved once: the uid the connecting process must be running as. Empty means
-        // "accept anyone the socket mode let through", which is the pre-0.2.0 behaviour.
+        // Resolve once per service start. Failure rejects all callers without stopping this
+        // endpoint owner: the sweeper must keep removing grants even with a bad account setting.
         int expectedUid = ResolveExpectedClientUid();
 
         try
@@ -721,7 +722,7 @@ public class FirewallWorkerService : BackgroundService
             {
                 var client = await listener.AcceptAsync(stoppingToken);
 
-                if (expectedUid >= 0 && !VerifyPeerUid(client, expectedUid))
+                if (expectedUid < 0 || !VerifyPeerUid(client, expectedUid))
                 {
                     try { client.Dispose(); } catch { }
                     continue;
@@ -775,15 +776,15 @@ public class FirewallWorkerService : BackgroundService
     }
 
     // Reads FirewallService:GmsaAccount, which on Linux holds the local account MFAWeb runs as.
-    // Returns -1 when unset or unresolvable, which leaves the socket mode as the only gate and
-    // preserves the behaviour of installs that predate this check.
+    // Returns -1 when unset or unresolvable. The accept loop then rejects every connection;
+    // it never silently falls back to trusting every member of the socket's group.
     [SupportedOSPlatform("linux")]
     private int ResolveExpectedClientUid()
     {
         var account = _config["FirewallService:GmsaAccount"];
         if (string.IsNullOrWhiteSpace(account))
         {
-            ServiceLogger.Warn("[IPC] FirewallService:GmsaAccount is not set - peer uid verification disabled.");
+            ReportInvalidClientAccount("FirewallService:GmsaAccount is not set. Set it to the local MFAWeb account (normally mfaweb).");
             return -1;
         }
 
@@ -797,7 +798,8 @@ public class FirewallWorkerService : BackgroundService
                 UseShellExecute        = false
             };
             using var proc = Process.Start(psi);
-            if (proc is null) return -1;
+            if (proc is null)
+                throw new InvalidOperationException("The account lookup process could not be started.");
 
             string output = proc.StandardOutput.ReadToEnd().Trim();
             proc.WaitForExit(5000);
@@ -808,20 +810,22 @@ public class FirewallWorkerService : BackgroundService
                 return uid;
             }
 
-            ServiceLogger.Error($"[IPC] FirewallService:GmsaAccount is set to '{account}' but it could not be resolved to a uid - peer verification is DISABLED.");
-            SendIpcAlert(
-                "MFA Firewall: configured IPC account could not be resolved",
-                $"FirewallService:GmsaAccount is set to '{account}', but resolving it to a uid failed.\n\n" +
-                "Peer credential verification on the IPC socket is disabled as a result. The socket's " +
-                "directory permissions and mode are still in force, but the configured check is not. " +
-                "Correct the account name or remove the setting to silence this.");
+            ReportInvalidClientAccount($"FirewallService:GmsaAccount '{account}' could not be resolved to a uid.");
             return -1;
         }
         catch (Exception ex)
         {
-            ServiceLogger.Warn($"[IPC] Could not resolve uid for '{account}' ({ex.Message}) - peer uid verification disabled.");
+            ReportInvalidClientAccount($"Could not resolve uid for '{account}' ({ex.Message}).");
             return -1;
         }
+    }
+
+    private void ReportInvalidClientAccount(string reason)
+    {
+        string detail = reason + " All IPC clients will be rejected; existing grants will still be swept. " +
+            "Correct FirewallService:GmsaAccount and restart MFAService to enable new grants.";
+        ServiceLogger.Error($"[IPC] {detail}");
+        SendIpcAlert("MFA Firewall: IPC client account invalid - new grants blocked", detail);
     }
 
     // A local IPC client has no legitimate reason to take longer than this to send one short
@@ -936,7 +940,7 @@ public class FirewallWorkerService : BackgroundService
     }
 
     // Request format: "IP|Username" or "DB:COMMAND|..."
-    private string ProcessFirewallRequest(string? request)
+    internal string ProcessFirewallRequest(string? request)
     {
         if (string.IsNullOrWhiteSpace(request))
             return "ERROR: Empty request";
@@ -974,8 +978,20 @@ public class FirewallWorkerService : BackgroundService
         }
 
         // 2. VALIDATE INPUTS
-        if (!System.Net.IPAddress.TryParse(ip, out _))
+        //
+        // IPAddress.TryParse accepts an IPv6 zone ID ("%...", RFC 4007) with arbitrary characters
+        // and silently drops it in ToString() rather than validating it -- so a crafted zone ID
+        // like "2001:db8::1%$(id)" could survive into the privileged shell command built below.
+        // No legitimate address here needs one (that's only link-local/scoped, already rejected
+        // by IsPublicIpAddress), so reject it outright and use only the parsed form from here on.
+        if (ip.Contains('%'))
+        {
+            ServiceLogger.Warn("[SECURITY] Rejected IP containing a zone ID.");
             return "ERROR: Invalid IP address";
+        }
+        if (!System.Net.IPAddress.TryParse(ip, out var parsedIp))
+            return "ERROR: Invalid IP address";
+        ip = parsedIp.ToString();
         // Defense in depth: re-enforce the "external addresses only" policy on the
         // privileged side, so a compromised/bypassed MFAWeb cannot make SYSTEM open
         // a firewall rule for a private/loopback source. MFAWeb checks this too.
@@ -1007,35 +1023,36 @@ public class FirewallWorkerService : BackgroundService
 
         try
         {
-            // 3. APPLY RULES FOR ALL CONFIGURED PORTS
-            foreach (var portProto in allowedPorts)
+            // Serialize grants and expiry so the sweeper cannot delete a concurrently renewed rule.
+            lock (_firewallLock)
             {
-                var ppParts = portProto.Split('/');
-                if (ppParts.Length != 2)
+                // 3. APPLY RULES FOR ALL CONFIGURED PORTS
+                foreach (var portProto in allowedPorts)
                 {
-                    ServiceLogger.Warn($"[IPC] Configured port '{portProto}' is invalid. Skipping.");
-                    continue;
-                }
+                    var ppParts = portProto.Split('/');
+                    if (ppParts.Length != 2)
+                    {
+                        throw new InvalidOperationException($"Configured port '{portProto}' is invalid.");
+                    }
 
-                // Range-check the port. int.TryParse alone accepts 0, negatives and 99999, which
-                // then get handed to iptables/netsh to reject in a much less obvious way.
-                if (!int.TryParse(ppParts[0].Trim(), out int port) || port < 1 || port > 65535)
-                {
-                    ServiceLogger.Warn($"[CONFIG] Configured port in '{portProto}' is not in 1-65535. Skipping.");
-                    continue;
-                }
+                    // Range-check the port. int.TryParse alone accepts 0, negatives and 99999, which
+                    // then get handed to iptables/netsh to reject in a much less obvious way.
+                    if (!int.TryParse(ppParts[0].Trim(), out int port) || port < 1 || port > 65535)
+                    {
+                        throw new InvalidOperationException($"Configured port in '{portProto}' is not in 1-65535.");
+                    }
 
-                // Allow-list the protocol. It is interpolated into the iptables/PowerShell command,
-                // and although only root can write this config, an unvalidated value here is an
-                // avoidable way for a typo to become a malformed privileged command.
-                string protocol = ppParts[1].Trim().ToUpperInvariant();
-                if (protocol != "TCP" && protocol != "UDP")
-                {
-                    ServiceLogger.Warn($"[CONFIG] Protocol in '{portProto}' must be TCP or UDP. Skipping.");
-                    continue;
-                }
+                    // Allow-list the protocol. It is interpolated into the iptables/PowerShell command,
+                    // and although only root can write this config, an unvalidated value here is an
+                    // avoidable way for a typo to become a malformed privileged command.
+                    string protocol = ppParts[1].Trim().ToUpperInvariant();
+                    if (protocol != "TCP" && protocol != "UDP")
+                    {
+                        throw new InvalidOperationException($"Protocol in '{portProto}' must be TCP or UDP.");
+                    }
 
-                OpenFirewallPort(ip, port, username, protocol, expirationHours);
+                    OpenFirewallPort(ip, port, username, protocol, expirationHours);
+                }
             }
 
             ServiceLogger.Log($"[IPC] Request completed in {sw.ElapsedMilliseconds}ms");
@@ -1099,14 +1116,14 @@ public class FirewallWorkerService : BackgroundService
     // -----------------------------------------------------------------------
     // FIREWALL OPERATIONS
     // -----------------------------------------------------------------------
-    private static void OpenFirewallPort(string ip, int port, string username, string protocol, int expirationHours)
+    private void OpenFirewallPort(string ip, int port, string username, string protocol, int expirationHours)
     {
         string expiresClean = DateTime.UtcNow.AddHours(expirationHours).ToString("yyyy-MM-dd HH:mm UTC");
-        string ruleName     = $"{_rulePrefix}{ip}_{port}";
+        string ruleName     = $"{_rulePrefix}{ip}_{port}_{protocol}";
         var fw = System.Diagnostics.Stopwatch.StartNew();
         ServiceLogger.Log($"[FIREWALL] Configuring rule: {ruleName}...");
 
-        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        if (_commands.IsWindows)
         {
             // Escape single quotes for PowerShell string safety ('' is the PS escape for ')
             string safeUsername = username.Replace("'", "''");
@@ -1125,6 +1142,8 @@ public class FirewallWorkerService : BackgroundService
                         -RemoteAddress $ip `
                         -LocalPort $p `
                         -Protocol $proto `
+                        -Direction Inbound `
+                        -Action Allow `
                         -Enabled True `
                         -Profile Any `
                         -ErrorAction Stop
@@ -1143,21 +1162,18 @@ public class FirewallWorkerService : BackgroundService
                 }}
             ";
 
-            RunPowerShell(script);
+            _commands.PowerShell(script);
             ServiceLogger.Debug($"[FIREWALL] Rule script completed in {fw.ElapsedMilliseconds}ms. Verifying...");
 
-            string verifyOutput = RunPowerShell(
-                $"Get-NetFirewallRule -Name '{ruleName}' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name"
+            string verifyOutput = _commands.PowerShell(
+                $"Get-NetFirewallRule -ErrorAction Stop | Where-Object {{ $_.Name -eq '{ruleName}' }} | Select-Object -ExpandProperty Name"
             ).Trim();
             ServiceLogger.Debug($"[FIREWALL] Verify completed in {fw.ElapsedMilliseconds}ms total.");
 
             if (verifyOutput.Equals(ruleName, StringComparison.OrdinalIgnoreCase))
                 ServiceLogger.Log($"[SUCCESS] Rule verified: {protocol}/{port} OPEN for {ip}.");
             else
-                // Warn, not Log: a verification failure means the grant the user was told they
-                // received may not exist. At INFO it disappears under Logging:AppMinLevel=warning,
-                // which is exactly the setting a production host is likely to run.
-                ServiceLogger.Warn($"[FAILED] Rule '{ruleName}' could not be verified after creation.");
+                throw new InvalidOperationException($"Rule '{ruleName}' could not be verified after creation.");
         }
         else
         {
@@ -1173,14 +1189,14 @@ public class FirewallWorkerService : BackgroundService
             // Upsert: remove any existing rule for this IP+port, then insert a fresh one.
             // iptables -I is not idempotent on its own — without the delete step it would
             // stack duplicate rules on repeated logins from the same IP.
-            string existing = RunBash("iptables -S INPUT 2>/dev/null");
+            string existing = _commands.Bash("iptables -S INPUT");
             foreach (string line in existing.Split('\n', StringSplitOptions.RemoveEmptyEntries))
             {
-                if (line.TrimStart().StartsWith("-A INPUT") && line.Contains(ruleName))
-                    RunBash("iptables " + line.TrimStart().Replace("-A INPUT", "-D INPUT"));
+                if (TryGetManagedRule(line, out var name, out _) && name == ruleName)
+                    DeleteLinuxRule(line);
             }
 
-            RunBash($"iptables -I INPUT -p {proto} --dport {port} -s {ip} -j ACCEPT -m comment --comment '{comment}'");
+            _commands.Bash($"iptables -I INPUT -p {proto} --dport {port} -s {ip} -j ACCEPT -m comment --comment '{comment}'");
             ServiceLogger.Debug($"[FIREWALL] iptables rule inserted in {fw.ElapsedMilliseconds}ms. Verifying...");
 
             // Verify by scanning the rule list for our comment, not with `iptables -C`.
@@ -1189,21 +1205,21 @@ public class FirewallWorkerService : BackgroundService
             // comment therefore never matches a rule that exists, which reported every
             // successful Linux grant as [FAILED] while the rule was in fact present and working.
             // Scanning also matches how the upsert above and SweepExpiredRules locate rules.
-            string after = RunBash("iptables -S INPUT 2>/dev/null");
+            string after = _commands.Bash("iptables -S INPUT");
             bool verified = after
                 .Split('\n', StringSplitOptions.RemoveEmptyEntries)
-                .Any(l => l.TrimStart().StartsWith("-A INPUT") && l.Contains(comment, StringComparison.Ordinal));
+                .Any(l => TryGetManagedRule(l, out var name, out var expiry) && name == ruleName && expiry == expEpoch);
 
             if (verified)
                 ServiceLogger.Log($"[SUCCESS] iptables rule verified: {protocol}/{port} OPEN for {ip}.");
             else
-                ServiceLogger.Warn($"[FAILED] iptables rule could not be verified: {protocol}/{port} for {ip}.");
+                throw new InvalidOperationException($"iptables rule could not be verified: {protocol}/{port} for {ip}.");
         }
     }
 
     internal static string RunPowerShell(string script)
     {
-        string full   = $"$ProgressPreference = 'SilentlyContinue'; Import-Module NetSecurity -ErrorAction SilentlyContinue; {script}";
+        string full   = $"$ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue'; Import-Module NetSecurity -ErrorAction Stop; {script}";
         string base64 = Convert.ToBase64String(Encoding.Unicode.GetBytes(full));
 
         var psi = new ProcessStartInfo("powershell.exe",
@@ -1215,20 +1231,10 @@ public class FirewallWorkerService : BackgroundService
             RedirectStandardError  = true
         };
 
-        var ps = System.Diagnostics.Stopwatch.StartNew();
-        using var proc = Process.Start(psi);
-        if (proc == null) return string.Empty;
-        ServiceLogger.Debug($"[PS] Process started in {ps.ElapsedMilliseconds}ms");
-
-        string output = proc.StandardOutput.ReadToEnd().Trim();
-        string error  = proc.StandardError.ReadToEnd();
-        proc.WaitForExit();
-        ServiceLogger.Debug($"[PS] Process exited in {ps.ElapsedMilliseconds}ms (exit code {proc.ExitCode})");
-
-        if (!string.IsNullOrWhiteSpace(error) && !error.Contains("<Objs"))
-            ServiceLogger.Error($"[PS ERROR] {error.Trim()}");
-
-        return output;
+        var result = FirewallCommandRunner.Run(psi);
+        if (!string.IsNullOrWhiteSpace(result.StandardError))
+            ServiceLogger.Warn($"[PS STDERR] {result.StandardError}");
+        return result.StandardOutput;
     }
 
     internal static string RunBash(string script)
@@ -1241,25 +1247,16 @@ public class FirewallWorkerService : BackgroundService
         psi.RedirectStandardOutput = true;
         psi.RedirectStandardError  = true;
 
-        var sw = System.Diagnostics.Stopwatch.StartNew();
-        using var proc = Process.Start(psi);
-        if (proc == null) return string.Empty;
-
-        string output = proc.StandardOutput.ReadToEnd().Trim();
-        string error  = proc.StandardError.ReadToEnd();
-        proc.WaitForExit();
-        ServiceLogger.Debug($"[BASH] Exited in {sw.ElapsedMilliseconds}ms (exit code {proc.ExitCode})");
-
-        if (!string.IsNullOrWhiteSpace(error))
-            ServiceLogger.Error($"[BASH ERROR] {error.Trim()}");
-
-        return output;
+        var result = FirewallCommandRunner.Run(psi);
+        if (!string.IsNullOrWhiteSpace(result.StandardError))
+            ServiceLogger.Warn($"[BASH STDERR] {result.StandardError}");
+        return result.StandardOutput;
     }
 
     // -----------------------------------------------------------------------
     // FIREWALL SWEEPER: Remove expired rules every 5 minutes
     // -----------------------------------------------------------------------
-    private static async Task RunSweeperAsync(CancellationToken stoppingToken)
+    internal async Task RunSweeperAsync(CancellationToken stoppingToken)
     {
         // Prefer to start only once this process owns the IPC endpoint, so a duplicate stays
         // inert -- but never let that wait stop rules from expiring. See IpcOwnership.MaxWait.
@@ -1276,37 +1273,48 @@ public class FirewallWorkerService : BackgroundService
         }
 
         ServiceLogger.Log("[SWEEPER] Starting...");
+        try { SweepExpiredRules(); }
+        catch (Exception ex) { ServiceLogger.Error($"[SWEEPER ERROR] {ex.Message}"); }
         using var timer = new PeriodicTimer(TimeSpan.FromMinutes(5));
 
         while (await timer.WaitForNextTickAsync(stoppingToken))
         {
             try { SweepExpiredRules(); }
-            catch (Exception ex) { ServiceLogger.Log($"[SWEEPER ERROR] {ex.Message}"); }
+            catch (Exception ex) { ServiceLogger.Error($"[SWEEPER ERROR] {ex.Message}"); }
         }
     }
 
-    private static void SweepExpiredRules()
+    internal void SweepExpiredRules()
+    {
+        lock (_firewallLock)
+            SweepExpiredRulesLocked();
+    }
+
+    private void SweepExpiredRulesLocked()
     {
         ServiceLogger.Log("[SWEEPER] Checking for expired rules...");
 
-        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        if (_commands.IsWindows)
         {
             string reaperScript = $@"
-                $rules = Get-NetFirewallRule -DisplayName '{_rulePrefix}*' -ErrorAction SilentlyContinue
+                $rules = Get-NetFirewallRule -ErrorAction Stop | Where-Object {{ $_.DisplayName -like '{_rulePrefix}*' }}
                 $nowUtcString = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm')
 
                 foreach ($rule in $rules) {{
                     if ($rule.Description -match 'Exp:\s*(\d{{4}}-\d{{2}}-\d{{2}}\s\d{{2}}:\d{{2}})') {{
                         $expString = $matches[1]
-                        if ($nowUtcString -gt $expString) {{
-                            Remove-NetFirewallRule -Name $rule.Name
+                        if ($nowUtcString -ge $expString) {{
+                            Remove-NetFirewallRule -Name $rule.Name -ErrorAction Stop
+                            if (Get-NetFirewallRule -ErrorAction Stop | Where-Object {{ $_.Name -eq $rule.Name }}) {{
+                                throw ('Expired rule remains after deletion: ' + $rule.Name)
+                            }}
                             Write-Output $rule.DisplayName
                         }}
                     }}
                 }}
             ";
 
-            string results = RunPowerShell(reaperScript).Trim();
+            string results = _commands.PowerShell(reaperScript).Trim();
 
             if (!string.IsNullOrWhiteSpace(results))
             {
@@ -1325,7 +1333,7 @@ public class FirewallWorkerService : BackgroundService
             // Linux: parse 'iptables -S INPUT' and delete any of our rules whose
             // stored expiry epoch has passed.  Update these commands if your distro
             // uses nftables, ufw, or firewalld instead of iptables.
-            string rules = RunBash("iptables -S INPUT 2>/dev/null");
+            string rules = _commands.Bash("iptables -S INPUT");
             if (string.IsNullOrWhiteSpace(rules))
             {
                 ServiceLogger.Log("[SWEEPER] No iptables rules found.");
@@ -1337,18 +1345,9 @@ public class FirewallWorkerService : BackgroundService
 
             foreach (string line in rules.Split('\n', StringSplitOptions.RemoveEmptyEntries))
             {
-                if (!line.Contains(_rulePrefix)) continue;
-
-                var expMatch = Regex.Match(line, @"exp:(\d+)");
-                if (!expMatch.Success) continue;
-
-                if (nowEpoch <= long.Parse(expMatch.Groups[1].Value)) continue;
-
-                // Delete by replaying the save-format rule with -D instead of -A
-                RunBash("iptables " + line.TrimStart().Replace("-A INPUT", "-D INPUT"));
-
-                var nameMatch = Regex.Match(line, Regex.Escape(_rulePrefix) + @"[^\s'""]+");
-                ServiceLogger.Log($"[SWEEPER] Expired iptables rule removed: {(nameMatch.Success ? nameMatch.Value : "unknown")}");
+                if (!TryGetManagedRule(line, out var name, out var expiry) || nowEpoch < expiry) continue;
+                DeleteLinuxRule(line);
+                ServiceLogger.Log($"[SWEEPER] Expired iptables rule removed: {name}");
                 count++;
             }
 
@@ -1356,6 +1355,30 @@ public class FirewallWorkerService : BackgroundService
                 ? $"[SWEEPER] Done. Removed {count} rule(s)."
                 : "[SWEEPER] No expired rules found.");
         }
+    }
+
+    // iptables -S quotes comments containing spaces. Match the complete generated comment,
+    // including its delimiter: port 22 must never match 2222, nor TCP match UDP. The old
+    // protocol-less names are still understood by expiry, so upgrades do not strand grants.
+    private bool TryGetManagedRule(string line, out string name, out long expiry)
+    {
+        name = string.Empty;
+        expiry = 0;
+        if (!line.TrimStart().StartsWith("-A INPUT ", StringComparison.Ordinal)) return false;
+        var match = Regex.Match(line, @"(?:^|\s)--comment ""(?<name>[^""]+) exp:(?<expiry>\d+)""(?:\s|$)");
+        if (!match.Success || !match.Groups["name"].Value.StartsWith(_rulePrefix, StringComparison.Ordinal)
+            || !long.TryParse(match.Groups["expiry"].Value, out expiry)) return false;
+        name = match.Groups["name"].Value;
+        return true;
+    }
+
+    private void DeleteLinuxRule(string line)
+    {
+        string rule = line.Trim();
+        _commands.Bash("iptables -D INPUT" + rule["-A INPUT".Length..]);
+        string remaining = _commands.Bash("iptables -S INPUT");
+        if (remaining.Split('\n', StringSplitOptions.RemoveEmptyEntries).Any(l => l.Trim() == rule))
+            throw new InvalidOperationException("iptables rule remains after deletion.");
     }
 }
 
@@ -1373,7 +1396,8 @@ public class DatabaseLockService : BackgroundService
 
     private static byte[] Entropy = Array.Empty<byte>();
 
-    // Cross-process mutex — shared by MFAWeb, MFAService, and MFAAdmin to serialize all DB reads/writes.
+    // Cross-process mutex — shared by MFAService and MFAAdmin, the only two writers, to serialize
+    // their writes. MFAWeb never writes the store and does not participate in this mutex.
     // ACL-restricted so only SYSTEM, Builtin Administrators, and the gMSA can acquire it.
     // Initialized in the constructor so the service account name comes from appsettings.
     private static System.Threading.Mutex _dbMutex = null!;
@@ -1458,6 +1482,65 @@ public class DatabaseLockService : BackgroundService
                 }
             }
         }
+
+        // Mirrors FirewallWorkerService's rule sweep above: periodic cleanup, not just a
+        // reactive check at request time, so an unused enrollment password doesn't linger
+        // in the database once its window has passed.
+        try { SweepExpiredProvisioning(); }
+        catch (Exception ex) { ServiceLogger.Error($"[DB SWEEPER ERROR] {ex.Message}"); }
+        using var timer = new PeriodicTimer(TimeSpan.FromMinutes(5));
+
+        while (await timer.WaitForNextTickAsync(stoppingToken))
+        {
+            try { SweepExpiredProvisioning(); }
+            catch (Exception ex) { ServiceLogger.Error($"[DB SWEEPER ERROR] {ex.Message}"); }
+        }
+    }
+
+    // add/reprovision give the TOTP and passkey links the same expiry (one shared `expiresUtc`
+    // local in both), so PasskeyProvisioningExpiresUtc -- always set, unlike the TOTP-only field
+    // -- is the right check for "has this account's window closed" regardless of whether TOTP is
+    // compiled in. Whichever path wasn't completed gets cleaned up as if it had been (AddPasskey
+    // and BurnTotpToken already do this on their own success paths). The password is only
+    // cleared when TOTP isn't confirmed: a confirmed account needs it for every future /auth
+    // login, and this expiry has nothing to do with that.
+    private static void SweepExpiredProvisioning()
+    {
+        using var lk = AcquireDbLock();
+        if (lk == null) { ServiceLogger.Warn("[DB SWEEPER] Timed out waiting for the database lock."); return; }
+
+        var users = LoadUsers();
+        var now = DateTime.UtcNow;
+        int cleared = users.Count(user => TryCleanExpiredProvisioning(user, now));
+
+        if (cleared > 0)
+        {
+            SaveUsers(users);
+            ServiceLogger.Log($"[DB SWEEPER] Cleared expired provisioning state for {cleared} account(s).");
+        }
+    }
+
+    // Pure decision logic, deliberately factored out of the file I/O above: given one user's
+    // state and the current time, does anything need clearing, and what. No DB/file dependency,
+    // so it's directly testable against constructed UserEntry values rather than needing a real
+    // users.dat and the full sweep/lock/save path around it. Returns whether it changed anything.
+    internal static bool TryCleanExpiredProvisioning(UserEntry user, DateTime now)
+    {
+        if (user.PasskeyProvisioningExpiresUtc is not { } expiry || now <= expiry) return false;
+        bool alreadyClean = user.PasskeyProvisioningToken == null && !user.PasskeyRegistrationReady
+            && user.ProvisioningToken == null
+            && (user.TotpConfirmed || string.IsNullOrEmpty(user.PasswordHash));
+        if (alreadyClean) return false;
+
+        user.PasskeyProvisioningToken      = null;
+        user.PasskeyProvisioningExpiresUtc = null;
+        user.PasskeyRegistrationReady      = false;
+        // BurnTotpToken already nulls these on the confirmed path, so this only ever has
+        // something to do on a TOTP link that also expired unused.
+        user.ProvisioningToken      = null;
+        user.ProvisioningExpiresUtc = null;
+        if (!user.TotpConfirmed) user.PasswordHash = "";
+        return true;
     }
 
     // -----------------------------------------------------------------------
@@ -1568,7 +1651,7 @@ public class DatabaseLockService : BackgroundService
     // -----------------------------------------------------------------------
     // DB IPC COMMAND DISPATCHER
     // Called by FirewallWorkerService when a request starts with "DB:"
-    // Commands: BURN_TOTP_TOKEN | SET_PASSKEY_TOKEN | UPDATE_SIGN_COUNT | ADD_PASSKEY
+    // Commands: BURN_TOTP_TOKEN | CONSUME_TOTP | SET_PASSKEY_TOKEN | UPDATE_SIGN_COUNT | ADD_PASSKEY
     // -----------------------------------------------------------------------
     internal static string ProcessDbRequest(string command)
     {
@@ -1580,6 +1663,9 @@ public class DatabaseLockService : BackgroundService
             {
 #if ALLOW_TOTP
                 "BURN_TOTP_TOKEN"     when parts.Length == 2 => BurnTotpToken(parts[1].Trim()),
+                "CONSUME_TOTP"        when parts.Length == 4 => TotpReplayProtection.Consume(
+                    parts[1].Trim(), parts[2].Trim(), parts[3].Trim(),
+                    AcquireDbLock, LoadUsers, SaveUsers, DateTimeOffset.UtcNow),
 #endif
                 "SET_PASSKEY_TOKEN"   when parts.Length == 4 => SetPasskeyToken(parts[1].Trim(), parts[2].Trim(), parts[3].Trim()),
                 "RENEW_PASSKEY_TOKEN" when parts.Length == 2 => RenewPasskeyToken(parts[1].Trim()),
@@ -1689,6 +1775,24 @@ public class DatabaseLockService : BackgroundService
             var cred = user.PasskeyCredentials.FirstOrDefault(c => c.CredentialId == credentialId);
             if (cred != null)
             {
+                // Compare-and-only-increase, not a blind overwrite: two concurrent logins with
+                // the same cloned credential each read the count before either writes, so a
+                // blind overwrite lets the second silently clobber the first and loses the
+                // non-increasing-count signal that would flag the clone. A rejection here is
+                // itself informative, not just a no-op.
+                if (newCount <= cred.SignCount)
+                {
+                    // SignCount is a uint, so stored=0 forces received=0 too -- this branch, not a
+                    // regression. Most platform authenticators (Windows Hello, iCloud Keychain,
+                    // Android) never implement a counter and always report 0, so this is routine,
+                    // not a clone signal; only a *nonzero* count that fails to advance is one.
+                    if (cred.SignCount == 0)
+                        ServiceLogger.Debug($"[DB] Credential '{credentialId}' reports no sign counter (0).");
+                    else
+                        ServiceLogger.Warn($"[SECURITY] Rejected non-increasing sign count for credential " +
+                            $"'{credentialId}': stored={cred.SignCount}, received={newCount}.");
+                    return "SUCCESS"; // detection, not prevention -- do not block the login over this
+                }
                 cred.SignCount = newCount;
                 SaveUsers(users);
                 ServiceLogger.Log($"[DB] Sign count updated for credential '{credentialId}'");
@@ -1720,6 +1824,16 @@ public class DatabaseLockService : BackgroundService
             return "ERROR: Registration not authorized";
         }
 
+        // MFAWeb already checks this, but against an earlier LoadUsers snapshot -- two
+        // registrations racing the same credential ID (vanishingly unlikely, but cheap to close)
+        // could both pass that and reach this authoritative writer. Re-check under the lock.
+        if (users.Any(u => u.PasskeyCredentials.Any(c => c.CredentialId == credentialId)))
+        {
+            ServiceLogger.Error($"[SECURITY] Rejected passkey registration for '{user.Username}': " +
+                $"credential ID already registered to another account.");
+            return "ERROR: Credential already registered";
+        }
+
         user.PasskeyCredentials.Add(new StoredPasskeyCredential
         {
             CredentialId  = credentialId,
@@ -1730,6 +1844,11 @@ public class DatabaseLockService : BackgroundService
         user.PasskeyProvisioningToken      = null;
         user.PasskeyProvisioningExpiresUtc = null;
         user.PasskeyRegistrationReady      = false;
+        // The enrollment password's only job is proving identity for this one registration --
+        // in a build with TOTP confirmed for this account, it doubles as the account's ongoing
+        // login credential (checked on every /auth request), so only burn it where that's not
+        // the case. Same condition the expiry sweep below uses, for the same reason.
+        if (!user.TotpConfirmed) user.PasswordHash = "";
         SaveUsers(users);
         ServiceLogger.Log($"[DB] Passkey credential registered for '{user.Username}'");
         return "SUCCESS";
@@ -1757,6 +1876,51 @@ public class DatabaseLockService : BackgroundService
     }
 
 }
+
+#if ALLOW_TOTP
+// Keep the read/check/write in one synchronous critical section: Mutex ownership is
+// thread-affine, and two requests must never both accept the same or an older step.
+// The callbacks use the existing authoritative DB lock and atomic, flushed save.
+internal static class TotpReplayProtection
+{
+    internal static string Consume(string username, string timeStepText, string secretFingerprint,
+        Func<IDisposable?> acquireLock, Func<List<UserEntry>> loadUsers,
+        Action<List<UserEntry>> saveUsers, DateTimeOffset utcNow)
+    {
+        if (!long.TryParse(timeStepText, System.Globalization.NumberStyles.None,
+                System.Globalization.CultureInfo.InvariantCulture, out long timeStep))
+            return "ERROR: Invalid TOTP time step";
+
+        // Match Otp.NET's default 30-second period and MFAWeb's +/- one-step window.
+        // An old queued request or a forged far-future watermark must fail closed.
+        long currentStep = utcNow.ToUnixTimeSeconds() / 30;
+        if (timeStep < currentStep - 1 || timeStep > currentStep + 1)
+            return "ERROR: TOTP time step expired";
+
+        using var dbLock = acquireLock();
+        if (dbLock == null) return "ERROR: DB lock timeout";
+
+        var users = loadUsers();
+        var user = users.FirstOrDefault(u => u.Username.Equals(username, StringComparison.OrdinalIgnoreCase));
+        if (user == null || !user.TotpConfirmed || string.IsNullOrWhiteSpace(user.TotpSecret))
+            return "ERROR: TOTP not enrolled";
+
+        string currentFingerprint = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(user.TotpSecret)));
+        if (!CryptographicOperations.FixedTimeEquals(Encoding.UTF8.GetBytes(currentFingerprint),
+                Encoding.UTF8.GetBytes(secretFingerprint)))
+            return "ERROR: TOTP enrollment changed";
+
+        if (user.LastAcceptedTotpTimeStep.HasValue && timeStep <= user.LastAcceptedTotpTimeStep.Value)
+            return "ERROR: TOTP time step already consumed";
+
+        // Older files have no recorded use. The first accepted step establishes the
+        // watermark, and every model preserves it across future writes and restarts.
+        user.LastAcceptedTotpTimeStep = timeStep;
+        saveUsers(users); // A failed save throws; the caller must not authorize access.
+        return "SUCCESS";
+    }
+}
+#endif
 
 // -----------------------------------------------------------------------
 // CERTIFICATE MONITOR SERVICE
@@ -1968,12 +2132,12 @@ public class CertificateMonitorService : BackgroundService
         }
 
         int  port   = int.TryParse(_config["Smtp:Port"], out var p) ? p : 25;
-        bool useSsl = bool.TryParse(_config["Smtp:UseSsl"], out var s) && s;
         var  user   = _config["Smtp:Username"];
         var  pass   = _config["Smtp:Password"];
 
         try
         {
+            bool useSsl = SmtpTransportPolicy.GetUseSsl(_config, host);
             using var msg = new MailMessage(from, notify)
             {
                 Subject = subject,
@@ -1996,6 +2160,31 @@ public class CertificateMonitorService : BackgroundService
     }
 }
 
+internal static class SmtpTransportPolicy
+{
+    internal static bool GetUseSsl(IConfiguration config, string host)
+    {
+        string? configured = config["Smtp:UseSsl"];
+        if (string.IsNullOrWhiteSpace(configured)) return true;
+        if (!bool.TryParse(configured, out bool useSsl))
+            throw new InvalidOperationException($"Smtp:UseSsl value '{configured}' is not true or false.");
+        if (!useSsl && !IsLoopbackHost(host))
+            throw new InvalidOperationException(
+                "Smtp:UseSsl may be false only for a loopback SMTP relay (localhost, 127.0.0.0/8, or ::1).");
+        return useSsl;
+    }
+
+    private static bool IsLoopbackHost(string host)
+    {
+        string candidate = host.Trim().TrimEnd('.');
+        if (candidate.Equals("localhost", StringComparison.OrdinalIgnoreCase)) return true;
+
+        candidate = candidate.TrimStart('[').TrimEnd(']');
+        return System.Net.IPAddress.TryParse(candidate, out var address)
+            && System.Net.IPAddress.IsLoopback(address);
+    }
+}
+
 public class UserEntry
 {
     public string Username { get; set; } = string.Empty;
@@ -2004,6 +2193,7 @@ public class UserEntry
     // True once the user has visited the setup page and scanned their QR code.
     // MFAAdmin sets this to false on add/reprovision; BurnTotpToken sets it to true.
     public bool TotpConfirmed { get; set; } = false;
+    public long? LastAcceptedTotpTimeStep { get; set; }
     public string? ProvisioningToken { get; set; }
     public DateTime? ProvisioningExpiresUtc { get; set; }
     public List<StoredPasskeyCredential> PasskeyCredentials { get; set; } = new();

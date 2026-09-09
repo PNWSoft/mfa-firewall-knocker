@@ -31,8 +31,11 @@ and the limitations below are as much a part of the specification as the guarant
 
 ### The problem addressed: a credential that leaves the building
 
-A WireGuard profile or an SSH private key is a bearer token. Possession is the entire test: the
-holder of the file authenticates as its owner, from any address, at any hour.
+A WireGuard profile or a conventional file-backed SSH private key is a bearer credential:
+possession of the file is the authentication test. OpenSSH FIDO credentials (`sk-ecdsa-*` and
+`sk-ssh-ed25519-*`) are a material exception: since OpenSSH 8.2, the local key handle is unusable
+without the security key, and deployments can also require touch or PIN verification. See the
+[OpenSSH 8.2 release notes](https://www.openssh.com/txt/release-8.2).
 
 Revocation is straightforward — remove the peer from the server, or the key from
 `authorized_keys`. Every control available is post-incident: revoke, rotate, audit handshakes.
@@ -138,8 +141,9 @@ It does not open anything.
 
 `MFAAdmin reset` removes every MFA-granted rule and does not require MFAService. It runs elevated
 and issues the firewall commands directly — `Remove-NetFirewallRule` on Windows, `iptables -D` on
-Linux — then re-reads the rule list and reports what remains rather than assuming the deletions
-succeeded. This applies to emergency revocation generally, not only to outages. `MFAAdmin diag`
+Linux. On Linux it then re-reads the rule list and reports what remains rather than assuming the
+deletions succeeded; on Windows it issues the removal and reports success without a corresponding
+re-check. This applies to emergency revocation generally, not only to outages. `MFAAdmin diag`
 lists the rules without removing them.
 
 `reset` is all-or-nothing; there is no per-user or per-rule revocation, so all users must
@@ -156,10 +160,13 @@ rotate keys across the fleet and hope you were fast enough.
 **Behind this gate, that file is inert on its own.** The port it would connect to does not exist
 until someone completes a WebAuthn ceremony against a passkey that:
 
-- **cannot be copied** — the private key is generated in and confined to the device's secure
-  hardware, and is non-exportable by design. Stealing files does not steal it.
-- **cannot be used without the person** — user verification is required on every assertion, so a
-  biometric or device PIN is needed each time, not just at enrolment.
+- **is managed by an authenticator rather than stored by this server** — stealing the server's
+  user database does not reveal a private key. The configured `attestationPreference = None`
+  does not prove secure hardware, device binding, or non-exportability; Apple, Google, Microsoft,
+  and third-party providers may sync or back up passkeys according to their own policies.
+- **requires authenticator-mediated user verification** — every assertion requests a biometric,
+  device PIN, or equivalent local verification. This protects against simple device possession,
+  while the authenticator provider's account-recovery and sync controls remain a trust boundary.
 - **cannot be phished** — the assertion is bound to the origin, so a convincing fake site cannot
   harvest anything replayable.
 
@@ -195,19 +202,28 @@ security; no network gate can be one.
 
 ### A note on the user database
 
-In the default passkey-only build the store holds no directly usable credential. WebAuthn
-credentials are **public keys**, and because TOTP is not compiled in there is no shared secret to
-write — so the file contains a user list, BCrypt password hashes, and public key material.
+In the default passkey-only build, enrolled WebAuthn credentials are **public keys** and there is
+no recoverable TOTP secret. The store still contains usernames and the hash of each account's
+current **one-time enrollment password** — a bootstrap credential, not a persistent one: it is
+checked exactly once, at registration, never used to log in, and replaced by a fresh one on every
+`add` or `reprovision`. This is enforced at the data layer, not only by the check sites that use
+it: the password is cleared the moment registration succeeds, and a periodic sweep also clears it
+if the 60-minute enrollment window closes unused, so it does not persist beyond the window it was
+minted for even if nobody ever completes registration with it. During enrollment or reprovisioning
+the store also contains a short-lived passkey registration token and the registration-ready state.
+A reader who can watch an active enrollment can race the legitimate user after the password gate
+has made that token ready, so confidentiality still matters during those windows.
 
-In that build, that makes **integrity, not confidentiality, the property worth defending**. Someone who can
-*read* `users.dat` learns which addresses have accounts and obtains BCrypt hashes whose value is
-limited: for an already-enrolled account the password cannot register a passkey, because
-`AddPasskey` refuses any account that already has one. Someone who can *write* it simply adds
-their own passkey credential and becomes that user.
+Integrity is always critical: someone who can write the store can add their own passkey credential
+and become that user. For an already-enrolled, passkey-only account with no active provisioning
+state, its password hash has already been cleared by the burn-after-use/expiry handling above --
+there is no live secret left there to disclose. A read still discloses the user list, and for any
+account still inside an active enrollment window, that window's live password hash and its
+outstanding tokens.
 
-The file permissions in INSTALL.md exist primarily for that second case. DPAPI encryption on
-Windows raises the bar on reads as well, but it is not what stands between an attacker and an
-account — the permissions are.
+The file permissions in INSTALL.md protect both properties. DPAPI encryption on Windows raises the
+bar on reads, while filesystem permissions remain the primary boundary against unauthorized reads
+and writes.
 
 ### Why TOTP changes this, and why it is off by default
 
@@ -222,23 +238,25 @@ DPAPI does on Windows — protects against theft of the file alone, but the serv
 decrypt it to function, so the material remains recoverable to anything with sufficient access to
 the host.
 
-That produces a sharp asymmetry between the three credential types:
+That produces a sharp asymmetry between the two build modes:
 
 | | What the server stores | What a full database breach yields |
 |---|---|---|
-| Password | a one-way hash | hashes an attacker must still crack |
-| **TOTP** | **the secret itself** | **valid codes for every user, immediately and indefinitely** |
-| WebAuthn / passkey | a public key | public keys — nothing that can authenticate |
+| Passkey-only | public keys, usernames, and -- only for an account still inside its enrollment window -- that window's one-time enrollment password hash and provisioning state | account data, plus any still-live enrollment password hashes and usable enrollment tokens during their short validity window, but no private passkey key |
+| **TOTP-enabled** | **all passkey-only data plus each TOTP secret** — and once an account confirms TOTP, its password hash stops being one-time: it becomes that account's ongoing login credential, checked on every `/auth` request, and the burn-after-use/expiry handling described above no longer applies to it | **all of the above plus valid codes for every TOTP user until each secret is re-enrolled** |
 
 A TOTP database breach is a mass-compromise event: every enrolled user's second factor becomes
-forgeable at once, silently, and stays that way until every secret is re-enrolled. A passkey
-database breach is a user list.
+forgeable at once, silently, and stays that way until every secret is re-enrolled. A passkey-only
+database breach is still serious, but it does not disclose the private key needed to produce an
+assertion for an already-enrolled credential.
 
 This is the second independent reason TOTP is not compiled into the default build — the first
-being that codes are phishable and replayable within their window. Neither is a criticism of TOTP
-as a technology; it is a reasonable second factor where the alternative is a password alone. It
-is simply a poor fit for a component whose stored state is otherwise worth nothing to an
-attacker.
+being that codes are phishable, and even with replay closed, a captured-but-unused code can still
+be raced within its validity window. Neither is a criticism of TOTP as a technology; it is a
+reasonable second factor where the alternative is a password alone. It adds immediately usable
+shared authenticator secrets to a store that already holds *some* immediately usable material
+without TOTP — the short-lived enrollment tokens noted above — and makes that risk permanent
+and comprehensive rather than transient and narrow.
 
 If you do enable it, weigh it especially carefully on Linux, where the store is not encrypted at
 rest.
@@ -260,7 +278,7 @@ rest.
 **In scope:** anything that lets someone open a firewall rule without completing
 authentication, authenticate as another user, escalate from MFAWeb to MFAService, read or
 modify `users.dat` without the required privileges, recover credentials from the database or
-logs, or bypass the passkey-registration password gate.
+logs, or bypass the passkey-registration one-time-password gate.
 
 **Out of scope** — these are documented design decisions, not oversights:
 
@@ -274,15 +292,18 @@ logs, or bypass the passkey-registration password gate.
   radius (public IPs only, configured ports only, time-limited) rather than preventing it.
   Reports that assume arbitrary code execution as the MFAWeb service account are describing
   this known boundary.
-- **TOTP code replay** within the code's validity window, when TOTP is explicitly enabled.
-  This is inherent to TOTP and is why TOTP is not compiled into the default build.
+- **First use of a phished TOTP code**, when TOTP is explicitly enabled. A captured, unused code
+  can be submitted before its owner; successful time-steps are persisted and rejected on reuse.
 - **Anything requiring Administrator or root** on the host. Those principals already own the
   database and the firewall.
 
 ## Supported versions
 
-This project has not yet cut a tagged release. Until it does, only the current `main` branch
-receives fixes.
+| Version | Security fixes |
+|---------|----------------|
+| Current `main` | Yes |
+| Latest tagged release | Yes |
+| Older tagged releases | No |
 
 ## Known issues
 
@@ -316,9 +337,10 @@ Tracked, understood, and not currently considered exploitable:
   accident. INSTALL.md has a "Verify the gate is actually gating" section; run it after install and
   after any firewall change.
 - **On Linux the rule is created with `iptables`, so a client connecting over public IPv6 gets no
-  rule.** Both sides accept a public IPv6 address as valid, and the user is shown ACCESS GRANTED,
-  but the `iptables` call cannot create a v6 rule and the verification logs a failure. It fails
-  closed — nothing is opened — but the report to the user is wrong. Until `ip6tables` support
+  rule.** Both sides accept a public IPv6 address as valid, but the `iptables` call cannot create a
+  v6 rule; MFAService reports the failure back over IPC, and MFAWeb shows a 503 ("Firewall service
+  is temporarily unavailable") rather than ACCESS GRANTED. It fails closed and reports that
+  accurately — the remaining gap is availability, not a false success. Until `ip6tables` support
   exists, publish an A record only, or disable the IPv6 listener on Linux deployments.
 - **Email addresses with a quoted `|` in the local part cannot authenticate.** The IPC
   protocol is `|`-delimited and the privileged side rejects requests with the wrong field

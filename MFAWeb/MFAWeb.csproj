@@ -2,8 +2,7 @@
 
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
-    <Version>0.2.0</Version>
-    <BuildDate>$([System.DateTime]::UtcNow.ToString("yyyy-MM-dd HH:mm:ss"))</BuildDate>
+    <Version>0.3.0</Version>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <ApplicationIcon>knocker.ico</ApplicationIcon>
@@ -14,7 +13,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <AssemblyMetadata Include="BuildDate" Value="$(BuildDate)" />
+    <InternalsVisibleTo Include="MFAWeb.RegistrationTests" />
   </ItemGroup>
 
   <ItemGroup>
