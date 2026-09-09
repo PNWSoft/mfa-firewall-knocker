@@ -44,6 +44,11 @@ Communication between MFAWeb and MFAService uses a **named pipe** (Windows) or *
 > instead, update the two clearly-marked sections in `OpenFirewallPort` and
 > `SweepExpiredRules` in `MFAService/Program.cs`. See [Linux Firewall Commands](#7-linux-firewall-commands).
 
+> **SDK version note:** `global.json` pins the exact .NET SDK version used to build this
+> repo. That's for reproducible builds/testing, not a security requirement — feel free to
+> change it to whatever SDK you have installed, and you'll need to once 10.0.400 is no
+> longer available (e.g. after it's superseded or deprecated upstream).
+
 ---
 
 ## Configuration Reference
