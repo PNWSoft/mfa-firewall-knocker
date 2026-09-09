@@ -525,7 +525,10 @@ UMask=0027
 NoNewPrivileges=true
 ProtectHome=true
 ProtectSystem=strict
-ReadWritePaths=/etc/mfa-auth /var/log/mfa-auth /run
+# .NET's cross-process database mutex (shared with MFAAdmin, which runs unsandboxed) uses the
+# shared /tmp namespace. Do not enable PrivateTmp, or MFAAdmin's view of the mutex diverges
+# from this service's, defeating the serialization it exists for.
+ReadWritePaths=/etc/mfa-auth /var/log/mfa-auth /run /tmp
 
 # Sandboxing that doesn't depend on which capabilities this process happens to use, so it's
 # safe regardless: this service never loads kernel modules, joins namespaces, execs a SUID
@@ -587,9 +590,6 @@ UMask=0027
 NoNewPrivileges=true
 ProtectHome=true
 ProtectSystem=strict
-# .NET's cross-process database mutex uses the shared /tmp namespace.
-# Do not enable PrivateTmp: the admin CLI and privileged service must see it too.
-ReadWritePaths=/tmp
 LogsDirectory=mfa-web
 LogsDirectoryMode=0750
 
@@ -672,7 +672,7 @@ Linux (`iptables`). The Linux path is active automatically when running on Linux
 source changes are required for a standard `iptables` setup.
 
 Rules are tracked using an `iptables` comment that embeds the rule name and expiry
-timestamp (e.g. `MFA_Temp_1.2.3.4_22 exp:1746000000`). The sweeper reads
+timestamp (e.g. `MFA_Temp_1.2.3.4_22_TCP exp:1746000000`). The sweeper reads
 `iptables -S INPUT`, finds rules whose expiry has passed, and deletes them.
 
 **If your distro uses a different firewall backend**, replace the `iptables` calls in
@@ -685,11 +685,11 @@ Example equivalents for common backends:
 
 ```bash
 # nftables
-nft add rule ip filter INPUT ip saddr 1.2.3.4 tcp dport 22 accept comment "MFA_Temp_1.2.3.4_22 exp:1746000000"
+nft add rule ip filter INPUT ip saddr 1.2.3.4 tcp dport 22 accept comment "MFA_Temp_1.2.3.4_22_TCP exp:1746000000"
 nft delete rule ip filter INPUT handle <handle>
 
 # ufw
-ufw allow from 1.2.3.4 to any port 22 proto tcp comment "MFA_Temp_1.2.3.4_22 exp:1746000000"
+ufw allow from 1.2.3.4 to any port 22 proto tcp comment "MFA_Temp_1.2.3.4_22_TCP exp:1746000000"
 ufw delete allow from 1.2.3.4 to any port 22 proto tcp
 
 # List active MFA rules (iptables)

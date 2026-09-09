@@ -165,8 +165,9 @@ than trusting its caller.
   regenerated fresh by every `add` or `reprovision` — enrollment and reprovisioning also mint a
   short-lived registration token and readiness state. Both read and write access need
   protection: a reader can disclose hashes or race an active enrollment, while a writer can
-  enroll their own credential. Both platforms serialize access through a cross-process mutex,
-  and the internet-facing MFAWeb cannot write it directly
+  enroll their own credential. MFAService and MFAAdmin — the only two writers — serialize
+  against each other through a cross-process mutex; the internet-facing MFAWeb never writes the
+  store directly, and reads it without that same serialization
 - **Building with `-p:AllowTotp=true` changes that**, and it is the main reason the flag is not
   the default. TOTP verification is `HMAC-SHA1(secret, timestep)`, so the server must keep each
   shared secret in recoverable form — it cannot be hashed, because a hash cannot generate codes.

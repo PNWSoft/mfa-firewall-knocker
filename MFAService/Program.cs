@@ -1396,7 +1396,8 @@ public class DatabaseLockService : BackgroundService
 
     private static byte[] Entropy = Array.Empty<byte>();
 
-    // Cross-process mutex — shared by MFAWeb, MFAService, and MFAAdmin to serialize all DB reads/writes.
+    // Cross-process mutex — shared by MFAService and MFAAdmin, the only two writers, to serialize
+    // their writes. MFAWeb never writes the store and does not participate in this mutex.
     // ACL-restricted so only SYSTEM, Builtin Administrators, and the gMSA can acquire it.
     // Initialized in the constructor so the service account name comes from appsettings.
     private static System.Threading.Mutex _dbMutex = null!;

@@ -141,8 +141,9 @@ It does not open anything.
 
 `MFAAdmin reset` removes every MFA-granted rule and does not require MFAService. It runs elevated
 and issues the firewall commands directly — `Remove-NetFirewallRule` on Windows, `iptables -D` on
-Linux — then re-reads the rule list and reports what remains rather than assuming the deletions
-succeeded. This applies to emergency revocation generally, not only to outages. `MFAAdmin diag`
+Linux. On Linux it then re-reads the rule list and reports what remains rather than assuming the
+deletions succeeded; on Windows it issues the removal and reports success without a corresponding
+re-check. This applies to emergency revocation generally, not only to outages. `MFAAdmin diag`
 lists the rules without removing them.
 
 `reset` is all-or-nothing; there is no per-user or per-rule revocation, so all users must
@@ -336,9 +337,10 @@ Tracked, understood, and not currently considered exploitable:
   accident. INSTALL.md has a "Verify the gate is actually gating" section; run it after install and
   after any firewall change.
 - **On Linux the rule is created with `iptables`, so a client connecting over public IPv6 gets no
-  rule.** Both sides accept a public IPv6 address as valid, and the user is shown ACCESS GRANTED,
-  but the `iptables` call cannot create a v6 rule and the verification logs a failure. It fails
-  closed — nothing is opened — but the report to the user is wrong. Until `ip6tables` support
+  rule.** Both sides accept a public IPv6 address as valid, but the `iptables` call cannot create a
+  v6 rule; MFAService reports the failure back over IPC, and MFAWeb shows a 503 ("Firewall service
+  is temporarily unavailable") rather than ACCESS GRANTED. It fails closed and reports that
+  accurately — the remaining gap is availability, not a false success. Until `ip6tables` support
   exists, publish an A record only, or disable the IPv6 listener on Linux deployments.
 - **Email addresses with a quoted `|` in the local part cannot authenticate.** The IPC
   protocol is `|`-delimited and the privileged side rejects requests with the wrong field
