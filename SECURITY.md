@@ -214,9 +214,11 @@ A reader who can watch an active enrollment can race the legitimate user after t
 has made that token ready, so confidentiality still matters during those windows.
 
 Integrity is always critical: someone who can write the store can add their own passkey credential
-and become that user. For an already-enrolled account with no active provisioning state, a read
-does not reveal a credential that can produce a WebAuthn assertion, but it still discloses the
-user list and the enrollment password hash.
+and become that user. For an already-enrolled, passkey-only account with no active provisioning
+state, its password hash has already been cleared by the burn-after-use/expiry handling above --
+there is no live secret left there to disclose. A read still discloses the user list, and for any
+account still inside an active enrollment window, that window's live password hash and its
+outstanding tokens.
 
 The file permissions in INSTALL.md protect both properties. DPAPI encryption on Windows raises the
 bar on reads, while filesystem permissions remain the primary boundary against unauthorized reads
@@ -239,7 +241,7 @@ That produces a sharp asymmetry between the two build modes:
 
 | | What the server stores | What a full database breach yields |
 |---|---|---|
-| Passkey-only | public keys, usernames, the current one-time enrollment password hash, and any active enrollment state | account data, the enrollment password hash, and usable enrollment tokens during their short validity window, but no private passkey key |
+| Passkey-only | public keys, usernames, and -- only for an account still inside its enrollment window -- that window's one-time enrollment password hash and provisioning state | account data, plus any still-live enrollment password hashes and usable enrollment tokens during their short validity window, but no private passkey key |
 | **TOTP-enabled** | **all passkey-only data plus each TOTP secret** — and once an account confirms TOTP, its password hash stops being one-time: it becomes that account's ongoing login credential, checked on every `/auth` request, and the burn-after-use/expiry handling described above no longer applies to it | **all of the above plus valid codes for every TOTP user until each secret is re-enrolled** |
 
 A TOTP database breach is a mass-compromise event: every enrolled user's second factor becomes
