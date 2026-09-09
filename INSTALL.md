@@ -542,7 +542,12 @@ RestrictNamespaces=true
 RestrictSUIDSGID=true
 RestrictRealtime=true
 LockPersonality=true
-ProtectProc=invisible
+
+# Deliberately NOT set: ProtectProc=invisible. Verified directly against a live host -- with
+# every other directive above applied, adding this one alone makes systemd wait forever for the
+# Type=notify readiness signal this app's AddSystemd() call sends, so the unit never leaves
+# "activating" and cycles through StartLimitBurst until it gives up. Everything else in this
+# unit was verified working together with a real end-to-end login on the same host.
 
 # Narrowed to what this process actually does: manage iptables (NET_ADMIN/NET_RAW, and
 # NETLINK for the address family below) and own files across users (DAC_OVERRIDE, CHOWN,
@@ -590,8 +595,10 @@ UMask=0027
 NoNewPrivileges=true
 ProtectHome=true
 ProtectSystem=strict
-LogsDirectory=mfa-web
-LogsDirectoryMode=0750
+# MFAWeb logs to /var/log/mfa-auth, the directory shared with MFAService (see step 4) -- not a
+# LogsDirectory= of its own. Verified directly: LogsDirectory=mfa-web here silently pointed
+# write access at /var/log/mfa-web instead, and every log write failed under ProtectSystem=strict.
+ReadWritePaths=/var/log/mfa-auth
 
 # Same rationale as MFAService's unit: these don't depend on which capabilities this process
 # happens to use, so they're safe regardless. This is the internet-facing half and the one
@@ -606,7 +613,9 @@ RestrictNamespaces=true
 RestrictSUIDSGID=true
 RestrictRealtime=true
 LockPersonality=true
-ProtectProc=invisible
+
+# Deliberately NOT set: ProtectProc=invisible -- see MFAService's unit above. Verified the same
+# failure here: this app's Type=notify readiness signal never reaches systemd with it set.
 
 # Allow binding to ports below 1024 if using port 443. CapabilityBoundingSet narrows this to
 # exactly that capability; RestrictAddressFamilies to the HTTPS listener and the Unix socket
