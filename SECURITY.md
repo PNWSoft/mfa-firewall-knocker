@@ -340,10 +340,20 @@ Tracked, understood, and not currently considered exploitable:
   `OpenFirewallPort` and `SweepExpiredRules` select the table by the grant's own address family;
   MFAAdmin's `diag` and `reset` read and clear both tables. This closes the earlier gap where a
   v6 client was accepted as valid but the (IPv4-only) `iptables` call failed, so MFAWeb returned a
-  503 instead of ACCESS GRANTED — it failed closed, but it failed. As of this change it has been
-  exercised by the automated regression suite, not yet confirmed against a real dual-stack client
-  and a real deployment the way the IPv4 path has been; treat it as implemented but not yet
-  field-verified until that happens.
+  503 instead of ACCESS GRANTED — it failed closed, but it failed. Exercised by the automated
+  regression suite, and field-verified 2026-09-17 against a real dual-stack deployment: a real
+  browser passkey login over IPv6, from a real external IPv6 client, produced a verified `ip6tables`
+  rule and ACCESS GRANTED end to end.
+- **`BouncerConfig:Ipv6GrantPrefixLength` widens an IPv6 grant to a configurable network (`/64`
+  to `/128`, default `/128`) instead of the exact host address.** IPv6 privacy addresses
+  (RFC 4941) and cellular carriers commonly rotate the client's host suffix within the same `/64`
+  with no user action, which would otherwise strand an already-open grant the moment the address
+  rotates — a real gap the IPv4 side doesn't have, since a NAT'd IPv4 client's address is far more
+  stable session-to-session. This is an explicit trade: a wider grant authorizes more addresses per
+  successful login, bounded at `/64` (the actual on-link prefix in the near-universal SLAAC case,
+  not further) so it never trusts address bits beyond "the same physical link." Off by default;
+  set it deliberately if roaming within one `/64` matters more than the narrower default. Also
+  field-verified 2026-09-17 alongside the base IPv6 support above.
 - **Email addresses with a quoted `|` in the local part cannot authenticate.** The IPC
   protocol is `|`-delimited and the privileged side rejects requests with the wrong field
   count, so such an address fails closed rather than open. Provisioning does not currently

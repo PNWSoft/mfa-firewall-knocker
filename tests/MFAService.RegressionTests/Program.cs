@@ -182,6 +182,22 @@ Test("Linux expiry sweeps both iptables and ip6tables tables", () =>
     Check(commands.Rules.Count == 1 && commands.Rules.Any(r => r.Contains("_2222_TCP")));
     Check(commands.Rules6.Count == 1 && commands.Rules6.Any(r => r.Contains("_2222_TCP")));
 });
+Test("IPv6 grant widens to the configured prefix's containing network", () =>
+{
+    // Privacy-address/cellular rotation stays within the same /64, so the rule should match the
+    // network, not the exact host that happened to authenticate. IPv4 is unaffected by this
+    // setting -- see the Ipv6GrantPrefixLength constants' comment.
+    var commands = new FakeCommands();
+    Check(WorkerWithIpv6PrefixLength(commands, 64).ProcessFirewallRequest(RequestV6) == "SUCCESS");
+    Check(commands.Rules6.Count == 1);
+    Check(commands.Rules6[0].Contains("-s 2001:4860:4860::/64 ") && commands.Rules6[0].Contains("_22_TCP exp:"));
+});
+Test("IPv6 grant prefix length below the documented minimum is clamped, not rejected", () =>
+{
+    var commands = new FakeCommands();
+    Check(WorkerWithIpv6PrefixLength(commands, 32).ProcessFirewallRequest(RequestV6) == "SUCCESS");
+    Check(commands.Rules6.Count == 1 && commands.Rules6[0].Contains("-s 2001:4860:4860::/64 "));
+});
 Test("expired provisioning is cleared, but the password only when TOTP was never confirmed", () =>
 {
     var now = DateTime.UtcNow;
@@ -223,7 +239,7 @@ Test("expired provisioning is cleared, but the password only when TOTP was never
     // Already clean and expired: idempotent, reports no change on a second pass.
     Check(!DatabaseLockService.TryCleanExpiredProvisioning(neverConfirmed, now));
 });
-Console.WriteLine(failed == 0 ? "All 21 regression checks passed." : $"{failed} regression check(s) failed.");
+Console.WriteLine(failed == 0 ? "All 23 regression checks passed." : $"{failed} regression check(s) failed.");
 return failed == 0 ? 0 : 1;
 
 void Test(string name, Action action)
@@ -261,6 +277,14 @@ static FirewallWorkerService WorkerWithPrefix(FakeCommands commands, string pref
     if (ports.Length == 0) ports = new[] { "22/TCP" };
     var entries = ports.Select((port, index) => new KeyValuePair<string, string?>($"BouncerConfig:AllowedPorts:{index}", port))
         .Append(new KeyValuePair<string, string?>("BouncerConfig:RulePrefix", prefix));
+    return new FirewallWorkerService(new ConfigurationBuilder().AddInMemoryCollection(entries).Build(), commands);
+}
+static FirewallWorkerService WorkerWithIpv6PrefixLength(FakeCommands commands, int prefixLength, params string[] ports)
+{
+    if (ports.Length == 0) ports = new[] { "22/TCP" };
+    var entries = ports.Select((port, index) => new KeyValuePair<string, string?>($"BouncerConfig:AllowedPorts:{index}", port))
+        .Append(new KeyValuePair<string, string?>("BouncerConfig:RulePrefix", "MFA_Temp_"))
+        .Append(new KeyValuePair<string, string?>("BouncerConfig:Ipv6GrantPrefixLength", prefixLength.ToString()));
     return new FirewallWorkerService(new ConfigurationBuilder().AddInMemoryCollection(entries).Build(), commands);
 }
 static string Rule(string name, long expiry)
@@ -318,7 +342,11 @@ sealed class FakeCommands : IFirewallCommands
                 {
                     var match = Regex.Match(script, @"-p (\w+) --dport (\d+) -s (\S+).*--comment '([^']+)'$");
                     if (!match.Success) throw new Exception("Unexpected insertion format");
-                    rules.Add($"-A INPUT -s {match.Groups[3].Value}/{mask} -p {match.Groups[1].Value} -m {match.Groups[1].Value} --dport {match.Groups[2].Value} -m comment --comment \"{match.Groups[4].Value}\" -j ACCEPT");
+                    // A widened IPv6 source already carries its own /prefix (see OpenFirewallPort);
+                    // only bare host addresses get the implicit /32 or /128 appended here.
+                    string source = match.Groups[3].Value;
+                    if (!source.Contains('/')) source += $"/{mask}";
+                    rules.Add($"-A INPUT -s {source} -p {match.Groups[1].Value} -m {match.Groups[1].Value} --dport {match.Groups[2].Value} -m comment --comment \"{match.Groups[4].Value}\" -j ACCEPT");
                 }
                 return "";
             }

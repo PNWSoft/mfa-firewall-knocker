@@ -302,6 +302,14 @@ database, the other offers a login that always fails — but it is not useful ei
 > clearly-marked sections in `OpenFirewallPort` and `SweepExpiredRules` in `MFAService/Program.cs`
 > (and their mirrors in `MFAAdmin/Program.cs`'s `diag`/`reset`) — for both address families, not
 > just IPv4. See the Linux Firewall Commands section of [INSTALL.md](INSTALL.md).
+>
+> **IPv6 roaming:** `BouncerConfig:Ipv6GrantPrefixLength` (default `128`, exact host — the same
+> behavior as IPv4) can be set anywhere from `64` to `128` to widen a grant to the client's
+> containing network instead of its exact address. This matters for IPv6 specifically because
+> privacy addresses (RFC 4941) and cellular carriers commonly rotate the host suffix within the
+> same `/64` on their own, which would otherwise silently strand an open grant the next time the
+> address changes. It's an explicit trade-off — a wider setting authorizes more addresses per
+> login — so it's off (exact host) unless you turn it on.
 
 ## Download
 
@@ -380,6 +388,10 @@ A few that are easy to get wrong:
   cert monitor will watch a different certificate than the one being served.
 - **`AllowedDomains`** — restricts which email domains can be provisioned.
 - **`BouncerConfig:AllowedPorts`** — the only ports MFAService will ever open, e.g. `["22/TCP"]`.
+- **`BouncerConfig:Ipv6GrantPrefixLength`** — defaults to `128` (exact host address, matching
+  IPv4). Set between `64` and `128` to widen an IPv6 grant to the client's containing network, so
+  a privacy-address or cellular-carrier rotation within the same `/64` doesn't strand the grant.
+  See the note under Prerequisites for the trade-off this makes.
 - **`LogoUrl`** — leave empty to use the bundled knocker logo, or point it at your own image.
 
 > **Do not put a reverse proxy in front of MFAWeb.** It deliberately ignores `X-Forwarded-For` and
@@ -445,6 +457,15 @@ connected.
 Whether an established session survives depends on your platform, your firewall, and what is
 listening behind the port — and a client reaching that port through some *other* rule (a
 permanently open port, a trusted interface, a separate allow) is unaffected either way.
+
+**Multiple users behind the same source IP necessarily share a rule.** A grant is scoped to a
+source IP address, not to a person or device — an office NAT, a shared proxy, a hotel network, or
+any other setup that puts several people behind one address means all of them are covered by the
+same rule for as long as it is open. Source-IP scoping is the entire access-control mechanism
+here, so this software cannot allow one of those people through while blocking another at the same
+address; it has no finer-grained identity to act on. If you need to discriminate between people who
+share a network path, that has to come from something else — application-layer auth on the
+protected service itself, for example — not from this tool.
 
 **Prepare a termination procedure before you need it, and treat it as your responsibility.**
 Only you can decide what it should do, because the right action is environment-specific:

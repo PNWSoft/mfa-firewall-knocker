@@ -213,6 +213,20 @@ public class FirewallWorkerService : BackgroundService
     // possible, but a misconfiguration cannot leave rules in the firewall indefinitely.
     private const int MaxExpirationHours = 48;
 
+    // Bounds on BouncerConfig:Ipv6GrantPrefixLength -- how much of the client's IPv6 address is
+    // widened into the grant, rather than matching the exact /128 host address. IPv6 privacy
+    // addresses (RFC 4941) and cellular carriers commonly rotate the host suffix within the same
+    // /64 without any user action, which would otherwise strand an already-open grant against a
+    // suffix that's already changed by the next request. /64 is the loosest allowed value because
+    // it's the actual on-link prefix in the near-universal SLAAC case -- widening further would
+    // start trusting address bits that don't correspond to "the same physical link", which is not
+    // what this is for. /128 (the default) is the exact-host behavior, matching IPv4 grants.
+    // IPv4 is deliberately not covered by this: CGNAT rotation is a different, unsolved problem
+    // (see the roaming design notes), and a /24-equivalent IPv4 widening would trust far more
+    // addresses per grant than the IPv6 case does.
+    private const int MinIpv6GrantPrefixLength = 64;
+    private const int MaxIpv6GrantPrefixLength = 128;
+
     public FirewallWorkerService(IConfiguration config) : this(config, new SystemFirewallCommands()) { }
 
     internal FirewallWorkerService(IConfiguration config, IFirewallCommands commands)
@@ -1021,6 +1035,23 @@ public class FirewallWorkerService : BackgroundService
             expirationHours = MaxExpirationHours;
         }
 
+        // Same clamp-and-say-so treatment as ExpirationHours above. Only meaningful for IPv6
+        // grants on Linux (see OpenFirewallPort); read once per request rather than per port.
+        int ipv6PrefixLength = _config.GetValue<int>("BouncerConfig:Ipv6GrantPrefixLength", MaxIpv6GrantPrefixLength);
+        if (ipv6PrefixLength < MinIpv6GrantPrefixLength)
+        {
+            ServiceLogger.Warn($"[CONFIG] BouncerConfig:Ipv6GrantPrefixLength={ipv6PrefixLength} is below the " +
+                               $"minimum of {MinIpv6GrantPrefixLength}; using {MinIpv6GrantPrefixLength}.");
+            ipv6PrefixLength = MinIpv6GrantPrefixLength;
+        }
+        else if (ipv6PrefixLength > MaxIpv6GrantPrefixLength)
+        {
+            ServiceLogger.Warn($"[CONFIG] BouncerConfig:Ipv6GrantPrefixLength={ipv6PrefixLength} exceeds the " +
+                               $"{MaxIpv6GrantPrefixLength}-bit maximum; clamping to {MaxIpv6GrantPrefixLength}. " +
+                               "Check the configuration for a typo.");
+            ipv6PrefixLength = MaxIpv6GrantPrefixLength;
+        }
+
         try
         {
             // Serialize grants and expiry so the sweeper cannot delete a concurrently renewed rule.
@@ -1051,7 +1082,7 @@ public class FirewallWorkerService : BackgroundService
                         throw new InvalidOperationException($"Protocol in '{portProto}' must be TCP or UDP.");
                     }
 
-                    OpenFirewallPort(ip, port, username, protocol, expirationHours);
+                    OpenFirewallPort(ip, port, username, protocol, expirationHours, ipv6PrefixLength);
                 }
             }
 
@@ -1116,7 +1147,7 @@ public class FirewallWorkerService : BackgroundService
     // -----------------------------------------------------------------------
     // FIREWALL OPERATIONS
     // -----------------------------------------------------------------------
-    private void OpenFirewallPort(string ip, int port, string username, string protocol, int expirationHours)
+    private void OpenFirewallPort(string ip, int port, string username, string protocol, int expirationHours, int ipv6PrefixLength)
     {
         string expiresClean = DateTime.UtcNow.AddHours(expirationHours).ToString("yyyy-MM-dd HH:mm UTC");
         string ruleName     = $"{_rulePrefix}{ip}_{port}_{protocol}";
@@ -1189,10 +1220,24 @@ public class FirewallWorkerService : BackgroundService
             long   expEpoch = DateTimeOffset.UtcNow.AddHours(expirationHours).ToUnixTimeSeconds();
             string comment  = $"{ruleName} exp:{expEpoch}";
 
+            // For IPv6 grants narrower than /128, match the containing network rather than the
+            // exact host address -- see the constants' comment for why. ip is already validated
+            // upstream (IsPublicIpAddress), so Parse here reflects an accepted address family.
+            // IPv4 is never widened: the source spec is always the bare address there.
+            string sourceSpec = ip;
+            if (table == "ip6tables" && ipv6PrefixLength < 128)
+            {
+                var network = new System.Net.IPNetwork(System.Net.IPAddress.Parse(ip), ipv6PrefixLength).BaseAddress;
+                sourceSpec = $"{network}/{ipv6PrefixLength}";
+            }
+
             // Upsert: remove any existing rule for this IP+port, then insert a fresh one.
             // iptables -I is not idempotent on its own — without the delete step it would
             // stack duplicate rules on repeated logins from the same IP. A prior rule for this
             // exact ruleName is necessarily in the same table, since the name embeds this IP.
+            // (A different host address in the same widened /64 gets its own ruleName and its
+            // own overlapping rule rather than being deduplicated against this one -- simpler and
+            // still correct, since the sweeper expires each independently regardless of overlap.)
             string existing = _commands.Bash($"{table} -S INPUT");
             foreach (string line in existing.Split('\n', StringSplitOptions.RemoveEmptyEntries))
             {
@@ -1200,7 +1245,7 @@ public class FirewallWorkerService : BackgroundService
                     DeleteLinuxRule(table, line);
             }
 
-            _commands.Bash($"{table} -I INPUT -p {proto} --dport {port} -s {ip} -j ACCEPT -m comment --comment '{comment}'");
+            _commands.Bash($"{table} -I INPUT -p {proto} --dport {port} -s {sourceSpec} -j ACCEPT -m comment --comment '{comment}'");
             ServiceLogger.Debug($"[FIREWALL] {table} rule inserted in {fw.ElapsedMilliseconds}ms. Verifying...");
 
             // Verify by scanning the rule list for our comment, not with `iptables -C`.
@@ -1215,9 +1260,9 @@ public class FirewallWorkerService : BackgroundService
                 .Any(l => TryGetManagedRule(l, out var name, out var expiry) && name == ruleName && expiry == expEpoch);
 
             if (verified)
-                ServiceLogger.Log($"[SUCCESS] {table} rule verified: {protocol}/{port} OPEN for {ip}.");
+                ServiceLogger.Log($"[SUCCESS] {table} rule verified: {protocol}/{port} OPEN for {sourceSpec}.");
             else
-                throw new InvalidOperationException($"{table} rule could not be verified: {protocol}/{port} for {ip}.");
+                throw new InvalidOperationException($"{table} rule could not be verified: {protocol}/{port} for {sourceSpec}.");
         }
     }
 
