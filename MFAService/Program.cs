@@ -171,12 +171,41 @@ internal static class ServiceLogger
             string path = Path.Combine(LogDirectory, $"mfaservice_{DateTime.UtcNow:yyyy-MM-dd}.log");
             lock (_lock)
             {
+                DeleteExpiredLogs("mfaservice_");
                 File.AppendAllText(path, entry + Environment.NewLine);
             }
         }
         catch (Exception ex)
         {
             Console.WriteLine($"[LOG ERROR] Could not write to log file: {ex.Message}");
+        }
+    }
+
+    // Daily files are kept for LogRetentionDays, then deleted by the first write of a new UTC day.
+    // Dated by file name rather than mtime, so a touched or copied old file still ages out.
+    private const int LogRetentionDays = 90;
+    private static DateTime _lastRetentionSweepDay = DateTime.MinValue;
+
+    // Caller holds _lock. A failure is only reported to the console, so it never blocks the log write.
+    private static void DeleteExpiredLogs(string prefix)
+    {
+        var today = DateTime.UtcNow.Date;
+        if (_lastRetentionSweepDay == today) return;
+        _lastRetentionSweepDay = today;
+        try
+        {
+            foreach (var file in Directory.EnumerateFiles(LogDirectory, prefix + "*.log"))
+            {
+                string datePart = Path.GetFileNameWithoutExtension(file).Substring(prefix.Length);
+                if (DateTime.TryParseExact(datePart, "yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture,
+                        System.Globalization.DateTimeStyles.None, out var day)
+                    && day < today.AddDays(-LogRetentionDays))
+                    File.Delete(file);
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[LOG ERROR] Could not remove expired log files: {ex.Message}");
         }
     }
 
@@ -232,8 +261,26 @@ public class FirewallWorkerService : BackgroundService
     internal FirewallWorkerService(IConfiguration config, IFirewallCommands commands)
     {
         _config = config;
-        _rulePrefix = config["BouncerConfig:RulePrefix"] ?? "MFA_Temp_";
+        _rulePrefix = ValidateRulePrefix(config["BouncerConfig:RulePrefix"] ?? "MFA_Temp_");
         _commands = commands;
+    }
+
+    // RulePrefix is validated rather than escaped. It reaches single-quoted PowerShell, a
+    // single-quoted iptables --comment, and the patterns that read rules back, and a quote breaks
+    // each one differently. On Linux the failure was silent: grants were created under a name the
+    // sweeper could never match, so they were never removed. Refusing to start is the safe outcome
+    // for a config error that would otherwise turn time-limited grants into standing ones.
+    private static readonly Regex RulePrefixPattern = new(@"^[A-Za-z0-9 _.-]{1,64}\z");
+
+    private static readonly Regex PlainEmailPattern = new(@"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\z");
+
+    internal static string ValidateRulePrefix(string prefix)
+    {
+        if (RulePrefixPattern.IsMatch(prefix)) return prefix;
+        string message = "[CONFIG] BouncerConfig:RulePrefix may contain only letters, digits, space, '_', '.' " +
+                         "and '-' (1-64 characters). Refusing to start rather than create rules the sweeper cannot remove.";
+        ServiceLogger.Error(message);
+        throw new InvalidOperationException(message);
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -1014,7 +1061,11 @@ public class FirewallWorkerService : BackgroundService
             ServiceLogger.Warn($"[SECURITY] Refused firewall rule for non-public IP: {ip}");
             return "ERROR: Only public IP addresses may be authorized";
         }
-        if (!MailAddress.TryCreate(username, out _))
+        // Plain addresses only, the same form MFAAdmin 'add' enforces. MailAddress alone also
+        // accepts quoted local parts ("any text"@domain), which can carry spaces, quotes and text
+        // such as "Exp: 2000-01-01 00:00" into the Windows rule description the sweeper parses.
+        // An account imported from an older database with such a name fails closed here.
+        if (!PlainEmailPattern.IsMatch(username) || !MailAddress.TryCreate(username, out _))
             return "ERROR: Invalid username";
 
         // Bound the configured window in BOTH directions. Without an upper cap a slipped digit
@@ -1036,7 +1087,7 @@ public class FirewallWorkerService : BackgroundService
         }
 
         // Same clamp-and-say-so treatment as ExpirationHours above. Only meaningful for IPv6
-        // grants on Linux (see OpenFirewallPort); read once per request rather than per port.
+        // grants, on either platform (see OpenFirewallPort); read once per request rather than per port.
         int ipv6PrefixLength = _config.GetValue<int>("BouncerConfig:Ipv6GrantPrefixLength", MaxIpv6GrantPrefixLength);
         if (ipv6PrefixLength < MinIpv6GrantPrefixLength)
         {
@@ -1154,6 +1205,24 @@ public class FirewallWorkerService : BackgroundService
         var fw = System.Diagnostics.Stopwatch.StartNew();
         ServiceLogger.Log($"[FIREWALL] Configuring rule: {ruleName}...");
 
+        // For IPv6 grants narrower than /128, match the containing network rather than the exact
+        // host address -- see the Ipv6GrantPrefixLength constants' comment for why. Applies on
+        // both platforms: Windows' -RemoteAddress accepts CIDR notation the same way iptables/
+        // ip6tables do. ip is already validated upstream (IsPublicIpAddress), so Parse here
+        // reflects an address family already accepted, never unvalidated user input. IPv4 is
+        // never widened: the source spec is always the bare address there.
+        string sourceSpec = ip;
+        if (System.Net.IPAddress.Parse(ip).AddressFamily == AddressFamily.InterNetworkV6 && ipv6PrefixLength < 128)
+        {
+            // Host bits are cleared here rather than left to IPNetwork: its constructor is
+            // documented to reject a base address with host bits set, even though current
+            // runtimes clear them instead. Neither behavior is relied on this way.
+            byte[] bytes = System.Net.IPAddress.Parse(ip).GetAddressBytes();
+            for (int bit = ipv6PrefixLength; bit < 128; bit++)
+                bytes[bit / 8] &= (byte)~(0x80 >> (bit % 8));
+            sourceSpec = $"{new System.Net.IPAddress(bytes)}/{ipv6PrefixLength}";
+        }
+
         if (_commands.IsWindows)
         {
             // Escape single quotes for PowerShell string safety ('' is the PS escape for ')
@@ -1163,7 +1232,7 @@ public class FirewallWorkerService : BackgroundService
             string script = $@"
                 $n     = '{ruleName}';
                 $desc  = '{description}';
-                $ip    = '{ip}';
+                $ip    = '{sourceSpec}';
                 $p     = {port};
                 $proto = '{protocol}';
 
@@ -1202,7 +1271,7 @@ public class FirewallWorkerService : BackgroundService
             ServiceLogger.Debug($"[FIREWALL] Verify completed in {fw.ElapsedMilliseconds}ms total.");
 
             if (verifyOutput.Equals(ruleName, StringComparison.OrdinalIgnoreCase))
-                ServiceLogger.Log($"[SUCCESS] Rule verified: {protocol}/{port} OPEN for {ip}.");
+                ServiceLogger.Log($"[SUCCESS] Rule verified: {protocol}/{port} OPEN for {sourceSpec}.");
             else
                 throw new InvalidOperationException($"Rule '{ruleName}' could not be verified after creation.");
         }
@@ -1219,17 +1288,6 @@ public class FirewallWorkerService : BackgroundService
             string proto    = protocol.ToLowerInvariant();
             long   expEpoch = DateTimeOffset.UtcNow.AddHours(expirationHours).ToUnixTimeSeconds();
             string comment  = $"{ruleName} exp:{expEpoch}";
-
-            // For IPv6 grants narrower than /128, match the containing network rather than the
-            // exact host address -- see the constants' comment for why. ip is already validated
-            // upstream (IsPublicIpAddress), so Parse here reflects an accepted address family.
-            // IPv4 is never widened: the source spec is always the bare address there.
-            string sourceSpec = ip;
-            if (table == "ip6tables" && ipv6PrefixLength < 128)
-            {
-                var network = new System.Net.IPNetwork(System.Net.IPAddress.Parse(ip), ipv6PrefixLength).BaseAddress;
-                sourceSpec = $"{network}/{ipv6PrefixLength}";
-            }
 
             // Upsert: remove any existing rule for this IP+port, then insert a fresh one.
             // iptables -I is not idempotent on its own — without the delete step it would
@@ -2209,31 +2267,6 @@ public class CertificateMonitorService : BackgroundService
             ServiceLogger.Error($"[CERT] Failed to send alert email: {ex.Message}");
             return false;
         }
-    }
-}
-
-internal static class SmtpTransportPolicy
-{
-    internal static bool GetUseSsl(IConfiguration config, string host)
-    {
-        string? configured = config["Smtp:UseSsl"];
-        if (string.IsNullOrWhiteSpace(configured)) return true;
-        if (!bool.TryParse(configured, out bool useSsl))
-            throw new InvalidOperationException($"Smtp:UseSsl value '{configured}' is not true or false.");
-        if (!useSsl && !IsLoopbackHost(host))
-            throw new InvalidOperationException(
-                "Smtp:UseSsl may be false only for a loopback SMTP relay (localhost, 127.0.0.0/8, or ::1).");
-        return useSsl;
-    }
-
-    private static bool IsLoopbackHost(string host)
-    {
-        string candidate = host.Trim().TrimEnd('.');
-        if (candidate.Equals("localhost", StringComparison.OrdinalIgnoreCase)) return true;
-
-        candidate = candidate.TrimStart('[').TrimEnd(']');
-        return System.Net.IPAddress.TryParse(candidate, out var address)
-            && System.Net.IPAddress.IsLoopback(address);
     }
 }
 

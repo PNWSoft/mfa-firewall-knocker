@@ -104,9 +104,12 @@ The reverse case matters more, since this is one person's code and the component
 track record.
 
 **This adds attack surface.** It is an internet-facing web application. The surface is narrow by
-construction: a small number of routes, no user-supplied content rendered back, no database
-engine, no file uploads, and a process that runs unprivileged, cannot write the user store and
-cannot issue a firewall command.
+construction: a small number of routes, no free-text user content rendered back (the
+request-derived values a page echoes, a provisioning token from the URL and the connecting
+address, are HTML-encoded), no database
+engine, no file uploads, and a process that runs unprivileged and cannot write the user store.
+It cannot run a firewall command itself; it can ask MFAService to open the configured ports for
+a public address, and MFAService re-checks that request rather than trusting it.
 
 Most outcomes of exploiting it leave the operator no worse off than not deploying it. Defeating
 the gate opens a port to a service that still requires its own key — the position the operator
@@ -140,14 +143,16 @@ An outage therefore costs the ability to grant access and the timely removal of 
 It does not open anything.
 
 `MFAAdmin reset` removes every MFA-granted rule and does not require MFAService. It runs elevated
-and issues the firewall commands directly — `Remove-NetFirewallRule` on Windows, `iptables -D` on
-Linux. On Linux it then re-reads the rule list and reports what remains rather than assuming the
+and issues the firewall commands directly — `Remove-NetFirewallRule` on Windows, `iptables -D` and
+`ip6tables -D` on Linux. On Linux it then re-reads the rule list and reports what remains rather than assuming the
 deletions succeeded; on Windows it issues the removal and reports success without a corresponding
 re-check. This applies to emergency revocation generally, not only to outages. `MFAAdmin diag`
 lists the rules without removing them.
 
-`reset` is all-or-nothing; there is no per-user or per-rule revocation, so all users must
-re-authenticate afterwards. To remove a single grant, delete that rule directly.
+`reset` removes every grant, so all users must re-authenticate afterwards. On Windows,
+`MFAAdmin delete` also removes the deleted user's own rules, because Windows rules record the
+username. Linux rules do not, so there a single grant is removed by deleting that rule directly
+(`diag` lists them by address).
 
 ### Where the credential goes
 
@@ -167,15 +172,19 @@ until someone completes a WebAuthn ceremony against a passkey that:
 - **requires authenticator-mediated user verification** — every assertion requests a biometric,
   device PIN, or equivalent local verification. This protects against simple device possession,
   while the authenticator provider's account-recovery and sync controls remain a trust boundary.
-- **cannot be phished** — the assertion is bound to the origin, so a convincing fake site cannot
-  harvest anything replayable.
+- **cannot be phished** — the assertion is bound to the site it was made on, and MFAWeb accepts
+  only its configured origins (`AppUrl`, plus any exact entries in `AdditionalOrigins`), so a
+  convincing fake site on any other name cannot harvest anything replayable. Every name listed
+  there is trusted as fully as `AppUrl`: keep its DNS pointing at this server, or remove it from
+  the configuration.
 
 So an attacker holding your profile has a key to a door that isn't there. They cannot open it
 from their address, and no amount of possessing the file changes that. The credential's value
 drops from "permanent access from anywhere" to nothing, without rotating a single key.
 
 **It also removes standing exposure generally:** the port is closed by default, each grant covers
-one source address, expires on its own, and is logged.
+one source address (or, if `Ipv6GrantPrefixLength` is set below 128, that address's IPv6
+network), expires on its own, and is logged.
 
 ### The compromised endpoint
 
@@ -266,6 +275,17 @@ rest.
 - **Anything behind the same public IP.** Rules are keyed on the source address, so every device
   sharing that NAT is inside the grant for its duration. At home that is your own devices; on an
   office, hotel, or café network it is not.
+- **Browser-only relays such as iCloud Private Relay.** The grant is keyed on the address the
+  login arrived from. For a Safari user with Private Relay on, that is one of the relay's exit
+  addresses, and it can change between sessions (two logins in one test came from different
+  `/64`s). Private Relay carries only browser traffic, so the protected service's own connection
+  leaves from the device's real address and does not match the grant: the login succeeds and the
+  tunnel does not connect. For WireGuard (UDP), the grant on the relay address does not appear to
+  admit anyone else either: only the relay can send from or receive at those addresses, it
+  forwards only browser TCP and QUIC, and a packet forged from that address cannot complete a
+  handshake because the reply goes to the relay. That analysis relies on WireGuard's handshake
+  needing a reply; other services behind the gate, UDP or TCP, have not been examined. The fix is on the client: turn off Private
+  Relay for this site, or sign in from another browser.
 - **Per-connection authorisation.** Once a rule is open, the protocol behind the port applies its
   own authentication and nothing more. This gate is not consulted again until the rule expires.
 - **Confidentiality or integrity of traffic.** No encryption of its own; that is entirely the job
@@ -356,5 +376,7 @@ Tracked, understood, and not currently considered exploitable:
   field-verified 2026-09-17 alongside the base IPv6 support above.
 - **Email addresses with a quoted `|` in the local part cannot authenticate.** The IPC
   protocol is `|`-delimited and the privileged side rejects requests with the wrong field
-  count, so such an address fails closed rather than open. Provisioning does not currently
-  refuse these addresses at `add` time.
+  count, so such an address fails closed rather than open. Since 0.4.0, `MFAAdmin add` accepts
+  only plain addresses (no quotes, spaces or `|`), and MFAService refuses firewall requests for
+  any other form, so an account with such an address, whether provisioned by an earlier version
+  or restored with `import` (which warns about it but does not refuse), fails closed.

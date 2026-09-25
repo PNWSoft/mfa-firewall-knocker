@@ -87,6 +87,55 @@ Test("Linux custom prefixes with spaces preserve renewals and legacy expiry", ()
     Check(commands.Rules.Count(rule => rule.Contains("MFA Temp_8.8.8.8_22_TCP exp:")) == 1);
     Check(commands.Rules.Count(rule => rule.Contains("MFA Temp_8.8.8.8_2222_TCP exp:")) == 1);
 });
+Test("rule prefixes that would break quoting or rule parsing are refused at startup", () =>
+{
+    foreach (var bad in new[] { "MFA\"Temp_", "MFA'Temp_", "MFA$(id)_", "MFA`Temp_", "MFA_Temp_\n", "", new string('A', 65) })
+    {
+        bool refused = false;
+        try { WorkerWithPrefix(new FakeCommands(), bad); }
+        catch (InvalidOperationException) { refused = true; }
+        Check(refused);
+    }
+    Check(FirewallWorkerService.ValidateRulePrefix("MFA Temp_.-1") == "MFA Temp_.-1");
+});
+Test("quoted local parts are refused before reaching a firewall command", () =>
+{
+    // MailAddress accepts these; the Windows rule description would carry the text verbatim.
+    var commands = new FakeCommands();
+    foreach (var user in new[] { "\"x Exp: 2000-01-01 00:00\"@example.com", "\"a b\"@example.com" })
+        Check(Worker(commands).ProcessFirewallRequest($"8.8.8.8|{user}") == "ERROR: Invalid username");
+    Check(commands.Rules.Count == 0 && commands.WindowsNames.Count == 0);
+});
+Test("SMTP without TLS is accepted only for a relay on this machine", () =>
+{
+    static IConfiguration Smtp(string? useSsl) => new ConfigurationBuilder()
+        .AddInMemoryCollection(useSsl == null ? Array.Empty<KeyValuePair<string, string?>>()
+            : new[] { new KeyValuePair<string, string?>("Smtp:UseSsl", useSsl) }).Build();
+
+    Check(SmtpTransportPolicy.GetUseSsl(Smtp(null), "mail.example.com"));      // default is TLS
+    Check(SmtpTransportPolicy.GetUseSsl(Smtp("true"), "mail.example.com"));
+    Throws<InvalidOperationException>(() => SmtpTransportPolicy.GetUseSsl(Smtp("yes"), "localhost"));
+
+    foreach (var local in new[] { "localhost", "LOCALHOST.", "127.0.0.1", "127.5.5.5", "[::1]" })
+        Check(!SmtpTransportPolicy.GetUseSsl(Smtp("false"), local));
+
+    // Hostnames are never resolved, even this machine's own name.
+    foreach (var remote in new[] { "8.8.8.8", "fe80::1", "fe80::1%2", "169.254.1.1", "0.0.0.0", "::",
+                                   "224.0.0.1", "mail.example.com", System.Net.Dns.GetHostName() })
+        Throws<InvalidOperationException>(() => SmtpTransportPolicy.GetUseSsl(Smtp("false"), remote));
+
+    // An address assigned to one of this machine's interfaces that is Up counts as local.
+    var own = System.Net.NetworkInformation.NetworkInterface.GetAllNetworkInterfaces()
+        .Where(n => n.OperationalStatus == System.Net.NetworkInformation.OperationalStatus.Up)
+        .SelectMany(n => n.GetIPProperties().UnicastAddresses)
+        .Where(u => !System.Net.IPAddress.IsLoopback(u.Address) && !u.Address.IsIPv6LinkLocal
+                    && !u.Address.ToString().StartsWith("169.254.")
+                    && (!OperatingSystem.IsWindows() || u.DuplicateAddressDetectionState ==
+                        System.Net.NetworkInformation.DuplicateAddressDetectionState.Preferred))
+        .Select(u => u.Address).FirstOrDefault();
+    if (own != null) Check(!SmtpTransportPolicy.GetUseSsl(Smtp("false"), own.ToString()));
+    else Console.WriteLine("  (no non-loopback address on an Up interface; host-local case not exercised)");
+});
 Test("Linux deletion command error reaches caller", () =>
 {
     var commands = new FakeCommands { FailDelete = true };
@@ -198,6 +247,14 @@ Test("IPv6 grant prefix length below the documented minimum is clamped, not reje
     Check(WorkerWithIpv6PrefixLength(commands, 32).ProcessFirewallRequest(RequestV6) == "SUCCESS");
     Check(commands.Rules6.Count == 1 && commands.Rules6[0].Contains("-s 2001:4860:4860::/64 "));
 });
+Test("Windows IPv6 grant also widens to the configured prefix's containing network", () =>
+{
+    // The widening logic lives above the platform branch in OpenFirewallPort and Windows'
+    // -RemoteAddress accepts CIDR the same way ip6tables does -- this is not Linux-only.
+    var commands = new FakeCommands { IsWindows = true };
+    Check(WorkerWithIpv6PrefixLength(commands, 64).ProcessFirewallRequest(RequestV6) == "SUCCESS");
+    Check(commands.SeenScripts.Any(s => s.Contains("$ip    = '2001:4860:4860::/64'")));
+});
 Test("expired provisioning is cleared, but the password only when TOTP was never confirmed", () =>
 {
     var now = DateTime.UtcNow;
@@ -239,7 +296,7 @@ Test("expired provisioning is cleared, but the password only when TOTP was never
     // Already clean and expired: idempotent, reports no change on a second pass.
     Check(!DatabaseLockService.TryCleanExpiredProvisioning(neverConfirmed, now));
 });
-Console.WriteLine(failed == 0 ? "All 23 regression checks passed." : $"{failed} regression check(s) failed.");
+Console.WriteLine(failed == 0 ? "All 27 regression checks passed." : $"{failed} regression check(s) failed.");
 return failed == 0 ? 0 : 1;
 
 void Test(string name, Action action)

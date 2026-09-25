@@ -14,7 +14,7 @@ Directory.CreateDirectory(root);
 int passed = 0;
 try
 {
-    var fixtures = new[] { "assertion", "malformed", "credential", "challenge", "provision", "guesses", "totp" }
+    var fixtures = new[] { "assertion", "malformed", "credential", "challenge", "provision", "guesses", "totp", "forged" }
         .ToDictionary(name => name, name => new Fixture(name));
     await using (var server = await TestWeb.StartAsync(root, fixtures.Values))
     {
@@ -99,6 +99,70 @@ try
             Assert(server.AlertsFor(fixture) == 1, "TOTP provisioning failures did not trigger an alert.");
         });
 #endif
+
+        await Run("request text containing 'counter' cannot forge a credential-clone alert", async () =>
+        {
+            // Fido2 echoes the clientData type in its error ("... Was: '<type>'"). Clone detection
+            // used to be a substring test for "counter", so this request raised [SECURITY ALERT].
+            var fixture = fixtures["forged"];
+            await FailAssertion(server, fixture, clientDataType: "counter] [ERR] [SECURITY ALERT] forged");
+            string log = server.ReadLog();
+            Assert(!log.Contains($"[SECURITY ALERT] Possible credential clone for '{fixture.User.Username}'"),
+                "A request-controlled clientData type raised the credential-clone alert.");
+            Assert(!log.Contains("[ERR] [SECURITY ALERT] forged"), "Request text imitating a log tag reached the log verbatim.");
+        });
+    }
+
+    await Run("AdditionalOrigins accepts only exact https origins under AppUrl's host and port", () =>
+    {
+        const string app = "https://mfa-monitor.invalid:8443";
+        var ok = WebAuthnOrigins.Build(app, new[] { "https://v6.mfa-monitor.invalid:8443", "https://V6.mfa-monitor.invalid:8443/" });
+        Assert(ok.SetEquals(new[] { app, "https://v6.mfa-monitor.invalid:8443" }), $"Unexpected origin set: {string.Join(", ", ok)}");
+        foreach (var bad in new[]
+        {
+            "http://v6.mfa-monitor.invalid:8443",          // not https
+            "https://evil.example.test:8443",               // outside the passkeys' domain
+            "https://xmfa-monitor.invalid:8443",            // suffix without a dot boundary
+            "https://v6.mfa-monitor.invalid",               // different port
+            "https://v6.mfa-monitor.invalid:8443/login",    // path
+            "https://user@v6.mfa-monitor.invalid:8443",     // credentials
+            "https://*.mfa-monitor.invalid:8443",           // wildcard
+            "v6.mfa-monitor.invalid",                       // not a URL
+        })
+        {
+            bool refused = false;
+            try { WebAuthnOrigins.Build(app, new[] { bad }); }
+            catch (InvalidOperationException) { refused = true; }
+            Assert(refused, $"AdditionalOrigins accepted '{bad}'.");
+        }
+        return Task.CompletedTask;
+    });
+
+    // A listed extra origin must pass Fido2's origin check and an unlisted name under the same
+    // domain must fail it. Both assertions are signed with the wrong key, so neither signs in;
+    // what differs is which check rejects them. A fresh server keeps these probe lines under the
+    // per-source cap.
+    string originRoot = Path.Combine(root, "origins");
+    Directory.CreateDirectory(originRoot);
+    var listed = new Fixture("origin-listed");
+    var unlisted = new Fixture("origin-unlisted");
+    await using (var originServer = await TestWeb.StartAsync(originRoot, new[] { listed, unlisted },
+        new Dictionary<string, string> { ["AdditionalOrigins__0"] = "https://v6.mfa-monitor.invalid" }))
+    {
+        await Run("a listed additional origin passes origin validation and an unlisted subdomain does not", async () =>
+        {
+            await FailAssertion(originServer, listed, origin: "https://v6.mfa-monitor.invalid");
+            await FailAssertion(originServer, unlisted, origin: "https://evil.mfa-monitor.invalid");
+            string[] lines = originServer.ReadLog().Split('\n');
+            Assert(lines.Any(l => l.Contains("Passkey origins accepted: https://mfa-monitor.invalid, https://v6.mfa-monitor.invalid")),
+                "The accepted origin set was not logged at startup.");
+            string listedLine = lines.FirstOrDefault(l => l.Contains($"assertion failed for '{listed.User.Username}'")) ?? "";
+            string unlistedLine = lines.FirstOrDefault(l => l.Contains($"assertion failed for '{unlisted.User.Username}'")) ?? "";
+            Assert(listedLine.Length > 0 && !listedLine.Contains("Fully qualified origin"),
+                $"The listed origin was rejected by origin validation: {listedLine}");
+            Assert(unlistedLine.Contains("Fully qualified origin"),
+                $"An unlisted subdomain was not rejected by origin validation: {unlistedLine}");
+        });
     }
 
     await Run("successful authentication clears the account's previous failures", () =>
@@ -152,6 +216,32 @@ try
                 $"Per-account threshold logging was suppressed for {name} -- only the email channel should be capped.");
     });
 
+    await Run("probe lines are capped per source and overall, and unusual addresses are not echoed", () =>
+    {
+        // Pre-auth probe events are attacker-triggerable, so their individual lines must stay
+        // bounded no matter how many arrive: 5 per source, 50 per window overall.
+        AuditLogger.LogDirectory = Path.Combine(root, "probe-cap");
+        ProbeLog.Record("203.0.113.9", "203.0.113.9", "x] [ERR] [SECURITY ALERT] forged");
+        for (int i = 0; i < 20; i++)
+            ProbeLog.Record("198.51.100.1", "198.51.100.1", "probe from a single source");
+        for (int source = 0; source < 30; source++)
+            for (int i = 0; i < 5; i++)
+                ProbeLog.Record($"v6:{source:x14}", $"2001:db8:{source:x}::1", "probe from many sources");
+
+        string log = string.Join("\n", Directory.EnumerateFiles(AuditLogger.LogDirectory).Select(File.ReadAllText));
+        int single = log.Split('\n').Count(l => l.Contains("[PROBE] probe from a single source"));
+        int total = log.Split('\n').Count(l => l.Contains("[PROBE] "));
+        Assert(single == 5, $"Expected 5 lines from one source, saw {single}.");
+        Assert(total == 50, $"Expected 50 probe lines in the window overall, saw {total}.");
+        Assert(log.Contains("x) (ERR) (SECURITY ALERT) forged") && !log.Contains("[ERR] [SECURITY ALERT] forged"),
+            "Brackets in probe text were not neutralized.");
+
+        Assert(ProbeLog.DisplayEmail("user@example.test") == "'user@example.test'", "Plain address was not shown.");
+        string quoted = "\"] [ERR] [SECURITY ALERT] forged\"@example.test";
+        Assert(!ProbeLog.DisplayEmail(quoted).Contains("SECURITY"), "Quoted local part was echoed into the log.");
+        return Task.CompletedTask;
+    });
+
     Console.WriteLine($"PASS: {passed} authentication alert regression checks.");
 }
 finally
@@ -194,7 +284,8 @@ static async Task<(string Key, string Challenge)> Challenge(TestWeb server, Fixt
         body.RootElement.GetProperty("options").GetProperty("challenge").GetString()!);
 }
 
-static async Task FailAssertion(TestWeb server, Fixture fixture, bool unknownCredential = false)
+static async Task FailAssertion(TestWeb server, Fixture fixture, bool unknownCredential = false, string clientDataType = "webauthn.get",
+    string origin = "https://mfa-monitor.invalid")
 {
     var challenge = await Challenge(server, fixture);
     byte[] authenticatorData = new byte[37];
@@ -203,7 +294,7 @@ static async Task FailAssertion(TestWeb server, Fixture fixture, bool unknownCre
     authenticatorData[36] = 1;    // signature counter
     byte[] clientData = JsonSerializer.SerializeToUtf8Bytes(new
     {
-        type = "webauthn.get", challenge = challenge.Challenge, origin = "https://mfa-monitor.invalid"
+        type = clientDataType, challenge = challenge.Challenge, origin
     });
     string credential = unknownCredential ? B64(RandomNumberGenerator.GetBytes(32)) : fixture.CredentialId;
     // A complete assertion signed by a different key must fail cryptographic verification.

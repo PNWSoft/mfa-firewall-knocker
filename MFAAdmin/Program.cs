@@ -71,6 +71,7 @@ namespace MFAAdmin
                     Directory.CreateDirectory(LogDirectory);
                 lock (_lock)
                 {
+                    DeleteExpiredLogs("mfaadmin_");
                     File.AppendAllText(
                         Path.Combine(LogDirectory, $"mfaadmin_{DateTime.UtcNow:yyyy-MM-dd}.log"),
                         entry + Environment.NewLine);
@@ -79,6 +80,34 @@ namespace MFAAdmin
             catch (Exception ex)
             {
                 Console.WriteLine($"[LOG ERROR] Could not write to log file: {ex.Message}");
+            }
+        }
+
+        // Daily files are kept for LogRetentionDays, then deleted by the first write of a new UTC day.
+        // Dated by file name rather than mtime, so a touched or copied old file still ages out.
+        private const int LogRetentionDays = 90;
+        private static DateTime _lastRetentionSweepDay = DateTime.MinValue;
+
+        // Caller holds _lock. A failure is only reported to the console, so it never blocks the log write.
+        private static void DeleteExpiredLogs(string prefix)
+        {
+            var today = DateTime.UtcNow.Date;
+            if (_lastRetentionSweepDay == today) return;
+            _lastRetentionSweepDay = today;
+            try
+            {
+                foreach (var file in Directory.EnumerateFiles(LogDirectory, prefix + "*.log"))
+                {
+                    string datePart = Path.GetFileNameWithoutExtension(file).Substring(prefix.Length);
+                    if (DateTime.TryParseExact(datePart, "yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture,
+                            System.Globalization.DateTimeStyles.None, out var day)
+                        && day < today.AddDays(-LogRetentionDays))
+                        File.Delete(file);
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[LOG ERROR] Could not remove expired log files: {ex.Message}");
             }
         }
     }
@@ -159,11 +188,31 @@ namespace MFAAdmin
 
         private static string SiteName => Config?["SiteName"] ?? "MFA Auth";
 
-        private static string RulePrefix => Config?["RulePrefix"] ?? "MFA_Temp_";
+        // Same character set MFAService enforces on BouncerConfig:RulePrefix. A prefix it would
+        // refuse can't match any rule it created, so diag/reset/delete refuse it too rather than
+        // scanning for, or removing, rules under a name that doesn't belong to this tool.
+        private static readonly Regex RulePrefixPattern = new(@"^[A-Za-z0-9 _.-]{1,64}\z");
 
-        // Defence in depth: RulePrefix comes from appsettings.json, not user input, but it's
-        // interpolated into single-quoted PowerShell strings, so a stray "'" in a misconfigured
-        // value would break out of that quoting. Use this, never the raw property, in PowerShell.
+        // The only username form accepted by 'add', and by MFAService for firewall requests.
+        // MailAddress also accepts quoted local parts ("any text"@domain) and other forms carrying
+        // spaces, quotes or '|', which are misparsed where usernames are written into firewall
+        // rule descriptions ("User: <name> Exp: <time>") and IPC requests.
+        private static readonly Regex PlainEmailPattern = new(@"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\z");
+
+        private static string RulePrefix
+        {
+            get
+            {
+                string prefix = Config?["RulePrefix"] ?? "MFA_Temp_";
+                if (!RulePrefixPattern.IsMatch(prefix))
+                    throw new InvalidOperationException("RulePrefix may contain only letters, digits, space, " +
+                        "'_', '.' and '-' (1-64 characters); it must match MFAService's BouncerConfig:RulePrefix.");
+                return prefix;
+            }
+        }
+
+        // Validation above already excludes "'", so this is belt-and-braces: RulePrefix is
+        // interpolated into single-quoted PowerShell strings. Use this, never the raw property, there.
         private static string RulePrefixPsEscaped => RulePrefix.Replace("'", "''");
 
         // TOTP support is a COMPILE-TIME decision (-p:AllowTotp=true), not a config value, so
@@ -253,6 +302,21 @@ namespace MFAAdmin
             bool isElevatedPrompt = args.Contains("--elevated-pause");
             var cleanArgs = args.Where(a => a != "--elevated-pause").ToArray();
 
+            // Checked once here rather than only when diag/reset/delete first read it, so a bad
+            // value is a readable error on every command instead of an unhandled exception partway
+            // through one (which, in the elevated Windows console, closed before it could be read).
+            if (!RulePrefixPattern.IsMatch(Config["RulePrefix"] ?? "MFA_Temp_"))
+            {
+                AdminLogger.Error("[ERROR] RulePrefix may contain only letters, digits, space, '_', '.' and '-' " +
+                                  "(1-64 characters); it must match MFAService's BouncerConfig:RulePrefix.");
+                if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows) && isElevatedPrompt)
+                {
+                    Console.WriteLine("\nPress any key to exit...");
+                    Console.ReadKey();
+                }
+                return;
+            }
+
             if (cleanArgs.Length == 0)
             {
                 var _asm = Assembly.GetExecutingAssembly();
@@ -329,6 +393,15 @@ namespace MFAAdmin
             }
 
             username = mailAddress.Address;
+
+            // A quoted local part containing "Exp: 2000-01-01 00:00", for instance, would expire
+            // that user's own Windows grants on the next sweep. See PlainEmailPattern.
+            if (!PlainEmailPattern.IsMatch(username))
+            {
+                AdminLogger.Error("[ERROR] Username must be a plain email address: letters, digits and . _ % + - " +
+                                  "before the @, with no quotes or spaces.");
+                return;
+            }
 
             // Credentials generated outside the lock — BCrypt hashing is expensive
             string password = GenerateRandomPassword(12);
@@ -426,29 +499,7 @@ namespace MFAAdmin
             throw new InvalidOperationException($"Smtp:Port value '{v}' is not a valid port (1-65535).");
         }
 
-        static bool SmtpUseSsl(string host)
-        {
-            string? v = Config["Smtp:UseSsl"];
-            if (string.IsNullOrWhiteSpace(v)) return true;
-            if (!bool.TryParse(v, out var b))
-                throw new InvalidOperationException($"Smtp:UseSsl value '{v}' is not true or false.");
-
-            if (!b && !IsLoopbackSmtpHost(host))
-                throw new InvalidOperationException(
-                    "Smtp:UseSsl may be false only for a loopback SMTP relay (localhost, 127.0.0.0/8, or ::1).");
-
-            return b;
-        }
-
-        static bool IsLoopbackSmtpHost(string host)
-        {
-            string candidate = host.Trim().TrimEnd('.');
-            if (candidate.Equals("localhost", StringComparison.OrdinalIgnoreCase)) return true;
-
-            candidate = candidate.TrimStart('[').TrimEnd(']');
-            return System.Net.IPAddress.TryParse(candidate, out var address)
-                && System.Net.IPAddress.IsLoopback(address);
-        }
+        static bool SmtpUseSsl(string host) => SmtpTransportPolicy.GetUseSsl(Config, host);
 
         static bool SendProvisioningEmail(string userEmail, string tempPassword, string totpUrl, string passkeyUrl)
         {
@@ -766,6 +817,13 @@ namespace MFAAdmin
             if (strippedReady > 0)
                 Console.WriteLine($"  Note: cleared PasskeyRegistrationReady on {strippedReady} record(s) -- " +
                     "imported data cannot claim that state directly.");
+
+            // Not refused: import is how a backup is restored, and an older database may hold such
+            // an account. MFAService rejects its firewall requests, so it fails closed; say so here.
+            var nonPlain = imported.Where(u => !PlainEmailPattern.IsMatch(u.Username)).Select(u => u.Username).ToList();
+            if (nonPlain.Count > 0)
+                Console.WriteLine($"  Warning: {nonPlain.Count} account(s) do not have a plain email address and will not " +
+                    $"be able to open the firewall: {string.Join(", ", nonPlain)}");
 
             int existingCount;
             using (AcquireDbLock()) { existingCount = LoadUsers().Count; }
@@ -1187,10 +1245,13 @@ namespace MFAAdmin
             if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
             {
                 // WINDOWS LOGIC: Query PowerShell for our custom tagged rules
-                Console.WriteLine($"{"IP Address",-15} | {"Port",-6} | {"User",-25} | {"Expires (Local)",-20}");
-                Console.WriteLine(new string('-', 75));
+                Console.WriteLine($"{"Source",-43} | {"Port",-6} | {"User",-25} | {"Expires (Local)",-20}");
+                Console.WriteLine(new string('-', 103));
 
-                string psCommand = $"-NoProfile -Command \"Get-NetFirewallRule -DisplayName '{RulePrefixPsEscaped}*' -ErrorAction SilentlyContinue | ForEach-Object {{ $_.DisplayName + '||' + $_.Description }}\"";
+                // The rule's own RemoteAddress is read as well as its name: the name carries the
+                // client's exact address, but a grant widened by Ipv6GrantPrefixLength covers that
+                // address's network, and only the address filter says so.
+                string psCommand = $"-NoProfile -Command \"Get-NetFirewallRule -DisplayName '{RulePrefixPsEscaped}*' -ErrorAction SilentlyContinue | ForEach-Object {{ $_.DisplayName + '||' + $_.Description + '||' + ((($_ | Get-NetFirewallAddressFilter).RemoteAddress) -join ',') }}\"";
 
                 var psi = new ProcessStartInfo("powershell", psCommand)
                 {
@@ -1216,9 +1277,16 @@ namespace MFAAdmin
                     try
                     {
                         var parts = line.Split("||");
-                        var nameParts = parts[0].Split('_'); // e.g. MFA_Temp_192.168.1.50_22
-                        string ip = nameParts[2];
-                        string port = nameParts[3].Trim();
+                        // Name is "<RulePrefix><ip>_<port>_<protocol>". Strip the prefix before
+                        // splitting: it may contain any number of underscores (or none).
+                        string name = parts[0].Trim();
+                        if (!name.StartsWith(RulePrefix, StringComparison.Ordinal)) continue;
+                        var nameParts = name.Substring(RulePrefix.Length).Split('_');
+                        string ip = nameParts[0];
+                        string port = nameParts.Length > 1 ? nameParts[1].Trim() : "?";
+
+                        string remote = parts.Length > 2 ? parts[2].Trim() : "";
+                        if (remote.Length > 0) ip = remote;
 
                         string desc = parts.Length > 1 ? parts[1] : "";
                         string user = "Unknown";
@@ -1246,7 +1314,7 @@ namespace MFAAdmin
                                 : expireString;
                         }
 
-                        Console.WriteLine($"{ip,-15} | {port,-6} | {user,-25} | {expires,-20}");
+                        Console.WriteLine($"{ip,-43} | {port,-6} | {user,-25} | {expires,-20}");
                     }
                     catch
                     {
@@ -1276,12 +1344,15 @@ namespace MFAAdmin
                 }
                 else
                 {
-                    Console.WriteLine($"{"IP Address",-18} | {"Port",-6} | {"Expires",-20}");
-                    Console.WriteLine(new string('-', 52));
+                    Console.WriteLine($"{"Source",-43} | {"Port",-6} | {"Expires",-20}");
+                    Console.WriteLine(new string('-', 77));
 
                     foreach (string line in mine)
                     {
-                        string ip   = Regex.Match(line, @"-s\s+([^\s/]+)").Groups[1].Value;
+                        // Keep the prefix length when the grant covers a network (Ipv6GrantPrefixLength
+                        // below 128); drop it only for a single host (/32, /128), as before.
+                        string ip   = Regex.Match(line, @"-s\s+(\S+)").Groups[1].Value;
+                        if (ip.EndsWith("/32") || ip.EndsWith("/128")) ip = ip[..ip.LastIndexOf('/')];
                         string port = Regex.Match(line, @"--dport\s+(\d+)").Groups[1].Value;
 
                         string expires = "Unknown";
@@ -1290,7 +1361,7 @@ namespace MFAAdmin
                             expires = DateTimeOffset.FromUnixTimeSeconds(epoch)
                                         .ToLocalTime().ToString("MM/dd/yyyy HH:mm");
 
-                        Console.WriteLine($"{(ip.Length   == 0 ? "?" : ip),-18} | " +
+                        Console.WriteLine($"{(ip.Length   == 0 ? "?" : ip),-43} | " +
                                           $"{(port.Length == 0 ? "?" : port),-6} | {expires,-20}");
                     }
 

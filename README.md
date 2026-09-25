@@ -9,7 +9,7 @@
 Exposing SSH, RDP, or any admin port to the internet means exposing it to everyone. Closing it means
 you can't reach it either. This is the middle path: the port stays **closed by default**, and a
 user who proves who they are with a passkey gets a firewall rule opened **for their
-source IP only**, which **expires automatically**.
+source address only** (optionally widened to its IPv6 network), which **expires automatically**.
 
 It's port knocking, except the knock is WebAuthn instead of a magic packet sequence.
 
@@ -78,7 +78,7 @@ phishing-resistant credential — and then opens it narrowly and briefly.
 | Binds key to human | at enrolment | at each use |
 | Builds a network | yes — mesh, NAT traversal, DNS, routing | no |
 | Client agent | required | none; any browser with a passkey |
-| Third party in the trust path | yes | none |
+| Third party in the trust path | yes | none for access (the passkey provider's sync and recovery still guard the credential) |
 | Existing keys and topology | replaced or absorbed | untouched |
 | Re-proof of the human | at enrolment, then on key expiry | every session |
 | Identity/ACL platform | SSO, SCIM, device posture, ACL language | none |
@@ -132,8 +132,8 @@ protocol behind the port.
 2. You authenticate with a **FIDO2 passkey** (or a TOTP code, in a build made with
    `-p:AllowTotp=true`).
 3. MFAWeb hands the request to MFAService over local IPC. It never touches the firewall itself.
-4. MFAService **independently re-validates** the request and opens a rule scoped to that single IP
-   and the ports you allowed.
+4. MFAService **independently re-validates** the request and opens a rule scoped to that source
+   address (or, if configured, its IPv6 `/64`) and the ports you allowed.
 5. A sweeper removes the rule once it expires (default: 1 hour).
 
 <div align="center">
@@ -153,7 +153,9 @@ than trusting its caller.
   PIN — possession of the device alone is never enough. TOTP is not compiled in unless you ask
   for it at build time. See [Passkey requirements](#passkey-requirements) — this is stricter
   than most WebAuthn deployments and will reject a YubiKey
-- **Per-IP, auto-expiring** firewall rules — nothing is left open
+- **Per-source-address, auto-expiring** firewall rules — each grant is removed when it expires.
+  An IPv6 grant can optionally cover the client's network (`Ipv6GrantPrefixLength`, /64 at the
+  widest) so an address that rotates within it keeps working
 - **Public-IP-only enforcement** — requests from RFC-1918, CGNAT, loopback, and link-local ranges
   are rejected, on both sides of the privilege boundary
 - **No account lockout by design** — usernames are email addresses and therefore guessable, so
@@ -179,7 +181,9 @@ than trusting its caller.
   *and* SAN, newest valid one wins; Linux re-reads the PEM every minute and hot-swaps when the
   thumbprint changes. Either way a renewal is picked up **without a restart** (verified against a
   real forced renewal), a failed read keeps the last good certificate rather than dropping TLS,
-  and an expired cert degrades to a warning banner instead of a startup crash
+  and an expired cert no longer crashes startup. A certificate nearing expiry is flagged on the
+  page shown after sign-in; once it has expired, browsers refuse the site and passkey sign-in
+  stops working, which is what the email alert below is for
 - **Cert expiry email alerts** from the always-on privileged service, so the warning still arrives
   in the one failure mode that matters: when no usable cert exists and the web app can't serve HTTPS
 - **Ignores `X-Forwarded-For`** — the client IP always comes from the TCP connection, so it can't be
@@ -293,7 +297,8 @@ database, the other offers a login that always fails — but it is not useful ei
   Directory domain if you want to run MFAWeb under a gMSA
 - **Linux:** systemd, and `iptables`/`ip6tables` (see the note below)
 - An SMTP relay with STARTTLS, for user provisioning emails and alerts. Plaintext SMTP is
-  accepted only for an explicit loopback relay.
+  accepted only for a relay on the same machine (loopback, or an address assigned to one of its
+  interfaces).
 - A TLS certificate for MFAWeb. MFAWeb is not an ACME client; obtain it with certbot (Linux)
   or win-acme (Windows). certbot `--standalone` needs port 80 reachable during issuance only.
 
@@ -310,6 +315,14 @@ database, the other offers a login that always fails — but it is not useful ei
 > same `/64` on their own, which would otherwise silently strand an open grant the next time the
 > address changes. It's an explicit trade-off — a wider setting authorizes more addresses per
 > login — so it's off (exact host) unless you turn it on.
+>
+> **Phones on cellular often pick IPv4.** A dual-stack client chooses IPv4 or IPv6 itself; Apple
+> devices, for example, use whichever connected faster recently. On a mobile carrier, IPv4 usually
+> means carrier-grade NAT: the grant then covers everyone sharing that address, and the tunnel may
+> not even leave from the same address as the login. To get a per-device IPv6 grant, publish a
+> second name with only an AAAA record (for example `v6.your.domain.com`), include it in MFAWeb's
+> certificate, and list it in `AdditionalOrigins`. Users on IPv6-capable networks sign in there;
+> anyone without IPv6 uses the main name.
 
 ## Download
 

@@ -6,7 +6,7 @@ Three components work together:
 
 | Component | Role | Runs as |
 |-----------|------|---------|
-| **MFAWeb** | Internet-facing web app. Authenticates users via WebAuthn (passkey) or TOTP, then asks MFAService to open the firewall. | gMSA (Windows) / dedicated user (Linux) |
+| **MFAWeb** | Internet-facing web app. Authenticates users via WebAuthn (passkey), or TOTP in a build made with `-p:AllowTotp=true`, then asks MFAService to open the firewall. | gMSA (Windows) / dedicated user (Linux) |
 | **MFAService** | Privileged background service. Receives IPC requests from MFAWeb and issues firewall commands. Never exposed to the internet. | LocalSystem (Windows) / root (Linux) |
 | **MFAAdmin** | Command-line admin tool. Manages the user database — add, delete, reprovision users. | Local Administrator (Windows) / root (Linux) |
 
@@ -28,14 +28,14 @@ Communication between MFAWeb and MFAService uses a **named pipe** (Windows) or *
 - .NET 10 Runtime (or Self-Contained publish)
 - Active Directory domain (required for gMSA)
 - PowerShell 5.1+ with the `NetSecurity` module (included in Windows Server)
-- An SMTP relay accessible from the server that supports authenticated STARTTLS
+- An SMTP relay that supports authenticated STARTTLS, or one running on the server itself
 - A TLS certificate for MFAWeb (see [TLS Options](#tls-options))
 
 ### Linux
 - Ubuntu 22.04 LTS / Debian 12 / RHEL 9 (or equivalent)
 - .NET 10 Runtime (or Self-Contained publish)
 - `systemd`
-- An SMTP relay accessible from the server that supports authenticated STARTTLS
+- An SMTP relay that supports authenticated STARTTLS, or one running on the server itself
 - A TLS certificate, obtained with an external ACME client such as certbot (see [TLS Options](#tls-options))
 
 > **Linux firewall backend note:** MFAService has separate Windows (PowerShell /
@@ -62,6 +62,7 @@ All three components read from their own `appsettings.json`. Copy the
 ```json
 {
   "AppUrl":            "https://your.domain.com:8443",
+  "AdditionalOrigins": [],
   "SiteName":          "My Organization Secure Access",
   "LogoUrl":           "",
   "DpapiEntropy":      "REPLACE-WITH-A-UNIQUE-RANDOM-STRING",
@@ -85,11 +86,12 @@ All three components read from their own `appsettings.json`. Copy the
 | Key | Description |
 |-----|-------------|
 | `AppUrl` | Full public URL of MFAWeb. Must match the TLS certificate's domain. Used for WebAuthn origin validation — any mismatch will break passkey login. |
+| `AdditionalOrigins` | Optional list of other names for this same server where passkey sign-in should work, as exact origins such as `"https://v6.your.domain.com:8443"`. The usual reason is an IPv6-only name (AAAA record only), so phones on cellular can't choose IPv4 and land behind carrier NAT; see the README's IPv6 notes. Each entry must be `https`, must be `AppUrl`'s host or a name under it, must use `AppUrl`'s port, and must have no path; MFAWeb refuses to start otherwise, and logs the accepted list at startup. The **one** certificate MFAWeb serves must cover every name listed (it selects a single certificate for all names, so a separate certificate for the extra name is never used), and MFAService's expiry alert checks only the main name. Every name listed is trusted exactly as `AppUrl` is: if you remove a name's DNS record, remove it here too. Default: empty. |
 | `SiteName` | Displayed in page titles, the TOTP issuer name, and provisioning emails. |
 | `LogoUrl` | Optional URL of a logo image shown on the login page. Leave empty to use the bundled knocker logo (`wwwroot/knocker.png`). If set to an external URL, that origin is added to the `img-src` CSP directive automatically. |
 | `DpapiEntropy` | **Required.** A deployment-specific value mixed into the DPAPI key derivation on Windows. It prevents other processes on the same machine from reading the database without knowing this value — keep it consistent across all three components. Startup fails if it is missing, under 16 characters, or still the placeholder from `appsettings.example.json` (that placeholder is published in the public repository and protects nothing). On Linux it is unused for encryption (the database is plain JSON) but is still validated at startup. See [step 3](#3-configure-appsettingsjson-and-restrict-permissions) for how to generate one. |
-| `RateLimitPerWindow` | Maximum requests per 5-minute window across all endpoints, per partition. An IPv4 address is its own partition; an IPv6 address is bucketed by its /56 network prefix, since a single customer allocation commonly spans a /56 or /64 and partitioning on the full address would let anyone inside their own allocation get an effectively fresh bucket per request. Default: 20. |
-| `GlobalRateLimitPerWindow` | A single aggregate cap shared across every partition combined, as a backstop independent of the per-partition key. Default: 200. |
+| `RateLimitPerWindow` | Maximum requests per 5-minute window to the login and registration routes, per partition. An IPv4 address is its own partition; an IPv6 address is bucketed by its /56 network prefix, since a single customer allocation commonly spans a /56 or /64 and partitioning on the full address would let anyone inside their own allocation get an effectively fresh bucket per request. Default: 20. |
+| `GlobalRateLimitPerWindow` | A single aggregate cap on those routes shared across every partition combined, as a backstop independent of the per-partition key. Default: 200. Only the app's own routes count toward it. Everything else (static files such as the login script, logo and favicon, unknown paths, and requests with the wrong HTTP method) has a fixed per-partition limit of its own instead (120 per 5 minutes), so one source cannot exhaust the shared budget that way and lock everyone out. |
 | `AllowedDomains` | Email address domains permitted to use the system. Enforced in both MFAWeb (login form rejects other domains) and MFAAdmin (`add` refuses to provision an account outside these domains). |
 | `FirewallService:GmsaAccount` | Required IPC client identity. On Windows, the gMSA account that MFAWeb runs as. On Linux, set this to the local account `mfaweb` in MFAService's config. The service rejects clients whose identity does not match. |
 | `AccountAlert:Threshold` | Failed login attempts for one account, within `WindowMinutes`, before a `[SECURITY]` log line fires (and an email, if `SendEmail` is on). Detection only — the account is never locked. Default: 10. |
@@ -118,8 +120,9 @@ All three components read from their own `appsettings.json`. Copy the
 | `DpapiEntropy` | Must match MFAWeb and MFAAdmin exactly. |
 | `BouncerConfig:AllowedPorts` | Ports opened for each authenticated IP, in `port/protocol` format. Examples: `"22/TCP"`, `"51820/UDP"`. |
 | `BouncerConfig:ExpirationHours` | How long firewall rules stay open. Rules are automatically removed by the sweeper when they expire. **Clamped to 1-48 on the privileged side**, so a larger value is reduced to 48 and logged with a `[CONFIG]` warning — a slipped digit cannot leave a standing grant. Every `AllowedPorts` entry must use a port in 1-65535 and protocol TCP or UDP; an invalid entry fails the grant request instead of returning a partial success. |
-| `BouncerConfig:RulePrefix` | Prefix applied to every firewall rule name. Must also match the value in MFAAdmin's config so the `diag` and `reset` commands can find the rules. |
-| `HttpsCert:PemPath` | **Linux only, and required for expiry alerts there.** Full path to the certificate MFAWeb serves (e.g. `/etc/mfa-auth/tls/current/fullchain.pem`). There is no certificate store on Linux, so without this the expiry watchdog is silently disabled — and an expired certificate means no passkey sign-in at all. |
+| `BouncerConfig:RulePrefix` | Prefix applied to every firewall rule name. Must also match the value in MFAAdmin's config so the `diag` and `reset` commands can find the rules. Letters, digits, space, `_`, `.` and `-` only, 1-64 characters; MFAService refuses to start with anything else, since a quote in the prefix breaks the firewall commands and, on Linux, leaves grants the sweeper can never remove. |
+| `BouncerConfig:Ipv6GrantPrefixLength` | How much of an IPv6 client's address a grant covers: `128` (the default) is the exact address, and anything down to `64` widens the grant to that address's network, so a client whose address changes within its `/64` (privacy addresses, cellular carriers) keeps access. Values outside 64-128 are clamped, with a `[CONFIG]` warning. IPv4 grants are never widened. Applies on both platforms: Windows has always handled IPv6 grants, as the exact address only, until 0.4.0; on Linux IPv6 grants are new in 0.4.0. |
+| `HttpsCert:PemPath` | **Linux only, and required for expiry alerts there.** Full path to the certificate MFAWeb serves (e.g. `/etc/mfa-auth/tls/current/fullchain.pem`). There is no certificate store on Linux, so without this the expiry watchdog logs `[CERT] Monitor disabled` at startup and never alerts — and an expired certificate means no passkey sign-in at all. |
 
 ### MFAAdmin — `appsettings.json`
 
@@ -147,10 +150,15 @@ All three components read from their own `appsettings.json`. Copy the
 | `RulePrefix` | Must match `BouncerConfig:RulePrefix` in MFAService. Used by `diag` and `reset` commands. |
 
 `Smtp:UseSsl` defaults to `true` and requires a validated STARTTLS connection. Set it to
-`false` only when the SMTP relay is reached through `localhost`, `127.0.0.0/8`, or `::1`;
-the applications reject plaintext delivery to any non-loopback host. Provisioning messages
-contain the temporary password and enrollment link, so the SMTP hop is part of the enrollment
-security boundary.
+`false` only when the SMTP relay runs on the same machine: `Smtp:Host` must be `localhost`, a
+loopback address, or an IP address assigned to one of this machine's interfaces (for example
+the address a local relay listens on). Hostnames other than `localhost` are never resolved for
+this check, so use the IP address itself. The address must be on an interface that is up at
+the time of each send, and should be statically assigned. Plaintext delivery to any other host
+is refused. Provisioning messages contain the temporary password and enrollment link, so the
+SMTP hop is part of the enrollment security boundary. On Linux, checking a non-loopback local
+address needs `AF_NETLINK` in the service unit's `RestrictAddressFamilies` (see the units
+below).
 
 ---
 
@@ -239,8 +247,13 @@ icacls "C:\ProgramData\MFAAuth" /inheritance:r `
     /grant 'Administrators:(OI)(CI)F' `
     /grant 'YOURDOMAIN\MFA_Service$:(OI)(CI)R'
 
-# MFAWeb writes its own log files, so the gMSA needs Modify on Logs specifically.
-icacls "C:\ProgramData\MFAAuth\Logs" /grant 'YOURDOMAIN\MFA_Service$:(OI)(CI)M'
+# MFAWeb writes (and after 90 days deletes) its own log files, and nothing else in Logs.
+# The gMSA may list the folder and create files in it; CREATOR OWNER then gives whichever
+# account created a file Modify on that file only. So MFAWeb can manage its own logs but
+# cannot alter or delete MFAService's.
+icacls "C:\ProgramData\MFAAuth\Logs" `
+    /grant 'YOURDOMAIN\MFA_Service$:(RX,WD)' `
+    /grant 'CREATOR OWNER:(OI)(IO)M'
 
 # Each appsettings.json holds DpapiEntropy and SMTP credentials.
 foreach ($f in @(
@@ -331,8 +344,8 @@ set the **same** `HttpsCert:Subject`/`Store`/`Location` values in MFAService's
 
 > **Do not add a `Kestrel:Endpoints:Https:Certificate` block.** MFAWeb deliberately selects
 > the certificate in code at request time (matching on CN *and* SAN, preferring the newest
-> valid one) so that a renewal is picked up without a restart and an expired certificate
-> degrades to a warning banner. Kestrel's built-in `Certificate:Subject` binding does a
+> valid one) so that a renewal is picked up without a restart and an expired certificate does
+> not stop the service from starting. Kestrel's built-in `Certificate:Subject` binding does a
 > CN-only lookup at startup and **crashes the service the moment that certificate expires**
 > or is replaced by a SAN-only one. The `Https` endpoint should declare only its `Url`.
 
@@ -390,11 +403,15 @@ Start-Service MFAFirewallService
 Start-Service MFAWebService
 ```
 
-Check the logs at `C:\ProgramData\MFAAuth\Logs\` to verify startup.
+Check the logs at `C:\ProgramData\MFAAuth\Logs\` to verify startup. Each component writes one
+file per UTC day and deletes its own files older than 90 days; archive them elsewhere first if
+you need a longer history. Failures that anyone can trigger without signing in (addresses with no
+passkey, invalid setup or registration links, failed passkey checks) are logged as `[PROBE]`
+lines, up to 5 per source and 50 in total per hour, with one summary line counting the rest.
 
-> If a service fails to start and writes **no** log file, the failure happened during
-> configuration validation, before file logging was available. Look in the Windows
-> **Application** event log instead — a missing, too-short, or still-placeholder
+> If a service fails to start and its log file shows only the startup line, or nothing, the
+> failure happened during configuration validation, which is reported outside the log file.
+> Look in the Windows **Application** event log — a missing, too-short, or still-placeholder
 > `DpapiEntropy` is reported there:
 >
 > ```powershell
@@ -418,6 +435,11 @@ sudo usermod -aG mfaipc mfaweb
 # Setgid keeps the mfaweb reader group on new database files written by either
 # the root admin CLI or the service. The web account cannot write this directory.
 sudo install -d -o root -g mfaweb -m 2750 /etc/mfa-auth
+
+# Log directory shared by MFAService and MFAWeb. Group-writable so mfaweb can create
+# its own files; setgid keeps them in mfaipc; the sticky bit means each account can
+# delete only its own files, so MFAWeb cannot remove MFAService's logs.
+sudo install -d -o root -g mfaipc -m 3770 /var/log/mfa-auth
 ```
 
 ### 2. Publish the Applications
@@ -460,9 +482,9 @@ logs/emails an error. It keeps running so existing firewall grants can still exp
 the setting and restart `mfa-service` before retrying a login. Removing the setting does not
 disable the identity check.
 
-In **MFAWeb's** config, set `"LogPath": "/var/log/mfa-web"`. The systemd unit below creates this
-dedicated directory so the web account can write its own logs without modifying the privileged
-service's logs in `/var/log/mfa-auth`.
+MFAWeb and MFAService both log to `/var/log/mfa-auth` on Linux by default (created in step 1),
+so leave `LogPath` unset in both configs. If you set it, use that same directory: the MFAWeb unit
+below grants write access to `/var/log/mfa-auth` only.
 
 On Linux you **must** keep the `Kestrel:Endpoints:Https:Certificate` block and point `Path`
 and `KeyPath` at your PEM files — there is no Windows certificate store, so it is the only
@@ -561,7 +583,9 @@ LockPersonality=true
 # the same way INSTALL.md already asks for the gate itself (see "Verify the gate is actually
 # gating"), since a too-narrow set fails firewall commands rather than refusing to start.
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_DAC_OVERRIDE CAP_CHOWN CAP_FOWNER
-RestrictAddressFamilies=AF_UNIX AF_NETLINK
+# AF_INET/AF_INET6 are for the SMTP connection that sends certificate-expiry and IPC alerts;
+# without them this service cannot reach any relay, even a local one, and never alerts.
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
 
 # Logging
 StandardOutput=journal
@@ -628,6 +652,8 @@ LockPersonality=true
 # for MFAService's unit above -- do not assume it's right just because the service starts.
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+# Add AF_NETLINK only if Smtp:Host is a local non-loopback address with Smtp:UseSsl=false:
+# checking that the address is this machine's needs to read the interface list.
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 
 StandardOutput=journal
@@ -744,8 +770,10 @@ Install into `LocalMachine\My` (win-acme, Certify, or an internal CA) and set
 
 MFAWeb selects the certificate at runtime: it matches the hostname against CN **and** SAN, keeps
 only currently-valid certificates with a private key, picks the newest expiry, and re-checks once
-a minute. A renewal is picked up **without a restart**, and an expired certificate degrades to a
-post-login warning banner rather than crashing Kestrel at startup.
+a minute. A renewal is picked up **without a restart**, and an expired certificate no longer
+crashes Kestrel at startup. A certificate within `CertAlert:WarnDays` of expiry is flagged on the
+page shown after a passkey sign-in; once it has expired, browsers refuse the site, so the email
+alert from MFAService is the warning that still arrives.
 
 > **The service account needs read access to the private key.** Otherwise the certificate selects
 > correctly and the TLS handshake still fails — SChannel cannot open the key and the client sees
@@ -953,8 +981,8 @@ then re-run it.
 > `AuthenticatorAttachment` to `CrossPlatform` (or remove it to permit both) in
 > `MFAWeb/Program.cs`, keeping `UserVerification = Required`.
 3. Links expire after **60 minutes**. Use `MFAAdmin reprovision` to resend.
-4. The user visits MFAWeb and authenticates with their passkey or TOTP code to open
-   the firewall for their current IP.
+4. The user visits MFAWeb and authenticates with their passkey (or TOTP code, in an
+   `AllowTotp` build) to open the firewall for their current IP.
 
 ---
 
@@ -1055,7 +1083,45 @@ Then:
 2. **Keep your `appsettings.json`.** Release archives ship only `appsettings.example.json`, so
    copy your existing config into the new directory rather than re-deriving it.
 
-3. **If upgrading from before 0.2.0, add `FirewallService:GmsaAccount` to MFAService's config.**
+3. **If upgrading from 0.3.0 or earlier, check `RulePrefix` first.** It may now contain only
+   letters, digits, space, `_`, `.` and `-`, at most 64 characters. MFAService refuses to start
+   with any other value, and MFAAdmin refuses to run. If yours has other characters, change it in
+   both MFAService's config (`BouncerConfig:RulePrefix`) and MFAAdmin's (`RulePrefix`) before
+   upgrading, then remove any rules still open under the old prefix by hand; the new prefix will
+   not match them. The default `MFA_Temp_` is unaffected.
+
+4. **If upgrading from 0.3.0 or earlier, tighten the log directory.** MFAWeb's service account
+   previously had Modify on the whole log directory, which let it delete MFAService's logs too.
+   Replace that with create-only access plus rights on its own files, then grant it its existing
+   files explicitly, since those were covered only by the grant being removed:
+
+   ```powershell
+   # Windows
+   $logs = "C:\ProgramData\MFAAuth\Logs"
+   icacls $logs /remove:g 'YOURDOMAIN\MFA_Service$'
+   icacls $logs /grant 'YOURDOMAIN\MFA_Service$:(RX,WD)' /grant 'CREATOR OWNER:(OI)(IO)M'
+   Get-ChildItem $logs -Filter 'mfaweb_*.log' | ForEach-Object {
+       icacls $_.FullName /grant 'YOURDOMAIN\MFA_Service$:M' | Out-Null
+   }
+   ```
+   ```bash
+   # Linux: the sticky bit limits deletion to each file's owner
+   sudo chmod 3770 /var/log/mfa-auth
+   ```
+
+5. **Linux, if upgrading from 0.3.0 or earlier: let MFAService open network connections.** The
+   earlier `mfa-service.service` had `RestrictAddressFamilies=AF_UNIX AF_NETLINK`, which blocks
+   the SMTP connection for certificate-expiry and IPC alerts, so those were never sent. Updating
+   the binaries does not change the unit; edit it:
+
+   ```bash
+   sudo sed -i 's/^RestrictAddressFamilies=AF_UNIX AF_NETLINK$/RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6/' \
+       /etc/systemd/system/mfa-service.service
+   sudo systemctl daemon-reload
+   systemctl show mfa-service -p RestrictAddressFamilies   # should list AF_INET and AF_INET6
+   ```
+
+6. **If upgrading from before 0.2.0, add `FirewallService:GmsaAccount` to MFAService's config.**
    The IPC identity check added in that release (see the next step) rejects every client —
    including a correctly upgraded MFAWeb — until this is set, because an older config simply
    doesn't have the key (see `FirewallService:GmsaAccount` under MFAWeb's configuration reference
@@ -1065,21 +1131,21 @@ Then:
    `[IPC] Peer verification enabled: only uid <n> ('mfaweb') may connect.` (Linux) or
    `[IPC] Claiming pipe name for gMSA '<name>'...` (Windows, `Debug` log level) before moving on.
 
-4. **Upgrade MFAService before MFAWeb.** From 0.2.0 the client verifies the privileged service's
+7. **Upgrade MFAService before MFAWeb.** From 0.2.0 the client verifies the privileged service's
    identity before sending anything, so a newer MFAWeb against an older MFAService is the
    combination most likely to fail. The reverse order is safe.
 
-5. **Deploy all three components together** when the release changes `users.dat`'s schema — they
+8. **Deploy all three components together** when the release changes `users.dat`'s schema — they
    share it. Release notes say when that applies.
 
-6. **Verify before you disconnect**, while you still have the independent path open:
+9. **Verify before you disconnect**, while you still have the independent path open:
    - both services are running, and the logs show the expected version at startup
    - MFAWeb serves HTTPS and selects a certificate
    - **a real passkey login opens a rule** — this is the only test that exercises the whole
      chain, including the IPC identity check added in 0.2.0
    - the rule disappears at expiry (or shorten `ExpirationHours` temporarily to watch it)
 
-7. **If it fails**, stop both services, restore the backed-up directory, and start them again —
+10. **If it fails**, stop both services, restore the backed-up directory, and start them again —
    privileged service first.
 
    On Linux, first move the failed installation directories aside under distinct names. Restore
@@ -1113,7 +1179,8 @@ Then:
   same hash becomes that account's ongoing login credential** and is no longer burned by
   either path. See SECURITY.md's "A note on the user database" for the full breakdown.
 - MFAWeb **only accepts authentication requests from public (internet) IP addresses**.
-  Requests from RFC-1918 private ranges are rejected with HTTP 403. This prevents
+  Requests from private (RFC 1918), CGNAT, loopback and link-local ranges are rejected (HTTP 403
+  on the login page). This prevents
   internal-only deployments from accidentally being used as a pivot point.
 - Firewall rules opened by MFAService expire automatically after `ExpirationHours`.
   MFAService's sweeper runs every 5 minutes to remove expired rules.

@@ -42,18 +42,38 @@ int rateLimitPerWindow = builder.Configuration.GetValue<int>("RateLimitPerWindow
 // isn't the only thing standing between the login endpoints and a flood. Deliberately generous --
 // sized well above what a real login burst from a few legitimate users would produce.
 int globalRateLimitPerWindow = builder.Configuration.GetValue<int>("GlobalRateLimitPerWindow", 200);
+// Per-source cap for requests outside the app's routes (static files, unmatched paths, wrong
+// methods). One login page load includes a handful of static files,
+// and several users behind one NAT address share the budget, so it sits well above
+// RateLimitPerWindow; it exists so a single source can't request them without limit.
+const int StaticRateLimitPerWindow = 120;
 builder.Services.AddRateLimiter(options =>
 {
     options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
 
-    options.GlobalLimiter = System.Threading.RateLimiting.PartitionedRateLimiter.Create<HttpContext, string>(_ =>
-        RateLimitPartition.GetFixedWindowLimiter("global", _ =>
-            new FixedWindowRateLimiterOptions
-            {
-                PermitLimit = globalRateLimitPerWindow,
-                Window = TimeSpan.FromMinutes(5),
-                QueueLimit = 0
-            }));
+    // The shared backstop covers the app's own routes only -- those carrying LoginRateLimit, which
+    // also limits each source. Everything else gets a per-source budget of its own: static files,
+    // unmatched paths, and a known path with the wrong method (routing gives that a synthetic
+    // "405" endpoint with no rate-limit metadata, so "has an endpoint" alone is not enough). When
+    // any of these drew from the shared bucket, one source could 429 every user's login. So
+    // draining the shared bucket takes at least globalRateLimitPerWindow / rateLimitPerWindow
+    // distinct sources.
+    options.GlobalLimiter = System.Threading.RateLimiting.PartitionedRateLimiter.Create<HttpContext, string>(httpContext =>
+        httpContext.GetEndpoint()?.Metadata.GetMetadata<Microsoft.AspNetCore.RateLimiting.EnableRateLimitingAttribute>() != null
+            ? RateLimitPartition.GetFixedWindowLimiter("global", _ =>
+                new FixedWindowRateLimiterOptions
+                {
+                    PermitLimit = globalRateLimitPerWindow,
+                    Window = TimeSpan.FromMinutes(5),
+                    QueueLimit = 0
+                })
+            : RateLimitPartition.GetFixedWindowLimiter("static:" + RateLimitPartitionKey(httpContext.Connection.RemoteIpAddress), _ =>
+                new FixedWindowRateLimiterOptions
+                {
+                    PermitLimit = StaticRateLimitPerWindow,
+                    Window = TimeSpan.FromMinutes(5),
+                    QueueLimit = 0
+                }));
 
     options.AddPolicy("LoginRateLimit", httpContext =>
     {
@@ -316,17 +336,23 @@ static X509Certificate2? SelectBestCertificate(string hostname, StoreName storeN
 
 // --- FIDO2/Passkey Configuration ---
 string appUrl = builder.Configuration["AppUrl"] ?? "https://localhost";
+// AdditionalOrigins: other hostnames for this same server that may run passkey ceremonies,
+// e.g. an IPv6-only name (AAAA record only) so dual-stack phones can't pick IPv4 and land
+// behind carrier NAT. Exact entries only, validated here; see WebAuthnOrigins.
+var webAuthnOrigins = WebAuthnOrigins.Build(appUrl,
+    builder.Configuration.GetSection("AdditionalOrigins").Get<string[]>() ?? Array.Empty<string>());
 var fido2 = new Fido2(new Fido2Configuration
 {
     ServerDomain = new Uri(appUrl).Host,
     ServerName = builder.Configuration["SiteName"] ?? "MFA Secure Access",
-    Origins = new HashSet<string> { appUrl }
+    Origins = webAuthnOrigins
 });
 
 var app = builder.Build();
 AuditLogger.SetMinLevel(app.Configuration["Logging:AppMinLevel"]);
 AuditLogger.LogDirectory = app.Configuration["LogPath"] ?? AuditLogger.LogDirectory;
 LoginFailureMonitor.Configure(app.Configuration);
+AuditLogger.Log($"Passkey origins accepted: {string.Join(", ", webAuthnOrigins)}");
 
 var _asm = Assembly.GetExecutingAssembly();
 var _ver = _asm.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion
@@ -364,7 +390,9 @@ app.UseRateLimiter();
 app.UseStaticFiles();
 
 // --- Passkey challenge store (in-memory, 2-minute expiry) ---
-var passkeyStore = new ConcurrentDictionary<string, (string OptionsJson, string Username, DateTime Expiry)>();
+// Each entry records which ceremony minted it, and each consumer checks that before use, so a
+// registration challenge can't be redeemed at /passkey/verify (or the reverse).
+var passkeyStore = new ConcurrentDictionary<string, (string OptionsJson, string Username, DateTime Expiry, PasskeyCeremony Ceremony)>();
 
 // --- Configuration & OS Detection ---
 string DbPath = app.Configuration["DbPath"] ?? (RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
@@ -450,7 +478,7 @@ app.MapGet("/", async (HttpContext context, IAntiforgery antiforgery) =>
                 .login-box {{ background: #1e1e1e; padding: 40px; border-radius: 8px; box-shadow: 0 8px 24px rgba(0,0,0,0.5); width: 90%; max-width: 320px; box-sizing: border-box; }}
                 .logo {{ display: block; margin: 0 auto 20px auto; max-width: 240px; width: 100%; }}
                 .ip-display {{ text-align: center; color: #aaa; font-size: 0.9em; margin-bottom: 20px; padding: 8px; background: #252525; border-radius: 4px; border: 1px solid #333; }}
-                .ip-display strong {{ color: #007acc; letter-spacing: 1px; }}
+                .ip-display strong {{ display: block; margin-top: 4px; color: #007acc; font-family: Consolas, 'Courier New', monospace; overflow-wrap: anywhere; }}
                 input {{ width: 100%; padding: 12px; margin: 10px 0; border: 1px solid #333; border-radius: 4px; box-sizing: border-box; background: #2d2d2d; color: #fff; }}
                 input:focus {{ outline: none; border-color: #007acc; }}
                 button {{ width: 100%; padding: 12px; background: #007acc; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; margin-top: 10px; transition: background 0.2s; }}
@@ -466,7 +494,7 @@ app.MapGet("/", async (HttpContext context, IAntiforgery antiforgery) =>
         <body>
             <div class='login-box'>
                 <img src='{(string.IsNullOrEmpty(logoUrl) ? "/knocker.png" : logoUrl)}' alt='Logo' class='logo' />
-                <div class='ip-display'>Connecting IP: <strong>{clientIp}</strong></div>
+                <div class='ip-display'>Connecting IP: <strong>{IpDisplayHtml(clientIp)}</strong></div>
 
                 <input type='email' id='usernameField' placeholder='Email Address' autocomplete='username webauthn' />
                 <button type='button' id='passkeyBtn'>Sign in with Passkey</button>
@@ -499,20 +527,19 @@ app.MapPost("/auth", async (HttpContext context, IAntiforgery antiforgery, IConf
     string password = form["password"].ToString();
     string totpCode = form["totp"].ToString().Trim();
 
-    AuditLogger.Log($"Login attempt from '{rawEmail}'");
-
     // 1. Validate Email Format and Domain
     var allowedDomains = app.Configuration.GetSection("AllowedDomains").Get<string[]>() ?? Array.Empty<string>();
 
     if (!MailAddress.TryCreate(rawEmail, out var mailAddress) ||
         !allowedDomains.Any(d => d.Equals(mailAddress.Host, StringComparison.OrdinalIgnoreCase)))
     {
-        AuditLogger.Warn("Denied - invalid account domain");
+        CountOutOfDomainProbe(context);
         await SendDenyResponse(context, "Invalid account domain.");
         return;
     }
 
     string username = mailAddress.Address;
+    AuditLogger.Log($"Login attempt from {ProbeLog.DisplayEmail(username)}");
 
     // 2. Get Client IP Address — TCP connection only, no proxy headers (by design)
     string clientIp = context.Connection.RemoteIpAddress?.ToString() ?? "";
@@ -618,7 +645,7 @@ app.MapPost("/auth", async (HttpContext context, IAntiforgery antiforgery, IConf
                 <body style='background:#121212; display:flex; justify-content:center; align-items:center; height:100vh; margin:0;'>
                     <div style='background:#1e1e1e; color:#0f0; font-family:monospace; padding:40px; text-align:center; border-radius:8px; border:1px solid #333; width: 90%; max-width: 400px; box-sizing: border-box;'>
                         <h2>[ ACCESS GRANTED ]</h2>
-                        <p>Firewall doorway opened for IP:<br/><strong>{clientIp}</strong></p>
+                        <p>Firewall doorway opened for IP:<br/><strong>{IpDisplayHtml(clientIp)}</strong></p>
                         <p>Authorized Services:<br/><strong>Server Default Policies Applied</strong></p>
                         <p style='color:#aaa; font-size:0.9em; margin-top:20px;'>You may now connect. This session will expire according to server policy.</p>
                         {passkeyRegHtml}
@@ -646,7 +673,7 @@ app.MapGet("/setup/{token}", async (HttpContext context, string token, IAntiforg
 
     if (provisionUsername == null)
     {
-        AuditLogger.Warn("Provisioning link is invalid or has expired.");
+        RecordProbe(context, "Provisioning link is invalid or has expired");
         await SendDenyResponse(context, "Provisioning link is invalid or has expired.");
         return;
     }
@@ -673,7 +700,7 @@ app.MapGet("/setup/{token}", async (HttpContext context, string token, IAntiforg
                 <p style='color:#aaa; font-size:0.9em;'>Verify your password to reveal your 2FA setup code.</p>
                 <form action='/setup' method='post'>
                     <input type='hidden' name='{csrfTokens.FormFieldName}' value='{csrfTokens.RequestToken}'/>
-                    <input type='hidden' name='token' value='{token}' />
+                    <input type='hidden' name='token' value='{System.Net.WebUtility.HtmlEncode(token)}' />
                     <input type='hidden' name='username' value='{System.Net.WebUtility.HtmlEncode(provisionUsername)}' />
                     <input type='password' name='password' placeholder='Enter your password' required />
                     <button type='submit'>Reveal Secret</button>
@@ -732,7 +759,7 @@ app.MapPost("/setup", async (HttpContext context, IAntiforgery antiforgery) =>
 
     if (setupInvalid)
     {
-        AuditLogger.Warn("Provisioning link is invalid or has expired.");
+        RecordProbe(context, "Provisioning link is invalid or has expired");
         await SendDenyResponse(context, "Provisioning link is invalid or has expired.");
         return;
     }
@@ -829,7 +856,7 @@ app.MapGet("/setup-passkey/{token}", async (HttpContext context, string token, I
 
     if (passkeyProvisionUsername == null)
     {
-        AuditLogger.Warn("Passkey provisioning link is invalid or has expired.");
+        RecordProbe(context, "Passkey provisioning link is invalid or has expired");
         await SendDenyResponse(context, "Provisioning link is invalid or has expired.");
         return;
     }
@@ -856,7 +883,7 @@ app.MapGet("/setup-passkey/{token}", async (HttpContext context, string token, I
                 <p style='color:#aaa; font-size:0.9em;'>Verify your password to continue.</p>
                 <form action='/setup-passkey' method='post'>
                     <input type='hidden' name='{csrfTokens.FormFieldName}' value='{csrfTokens.RequestToken}'/>
-                    <input type='hidden' name='token' value='{token}' />
+                    <input type='hidden' name='token' value='{System.Net.WebUtility.HtmlEncode(token)}' />
                     <input type='hidden' name='username' value='{System.Net.WebUtility.HtmlEncode(passkeyProvisionUsername)}' />
                     <input type='password' name='password' placeholder='Enter your password' required autocomplete='current-password' />
                     <button type='submit'>Continue</button>
@@ -899,7 +926,7 @@ app.MapPost("/setup-passkey", async (HttpContext context, IAntiforgery antiforge
 
     if (pkInvalid)
     {
-        AuditLogger.Warn("Passkey provisioning link is invalid or has expired.");
+        RecordProbe(context, "Passkey provisioning link is invalid or has expired");
         await SendDenyResponse(context, "Provisioning link is invalid or has expired.");
         return;
     }
@@ -974,15 +1001,18 @@ app.MapPost("/passkey/challenge", async (HttpContext context) =>
     if (!MailAddress.TryCreate(rawEmail, out var mail) ||
         !allowedDomains.Any(d => d.Equals(mail.Host, StringComparison.OrdinalIgnoreCase)))
     {
+        CountOutOfDomainProbe(context);
         context.Response.StatusCode = 400;
         await context.Response.WriteAsync("Invalid account domain.");
         return;
     }
 
     List<PublicKeyCredentialDescriptor>? allowedKeys = null;
+    bool accountExists;
     {
         var users = LoadUsers(DbPath, Entropy);
         var user = users.FirstOrDefault(u => u.Username.Equals(mail.Address, StringComparison.OrdinalIgnoreCase));
+        accountExists = user != null;
         if (user != null && user.PasskeyCredentials.Count > 0)
             allowedKeys = user.PasskeyCredentials
                 .Select(c => new PublicKeyCredentialDescriptor(FromBase64Url(c.CredentialId)))
@@ -991,6 +1021,15 @@ app.MapPost("/passkey/challenge", async (HttpContext context) =>
 
     if (allowedKeys == null)
     {
+        // A sign-in attempt for an address that can't sign in is worth a record: typos, but also
+        // account probing. The response is identical either way, so the distinction stays
+        // server-side and adds no enumeration signal. Not fed to LoginFailureMonitor -- that
+        // would key its state on attacker-chosen addresses; ProbeLog caps the volume instead.
+        RecordProbe(context,
+            $"Passkey sign-in attempted for {ProbeLog.DisplayEmail(mail.Address)} " +
+            $"({(accountExists ? "account has no passkey registered" : "no such account")})",
+            accountExists ? mail.Address : null);
+
         context.Response.StatusCode = 401;
         await context.Response.WriteAsync("No passkey registered for this account.");
         return;
@@ -1005,7 +1044,7 @@ app.MapPost("/passkey/challenge", async (HttpContext context) =>
         if (passkeyStore.TryGetValue(k, out var e) && e.Expiry < now) passkeyStore.TryRemove(k, out _);
 
     string key = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32)).Replace('+', '-').Replace('/', '_').TrimEnd('=');
-    passkeyStore[key] = (optionsJson, mail.Address, DateTime.UtcNow.AddMinutes(2));
+    passkeyStore[key] = (optionsJson, mail.Address, DateTime.UtcNow.AddMinutes(2), PasskeyCeremony.Assertion);
 
     using var optDoc = JsonDocument.Parse(optionsJson);
     context.Response.ContentType = "application/json";
@@ -1030,12 +1069,11 @@ app.MapPost("/passkey/verify", async (HttpContext context, IConfiguration config
         assertionJson = doc.RootElement.TryGetProperty("assertion",   out var aP) ? aP.GetRawText() : "{}";
     }
 
-    AuditLogger.Log($"Passkey verify attempt from '{rawEmail}'");
-
     var allowedDomains = app.Configuration.GetSection("AllowedDomains").Get<string[]>() ?? Array.Empty<string>();
     if (!MailAddress.TryCreate(rawEmail, out var mail) ||
         !allowedDomains.Any(d => d.Equals(mail.Host, StringComparison.OrdinalIgnoreCase)))
     {
+        CountOutOfDomainProbe(context);
         context.Response.StatusCode = 401;
         await context.Response.WriteAsync("Invalid credentials.");
         return;
@@ -1043,7 +1081,8 @@ app.MapPost("/passkey/verify", async (HttpContext context, IConfiguration config
 
     string username = mail.Address;
 
-    if (!passkeyStore.TryRemove(challengeKey, out var stored) || stored.Expiry < DateTime.UtcNow)
+    if (!passkeyStore.TryRemove(challengeKey, out var stored) || stored.Expiry < DateTime.UtcNow
+        || stored.Ceremony != PasskeyCeremony.Assertion)
     {
         context.Response.StatusCode = 401;
         await context.Response.WriteAsync("Challenge expired. Please try again.");
@@ -1056,6 +1095,10 @@ app.MapPost("/passkey/verify", async (HttpContext context, IConfiguration config
         await context.Response.WriteAsync("Invalid credentials.");
         return;
     }
+
+    // Logged only once the request is bound to a challenge issued for this account, which
+    // /passkey/challenge hands out only for accounts with a registered passkey.
+    AuditLogger.Log($"Passkey verify attempt from '{username}'");
 
     AuthenticatorAssertionRawResponse? clientAssertion;
     try { clientAssertion = JsonSerializer.Deserialize<AuthenticatorAssertionRawResponse>(assertionJson); }
@@ -1084,7 +1127,7 @@ app.MapPost("/passkey/verify", async (HttpContext context, IConfiguration config
             .FirstOrDefault(c => FromBase64Url(c.CredentialId).SequenceEqual(clientAssertion.Id ?? clientAssertion.RawId ?? Array.Empty<byte>()));
         if (cred == null)
         {
-            AuditLogger.Warn("Passkey verify - credential not found");
+            RecordProbe(context, $"Passkey verify - credential not found for '{username}'", username);
             context.Response.StatusCode = 401;
             await context.Response.WriteAsync("Invalid credentials.");
             return;
@@ -1122,12 +1165,15 @@ app.MapPost("/passkey/verify", async (HttpContext context, IConfiguration config
 
         // Sign-count regression means the credential counter went backwards — a strong indicator
         // of a cloned authenticator.  Log at ERROR so it surfaces in monitoring.
-        bool isCounterAnomaly = ex.Message.Contains("counter", StringComparison.OrdinalIgnoreCase)
-                             || ex.Message.Contains("sign count", StringComparison.OrdinalIgnoreCase);
+        // Matched on the exact start of Fido2's own message, never a substring: other Fido2
+        // messages echo request fields (e.g. "Type not equal to ... Was: '<clientData type>'"),
+        // so a substring test let an unauthenticated request forge this alert. Fido2's message
+        // text is not logged on this line for the same reason.
+        bool isCounterAnomaly = ex.Message.StartsWith("SignatureCounter was not greater than stored SignatureCounter", StringComparison.Ordinal);
         if (isCounterAnomaly)
-            AuditLogger.Error($"[SECURITY ALERT] Possible credential clone for '{username}' - sign count anomaly: {ex.Message}");
+            AuditLogger.Error($"[SECURITY ALERT] Possible credential clone for '{username}' - signature counter did not advance.");
         else
-            AuditLogger.Warn($"Passkey assertion failed for '{username}': {ex.Message}");
+            RecordProbe(context, $"Passkey assertion failed for '{username}': {ex.Message}", username);
         context.Response.StatusCode = 401; await context.Response.WriteAsync("Passkey verification failed."); return;
     }
 
@@ -1178,7 +1224,7 @@ app.MapPost("/passkey/verify", async (HttpContext context, IConfiguration config
         <body style='background:#121212; display:flex; justify-content:center; align-items:center; height:100vh; margin:0;'>
             <div style='background:#1e1e1e; color:#0f0; font-family:monospace; padding:40px; text-align:center; border-radius:8px; border:1px solid #333; width:90%; max-width:400px; box-sizing:border-box;'>
                 <h2>[ ACCESS GRANTED ]</h2>
-                <p>Firewall doorway opened for IP:<br/><strong>{clientIp}</strong></p>
+                <p>Firewall doorway opened for IP:<br/><strong>{IpDisplayHtml(clientIp)}</strong></p>
                 <p>Authorized Services:<br/><strong>Server Default Policies Applied</strong></p>
                 <p style='color:#aaa; font-size:0.9em; margin-top:20px;'>You may now connect. This session will expire according to server policy.</p>
                 <div style='margin-top:20px; border-top:1px solid #333; padding-top:20px;'>
@@ -1205,6 +1251,7 @@ app.MapGet("/register-passkey/{token}", async (HttpContext context, string token
 
     if (!regLinkValid)
     {
+        RecordProbe(context, "Passkey registration link is invalid or has expired");
         await SendDenyResponse(context, "Registration link is invalid or has expired.");
         return;
     }
@@ -1231,7 +1278,7 @@ app.MapGet("/register-passkey/{token}", async (HttpContext context, string token
             <div class='box'>
                 <h2 style='margin-top:0;'>Register a Passkey</h2>
                 <p style='color:#aaa; font-size:0.9em;'>Your device will ask you for your fingerprint, face, or PIN. This passkey lets you sign in without a 6-digit code.</p>
-                <button id='registerBtn' data-token='{token}'>Register This Device</button>
+                <button id='registerBtn' data-token='{System.Net.WebUtility.HtmlEncode(token)}'>Register This Device</button>
                 <div id='status'></div>
                 <a href='/' style='display:inline-block; margin-top:24px; color:#555; font-size:0.85em;'>Back to Login</a>
             </div>
@@ -1262,6 +1309,7 @@ app.MapPost("/passkey/register/begin", async (HttpContext context) =>
         if (user == null || user.PasskeyProvisioningExpiresUtc == null || DateTime.UtcNow > user.PasskeyProvisioningExpiresUtc
             || !user.PasskeyRegistrationReady)
         {
+            RecordProbe(context, "Passkey registration link is invalid or has expired");
             context.Response.StatusCode = 401;
             await context.Response.WriteAsync("Registration link is invalid or has expired.");
             return;
@@ -1296,7 +1344,7 @@ app.MapPost("/passkey/register/begin", async (HttpContext context) =>
         if (passkeyStore.TryGetValue(k, out var e) && e.Expiry < now) passkeyStore.TryRemove(k, out _);
 
     string key = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32)).Replace('+', '-').Replace('/', '_').TrimEnd('=');
-    passkeyStore[key] = (optionsJson, fidoUser!.Name, DateTime.UtcNow.AddMinutes(2));
+    passkeyStore[key] = (optionsJson, fidoUser!.Name, DateTime.UtcNow.AddMinutes(2), PasskeyCeremony.Registration);
 
     using var optDoc = JsonDocument.Parse(optionsJson);
     await context.Response.WriteAsJsonAsync(new { challengeKey = key, options = optDoc.RootElement.Clone() });
@@ -1321,7 +1369,8 @@ app.MapPost("/passkey/register/complete", async (HttpContext context) =>
         attestJson   = doc.RootElement.TryGetProperty("attestation",  out var aP) ? aP.GetRawText() : "{}";
     }
 
-    if (!passkeyStore.TryRemove(challengeKey, out var stored) || stored.Expiry < DateTime.UtcNow)
+    if (!passkeyStore.TryRemove(challengeKey, out var stored) || stored.Expiry < DateTime.UtcNow
+        || stored.Ceremony != PasskeyCeremony.Registration)
     {
         context.Response.StatusCode = 401;
         await context.Response.WriteAsync("Challenge expired. Please start over.");
@@ -1348,6 +1397,7 @@ app.MapPost("/passkey/register/complete", async (HttpContext context) =>
         // database account, so require an exact match before attestation verification or IPC.
         if (!PasskeyRegistrationAuthorization.IsAuthorized(stored.Username, user, DateTime.UtcNow))
         {
+            RecordProbe(context, "Passkey registration link is invalid or has expired");
             context.Response.StatusCode = 401;
             await context.Response.WriteAsync("Registration link is invalid or has expired.");
             return;
@@ -1543,6 +1593,25 @@ static byte[] FromBase64Url(string b64url)
 
 static string ToBase64Url(byte[] bytes) =>
     Convert.ToBase64String(bytes).Replace('+', '-').Replace('/', '_').TrimEnd('=');
+
+// HTML for displaying a client IP: encoded, with a <wbr> after each colon so a full IPv6 address
+// (up to 39 chars) wraps at group boundaries instead of overflowing the narrow page boxes.
+// <wbr> inserts no character, so the address still copies as one string.
+static string IpDisplayHtml(string ip) =>
+    System.Net.WebUtility.HtmlEncode(ip).Replace(":", ":<wbr>");
+
+// Display form of the connecting address: IPv4-mapped IPv6 reduced to plain IPv4.
+static string ClientIpForDisplay(HttpContext context)
+{
+    string ip = context.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+    return ip.StartsWith("::ffff:") ? ip.Substring(7) : ip;
+}
+
+static void RecordProbe(HttpContext context, string message, string? existingAccount = null) =>
+    ProbeLog.Record(RateLimitPartitionKey(context.Connection.RemoteIpAddress), ClientIpForDisplay(context), message, existingAccount);
+
+static void CountOutOfDomainProbe(HttpContext context) =>
+    ProbeLog.CountOutOfDomain(RateLimitPartitionKey(context.Connection.RemoteIpAddress));
 
 static bool IsPublicIpAddress(string ipString)
 {
@@ -2030,7 +2099,7 @@ public static class LoginFailureMonitor
         string? user = cfg["Smtp:Username"], pass = cfg["Smtp:Password"];
         try
         {
-            bool useSsl = GetSmtpUseSsl(cfg, host);
+            bool useSsl = SmtpTransportPolicy.GetUseSsl(cfg, host);
             using var msg = new MailMessage(from, notify)
             {
                 Subject = $"[MFA] {failures} failed logins for {username}",
@@ -2050,30 +2119,164 @@ public static class LoginFailureMonitor
         }
     }
 
-    private static bool GetSmtpUseSsl(IConfiguration cfg, string host)
+}
+
+// Capped logging for events anyone on the internet can trigger before authenticating: sign-in
+// attempts for addresses with no passkey, invalid provisioning links, failed assertions. They are
+// worth recording (they're how account probing shows up), but uncapped they let one attacker bury
+// real events under ~2,400 junk lines an hour. So: the first few per source and a fixed number
+// overall per window are logged in full as [PROBE] lines; the rest are only counted, and a single
+// summary line reports them once the window has ended.
+//
+// The summary is written lazily, by the first probe event after the window ends, and states the
+// window's bounds so its later timestamp isn't misleading. An attacker can spend the global
+// allowance to hide a later probe's individual line; the summary still counts it, and a
+// suppressed probe is lost reconnaissance detail, not lost authentication security. Constants,
+// not config, per the project's preference for fewer switches.
+public static class ProbeLog
+{
+    private const int MaxLinesPerSourcePerWindow = 5;
+    private const int MaxLinesPerWindow = 50;
+    private const int MaxNamedAccountsInSummary = 10;
+    private static readonly TimeSpan Window = TimeSpan.FromHours(1);
+
+    private static readonly object _lock = new();
+    private static DateTime _windowStartUtc = DateTime.MinValue;
+    private static int _linesLogged;
+    private static readonly Dictionary<string, int> _linesPerSource = new();
+    private static int _suppressed;
+    private static readonly HashSet<string> _suppressedSources = new();
+    private static readonly HashSet<string> _suppressedAccounts = new(StringComparer.OrdinalIgnoreCase);
+    private static int _outOfDomain;
+    private static readonly HashSet<string> _outOfDomainSources = new();
+
+    // sourceKey is the rate-limit partition (IPv4 address or IPv6 /56); clientIp is for display.
+    // existingAccount names a real account the attempt targeted, if any -- that set can't grow past
+    // the account list, so it is safe to report even when the individual lines are suppressed.
+    public static void Record(string sourceKey, string clientIp, string message, string? existingAccount = null)
     {
-        string? configured = cfg["Smtp:UseSsl"];
-        if (string.IsNullOrWhiteSpace(configured)) return true;
-        if (!bool.TryParse(configured, out bool useSsl))
-            throw new InvalidOperationException($"Smtp:UseSsl value '{configured}' is not true or false.");
-        if (!useSsl && !IsLoopbackSmtpHost(host))
-            throw new InvalidOperationException(
-                "Smtp:UseSsl may be false only for a loopback SMTP relay (localhost, 127.0.0.0/8, or ::1).");
-        return useSsl;
+        lock (_lock)
+        {
+            RollWindowIfDue();
+            _linesPerSource.TryGetValue(sourceKey, out int fromSource);
+            if (_linesLogged < MaxLinesPerWindow && fromSource < MaxLinesPerSourcePerWindow)
+            {
+                _linesLogged++;
+                _linesPerSource[sourceKey] = fromSource + 1;
+                AuditLogger.Warn($"[PROBE] {Neutralize(message)} from {clientIp}");
+                return;
+            }
+            _suppressed++;
+            _suppressedSources.Add(sourceKey);
+            if (existingAccount != null) _suppressedAccounts.Add(existingAccount);
+        }
     }
 
-    private static bool IsLoopbackSmtpHost(string host)
+    // Addresses outside AllowedDomains carry no account signal (they can't match an account), so
+    // they are only counted, never logged individually.
+    public static void CountOutOfDomain(string sourceKey)
     {
-        string candidate = host.Trim().TrimEnd('.');
-        if (candidate.Equals("localhost", StringComparison.OrdinalIgnoreCase)) return true;
+        lock (_lock)
+        {
+            RollWindowIfDue();
+            _outOfDomain++;
+            _outOfDomainSources.Add(sourceKey);
+        }
+    }
 
-        candidate = candidate.TrimStart('[').TrimEnd(']');
-        return System.Net.IPAddress.TryParse(candidate, out var address)
-            && System.Net.IPAddress.IsLoopback(address);
+    // Probe messages can carry request-derived text (Fido2 echoes clientData fields in its
+    // errors). Every log tag is bracketed, so swapping brackets for parentheses stops that text
+    // imitating one; the length cap keeps one line from filling the logger's 512-char budget.
+    private const int MaxMessageLength = 300;
+    private static string Neutralize(string message)
+    {
+        string safe = message.Replace('[', '(').Replace(']', ')');
+        return safe.Length <= MaxMessageLength ? safe : safe[..MaxMessageLength] + "...";
+    }
+
+    // An email for a [PROBE] line: quoted, and only if it is a plain address. A quoted local part
+    // ("any printable text"@domain) is valid to MailAddress and could carry text that imitates
+    // other log tags, so anything else is reduced to its length.
+    public static string DisplayEmail(string address) =>
+        address.Length <= 254 && System.Text.RegularExpressions.Regex.IsMatch(address, @"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\z")
+            ? $"'{address}'"
+            : $"(unusual address, {address.Length} chars)";
+
+    private static void RollWindowIfDue()
+    {
+        var now = DateTime.UtcNow;
+        if (now - _windowStartUtc < Window) return;
+
+        if (_suppressed > 0 || _outOfDomain > 0)
+        {
+            var summary = new StringBuilder(
+                $"[PROBE] Summary for {_windowStartUtc:yyyy-MM-dd HH:mm} to {_windowStartUtc + Window:HH:mm} UTC: ");
+            // Counts first: if a long account list pushes the line past the logger's 512-char
+            // cut, it is the tail of the list that is lost, not the numbers.
+            summary.Append($"{_suppressed} further attempt(s) not logged individually, from {_suppressedSources.Count} source(s); ");
+            summary.Append($"{_outOfDomain} attempt(s) for addresses outside AllowedDomains, from {_outOfDomainSources.Count} source(s)");
+            if (_suppressedAccounts.Count > 0)
+            {
+                var named = _suppressedAccounts.OrderBy(a => a, StringComparer.OrdinalIgnoreCase).Take(MaxNamedAccountsInSummary);
+                summary.Append($"; existing accounts targeted: {string.Join(", ", named)}");
+                if (_suppressedAccounts.Count > MaxNamedAccountsInSummary)
+                    summary.Append($" (+{_suppressedAccounts.Count - MaxNamedAccountsInSummary} more)");
+            }
+            summary.Append('.');
+            AuditLogger.Warn(summary.ToString());
+        }
+
+        _windowStartUtc = now;
+        _linesLogged = 0;
+        _linesPerSource.Clear();
+        _suppressed = 0;
+        _suppressedSources.Clear();
+        _suppressedAccounts.Clear();
+        _outOfDomain = 0;
+        _outOfDomainSources.Clear();
     }
 }
 
 public enum LogSeverity { Debug, Info, Warning, Error }
+
+public enum PasskeyCeremony { Assertion, Registration }
+
+// The WebAuthn origin allowlist: AppUrl plus any AdditionalOrigins. This check is what stops a
+// passkey assertion produced on some other page from being accepted. Browsers let any page under
+// the passkeys' domain (the RP ID, AppUrl's host) request an assertion for it, so every origin
+// listed here is as trusted as AppUrl itself. Hence exact entries only -- never a wildcard, a
+// pattern, or a set derived from whatever names the certificate happens to cover -- and a bad
+// entry stops startup rather than being skipped.
+public static class WebAuthnOrigins
+{
+    public static HashSet<string> Build(string appUrl, IEnumerable<string> additional)
+    {
+        var primary = new Uri(appUrl);
+        var origins = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { appUrl };
+        foreach (string entry in additional)
+        {
+            if (!Uri.TryCreate(entry, UriKind.Absolute, out var uri) || uri.Scheme != Uri.UriSchemeHttps)
+                throw Invalid(entry, "must be an absolute https:// URL");
+            if (uri.UserInfo.Length > 0 || uri.AbsolutePath != "/" || uri.Query.Length > 0 || uri.Fragment.Length > 0)
+                throw Invalid(entry, "must be scheme, host and port only, with no path, query or credentials");
+            // Hygiene more than security: a browser refuses to use the passkeys on a host outside
+            // the RP ID. Catches typos and copy-paste from another deployment.
+            if (!uri.Host.Equals(primary.Host, StringComparison.OrdinalIgnoreCase)
+                && !uri.Host.EndsWith("." + primary.Host, StringComparison.OrdinalIgnoreCase))
+                throw Invalid(entry, $"must be {primary.Host} or a name under it (the passkeys' domain)");
+            // There is one listener. A different port is dead config, and a default port would
+            // be normalized away by Fido2 and never match.
+            if (uri.Port != primary.Port)
+                throw Invalid(entry, $"must use the same port as AppUrl ({primary.Port})");
+            origins.Add(uri.GetLeftPart(UriPartial.Authority));
+        }
+        return origins;
+    }
+
+    private static InvalidOperationException Invalid(string entry, string reason) =>
+        new($"AdditionalOrigins entry '{entry}' {reason}. Refusing to start: every listed origin is trusted " +
+            "for passkey sign-in exactly as AppUrl is.");
+}
 
 public static class AuditLogger
 {
@@ -2129,12 +2332,41 @@ public static class AuditLogger
 
             lock (_lock)
             {
+                DeleteExpiredLogs("mfaweb_");
                 File.AppendAllText(fullPath, logEntry + Environment.NewLine);
             }
         }
         catch (Exception ex)
         {
             Console.WriteLine($"[LOG ERROR] Could not write to log file: {ex.Message}");
+        }
+    }
+
+    // Daily files are kept for LogRetentionDays, then deleted by the first write of a new UTC day.
+    // Dated by file name rather than mtime, so a touched or copied old file still ages out.
+    private const int LogRetentionDays = 90;
+    private static DateTime _lastRetentionSweepDay = DateTime.MinValue;
+
+    // Caller holds _lock. A failure is only reported to the console, so it never blocks the log write.
+    private static void DeleteExpiredLogs(string prefix)
+    {
+        var today = DateTime.UtcNow.Date;
+        if (_lastRetentionSweepDay == today) return;
+        _lastRetentionSweepDay = today;
+        try
+        {
+            foreach (var file in Directory.EnumerateFiles(LogDirectory, prefix + "*.log"))
+            {
+                string datePart = Path.GetFileNameWithoutExtension(file).Substring(prefix.Length);
+                if (DateTime.TryParseExact(datePart, "yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture,
+                        System.Globalization.DateTimeStyles.None, out var day)
+                    && day < today.AddDays(-LogRetentionDays))
+                    File.Delete(file);
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[LOG ERROR] Could not remove expired log files: {ex.Message}");
         }
     }
 

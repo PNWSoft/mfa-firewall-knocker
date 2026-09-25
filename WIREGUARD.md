@@ -115,8 +115,9 @@ question, at the cost of a small piece of infrastructure that isn't WireGuard's 
 
 ## IPv6 note
 
-Known limitation, not specific to WireGuard: on Linux, rules are created with `iptables`, so a
-client authenticating and connecting over public IPv6 gets no rule — the request appears to
-succeed but the port never actually opens. If you run a dual-stack WireGuard listener on Linux,
-either publish an A record only for the MFAWeb hostname or disable the IPv6 listener until
-`ip6tables` support exists. See "Known issues" in SECURITY.md.
+On Linux, a client that signs in over public IPv6 gets its grant in `ip6tables` (since 0.4.0),
+and IPv4 grants go in `iptables`. For a dual-stack WireGuard listener, make sure `ip6tables`
+blocks the port by default the same way `iptables` does: the gate only adds allow rules, so a
+permissive IPv6 policy leaves the port open regardless. If clients' IPv6 addresses change
+within their network, `BouncerConfig:Ipv6GrantPrefixLength` can widen each grant to that
+`/64`. See "Known issues" in SECURITY.md.
