@@ -296,7 +296,28 @@ Test("expired provisioning is cleared, but the password only when TOTP was never
     // Already clean and expired: idempotent, reports no change on a second pass.
     Check(!DatabaseLockService.TryCleanExpiredProvisioning(neverConfirmed, now));
 });
-Console.WriteLine(failed == 0 ? "All 27 regression checks passed." : $"{failed} regression check(s) failed.");
+Test("the Linux database lock file excludes a second holder until released", () =>
+{
+    string dir = Path.Combine(Path.GetTempPath(), "mfa-lock-" + Guid.NewGuid().ToString("N"));
+    Directory.CreateDirectory(dir);
+    try
+    {
+        string db = Path.Combine(dir, "users.json");
+        using (var first = LinuxDbLock.TryAcquire(db, TimeSpan.FromSeconds(1)))
+        {
+            Check(first != null);
+            var watch = Stopwatch.StartNew();
+            Check(LinuxDbLock.TryAcquire(db, TimeSpan.FromMilliseconds(300)) == null);
+            Check(watch.Elapsed >= TimeSpan.FromMilliseconds(250));
+        }
+        using (var again = LinuxDbLock.TryAcquire(db, TimeSpan.FromSeconds(1))) Check(again != null);
+        Check(File.Exists(Path.Combine(dir, "users.lock")));
+        if (!OperatingSystem.IsWindows())
+            Check(File.GetUnixFileMode(Path.Combine(dir, "users.lock")) == (UnixFileMode.UserRead | UnixFileMode.UserWrite));
+    }
+    finally { Directory.Delete(dir, true); }
+});
+Console.WriteLine(failed == 0 ? "All 28 regression checks passed." : $"{failed} regression check(s) failed.");
 return failed == 0 ? 0 : 1;
 
 void Test(string name, Action action)

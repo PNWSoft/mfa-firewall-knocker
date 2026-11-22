@@ -144,19 +144,18 @@ namespace MFAAdmin
 
     class Program
     {
-        // Cross-process mutex — shared by MFAService and MFAAdmin, the only two writers, to serialize
-        // their writes. MFAWeb never writes the store and does not participate in this mutex.
-        // ACL-restricted so only SYSTEM, Builtin Administrators, and the gMSA can acquire it.
-        // Initialized in Main() after config is loaded so the service account name comes from appsettings.
-        private static System.Threading.Mutex _dbMutex = null!;
+        // Cross-process lock shared by MFAService and MFAAdmin, the only two writers, to serialize
+        // their writes. MFAWeb never writes the store and does not take it. On Windows it is a
+        // named mutex, ACL-restricted so only SYSTEM, Builtin Administrators, and the gMSA can
+        // acquire it, created in Main() after config is loaded so the service account name comes
+        // from appsettings. On Linux it is a lock file beside the database; see
+        // Shared/LinuxDbLock.cs for why not a mutex.
+        private static System.Threading.Mutex? _dbMutex;
 
 #pragma warning disable CA1416
         private static System.Threading.Mutex CreateSecureDbMutex(string? serviceAccount)
         {
             const string mutexName = @"Global\MFA_DB_LOCK";
-
-            if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-                return new System.Threading.Mutex(false, mutexName);
 
             var security = new MutexSecurity();
 
@@ -290,7 +289,8 @@ namespace MFAAdmin
                 }
             }
 
-            _dbMutex = CreateSecureDbMutex(Config["FirewallService:GmsaAccount"]);
+            if (OperatingSystem.IsWindows())
+                _dbMutex = CreateSecureDbMutex(Config["FirewallService:GmsaAccount"]);
 
             // Ensure the directory exists before doing anything
             var dir = Path.GetDirectoryName(DbPath);
@@ -1015,9 +1015,25 @@ namespace MFAAdmin
 
         static IDisposable AcquireDbLock()
         {
+            if (!OperatingSystem.IsWindows())
+            {
+                try { return LinuxDbLock.TryAcquire(DbPath, TimeSpan.FromSeconds(10)) ?? TimedOut(); }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    AdminLogger.Error($"[DB LOCK] Could not open the database lock file: {ex.Message}");
+                    Environment.Exit(1);
+                    return null!;
+                }
+                static IDisposable TimedOut()
+                {
+                    AdminLogger.Error("[DB LOCK] Timed out waiting for database lock.");
+                    Environment.Exit(1);
+                    return null!;
+                }
+            }
             try
             {
-                if (!_dbMutex.WaitOne(TimeSpan.FromSeconds(10)))
+                if (!_dbMutex!.WaitOne(TimeSpan.FromSeconds(10)))
                 {
                     AdminLogger.Error("[DB LOCK] Timed out waiting for database lock.");
                     Environment.Exit(1);
@@ -1028,7 +1044,7 @@ namespace MFAAdmin
                 // A prior process crashed while holding the lock; Windows transferred ownership to us.
                 AdminLogger.Warn("[DB LOCK] Mutex was abandoned by a prior process - ownership transferred, proceeding.");
             }
-            return new DbLock(_dbMutex);
+            return new DbLock(_dbMutex!);
         }
 
         private sealed class DbLock : IDisposable

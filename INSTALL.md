@@ -548,9 +548,9 @@ UMask=0027
 NoNewPrivileges=true
 ProtectHome=true
 ProtectSystem=strict
-# .NET's cross-process database mutex (shared with MFAAdmin, which runs unsandboxed) uses the
-# shared /tmp namespace. Do not enable PrivateTmp, or MFAAdmin's view of the mutex diverges
-# from this service's, defeating the serialization it exists for.
+# The database lock shared with MFAAdmin, which runs unsandboxed, is the file
+# /etc/mfa-auth/users.lock, so both see the same lock whatever this sandbox does to /tmp or to
+# home directories.
 ReadWritePaths=/etc/mfa-auth /var/log/mfa-auth /run /tmp
 
 # Sandboxing that doesn't depend on which capabilities this process happens to use, so it's

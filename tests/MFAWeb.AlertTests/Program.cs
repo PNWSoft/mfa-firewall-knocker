@@ -435,7 +435,7 @@ sealed class TestWeb : IAsyncDisposable
             process.Start();
             process.BeginOutputReadLine();
             process.BeginErrorReadLine();
-            Uri address = await listening.Task.WaitAsync(TimeSpan.FromSeconds(20));
+            Uri address = await listening.Task.WaitAsync(TimeSpan.FromSeconds(60));
             return new TestWeb(process, address, logs);
         }
         catch

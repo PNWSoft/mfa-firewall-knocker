@@ -1506,11 +1506,12 @@ public class DatabaseLockService : BackgroundService
 
     private static byte[] Entropy = Array.Empty<byte>();
 
-    // Cross-process mutex — shared by MFAService and MFAAdmin, the only two writers, to serialize
-    // their writes. MFAWeb never writes the store and does not participate in this mutex.
-    // ACL-restricted so only SYSTEM, Builtin Administrators, and the gMSA can acquire it.
-    // Initialized in the constructor so the service account name comes from appsettings.
-    private static System.Threading.Mutex _dbMutex = null!;
+    // Cross-process lock shared by MFAService and MFAAdmin, the only two writers, to serialize
+    // their writes. MFAWeb never writes the store and does not take it. On Windows it is a named
+    // mutex, ACL-restricted so only SYSTEM, Builtin Administrators, and the gMSA can acquire it,
+    // created in the constructor so the service account name comes from appsettings. On Linux it
+    // is a lock file beside the database; see Shared/LinuxDbLock.cs for why not a mutex.
+    private static System.Threading.Mutex? _dbMutex;
 
     public DatabaseLockService(IConfiguration config)
     {
@@ -1526,15 +1527,14 @@ public class DatabaseLockService : BackgroundService
         if (entropyStr.Trim().Length < 16)
             throw new InvalidOperationException("DpapiEntropy must be at least 16 characters. Generate a unique random string for this deployment (e.g. 32 random bytes, base64-encoded).");
         Entropy = Encoding.UTF8.GetBytes(entropyStr);
-        _dbMutex ??= CreateSecureDbMutex(config["FirewallService:GmsaAccount"]);
+        if (OperatingSystem.IsWindows())
+            _dbMutex ??= CreateSecureDbMutex(config["FirewallService:GmsaAccount"]);
     }
 
+    [SupportedOSPlatform("windows")]
     private static System.Threading.Mutex CreateSecureDbMutex(string? serviceAccount)
     {
         const string mutexName = @"Global\MFA_DB_LOCK";
-
-        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-            return new System.Threading.Mutex(false, mutexName);
 
         var security = new MutexSecurity();
 
@@ -1560,7 +1560,7 @@ public class DatabaseLockService : BackgroundService
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         // A duplicate instance must not touch the user database either. Its writes would race
-        // the real service's, and on Linux there is no cross-process mutex to serialise them.
+        // the real service's, and the cross-process database lock is not held across them.
         // See IpcOwnership.
         await IpcOwnership.Claimed.WaitAsync(stoppingToken);
 
@@ -1966,16 +1966,25 @@ public class DatabaseLockService : BackgroundService
 
     private static IDisposable? AcquireDbLock()
     {
+        if (!OperatingSystem.IsWindows())
+        {
+            try { return LinuxDbLock.TryAcquire(DbPath, TimeSpan.FromSeconds(10)); }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                ServiceLogger.Error($"[DB LOCK] Could not open the database lock file: {ex.Message}");
+                return null;
+            }
+        }
         try
         {
-            if (!_dbMutex.WaitOne(TimeSpan.FromSeconds(10))) return null;
+            if (!_dbMutex!.WaitOne(TimeSpan.FromSeconds(10))) return null;
         }
         catch (AbandonedMutexException)
         {
             // A prior process crashed while holding the lock; Windows transferred ownership to us.
             ServiceLogger.Warn("[DB LOCK] Mutex was abandoned by a prior process - ownership transferred, proceeding.");
         }
-        return new DbLock(_dbMutex);
+        return new DbLock(_dbMutex!);
     }
 
     private sealed class DbLock : IDisposable

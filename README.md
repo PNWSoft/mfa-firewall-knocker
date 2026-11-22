@@ -168,7 +168,8 @@ than trusting its caller.
   short-lived registration token and readiness state. Both read and write access need
   protection: a reader can disclose hashes or race an active enrollment, while a writer can
   enroll their own credential. MFAService and MFAAdmin — the only two writers — serialize
-  against each other through a cross-process mutex; the internet-facing MFAWeb never writes the
+  against each other through a cross-process lock (a named mutex on Windows, a lock file on
+  Linux); the internet-facing MFAWeb never writes the
   store directly, and reads it without that same serialization
 - **Building with `-p:AllowTotp=true` changes that**, and it is the main reason the flag is not
   the default. TOTP verification is `HMAC-SHA1(secret, timestep)`, so the server must keep each
