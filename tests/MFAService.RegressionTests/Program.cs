@@ -550,7 +550,7 @@ Test("Windows privileged log files: links and files we cannot inspect are set as
         // rename, as it can for a file whose DACL leaves us out -- left in place while the log
         // goes to a uniquely named file. Never written to, and always reported.
         (used, note) = PrivilegedLogFile.Prepare(foreign);
-        Check(note!.Contains("not created by this account") && File.Exists(used) && File.ReadAllText(used) == "");
+        Check(note!.Contains("owned by another account") && File.Exists(used) && File.ReadAllText(used) == "");
         Check(used == foreign ? note.Contains("set aside") : note.Contains("writing to"));
 
         Check(File.ReadAllText(target) == "untouched");
