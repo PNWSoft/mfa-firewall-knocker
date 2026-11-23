@@ -3,7 +3,7 @@
   <PropertyGroup>
     <OutputType>Exe</OutputType>
     <TargetFramework>net10.0</TargetFramework>
-    <Version>0.5.1</Version>
+    <Version>0.6.0</Version>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <ApplicationIcon>knocker.ico</ApplicationIcon>
@@ -19,6 +19,7 @@
     <Compile Include="..\Shared\WindowsPowerShell.cs" Link="WindowsPowerShell.cs" />
     <Compile Include="..\Shared\PrivilegedLogFile.cs" Link="PrivilegedLogFile.cs" />
     <Compile Include="..\Shared\ConfigFiles.cs" Link="ConfigFiles.cs" />
+    <Compile Include="..\Shared\CertTrust.cs" Link="CertTrust.cs" />
   </ItemGroup>
 
   <ItemGroup>
@@ -31,6 +32,7 @@
   </ItemGroup>
 
   <ItemGroup>
+    <PackageReference Include="BCrypt.Net-Next" Version="4.1.0" />
     <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" Version="10.0.5" />
     <PackageReference Include="Microsoft.Extensions.Hosting.Systemd" Version="10.0.5" />
     <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="10.0.5" />

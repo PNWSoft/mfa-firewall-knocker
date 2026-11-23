@@ -142,13 +142,14 @@ not change:
 An outage therefore costs the ability to grant access and the timely removal of existing grants.
 It does not open anything.
 
-`MFAAdmin reset` removes every MFA-granted rule and does not require MFAService. It runs elevated
+`MFAAdmin reset` removes every rule under its configured `RulePrefix` (on Linux, in every chain
+of both tables) and does not require MFAService. It runs elevated
 and issues the firewall commands directly — `Remove-NetFirewallRule` on Windows, `iptables -D` and
 `ip6tables -D` on Linux. On both platforms it then re-reads the rule list and reports what remains
 rather than assuming the deletions succeeded, and exits non-zero if any do. This applies to emergency revocation generally, not only to outages. `MFAAdmin diag`
 lists the rules without removing them.
 
-`reset` removes every grant, so all users must re-authenticate afterwards. `MFAAdmin delete`
+`reset` removes every grant under that prefix, so all users must re-authenticate afterwards. `MFAAdmin delete`
 also removes the deleted user's own rules, which record the username: in the rule description on
 Windows, and in the rule comment on Linux. Linux rules granted by a version before the username
 was recorded carry none; `delete` reports how many such rules are open, and `diag` lists them by
@@ -215,7 +216,7 @@ security; no network gate can be one.
 In the default passkey-only build, enrolled WebAuthn credentials are **public keys** and there is
 no recoverable TOTP secret. The store still contains usernames and the hash of each account's
 current **one-time enrollment password** — a bootstrap credential, not a persistent one: it is
-checked exactly once, at registration, never used to log in, and replaced by a fresh one on every
+used only for passkey registration, never to log in, and replaced by a fresh one on every
 `add` or `reprovision`. This is enforced at the data layer, not only by the check sites that use
 it: the password is cleared the moment registration succeeds, and a periodic sweep also clears it
 if the 60-minute enrollment window closes unused, so it does not persist beyond the window it was
@@ -312,10 +313,14 @@ logs, or bypass the passkey-registration one-time-password gate.
   total within its trust scope. MFAService's independent re-validation bounds the blast
   radius (public IPs only, configured ports only, time-limited) rather than preventing it.
   Reports that assume arbitrary code execution as the MFAWeb service account are describing
-  this known boundary. That includes registering a passkey on an account that has none yet: in
-  the default build, an account part-way through setup (provisioned, with its setup link still
-  live); in a TOTP build, any account without a passkey. An account that already has a passkey
-  cannot get a second one this way. It also covers the log directory MFAWeb
+  this known boundary. That includes registering a passkey on an account that has none yet. In
+  the default build MFAService checks the enrolment password itself (since 0.6.0), so this needs
+  the password gate to have been passed: by someone who has the password, or by the owner while
+  MFAWeb is compromised (it then sees the password, and for 5 minutes holds the
+  registration-ready token, as a database reader would; see above). In a TOTP build, any account
+  without a passkey. An account that already has a passkey cannot get a second one this way. On
+  each registration MFAService sends an email to the account's own address and
+  `Smtp:NotifyAddress`; a failed send is logged, and the registration stands. It also covers the log directory MFAWeb
   shares with MFAService and MFAAdmin: the web account can read their logs on Windows, can make
   them switch to a differently named file, and on either platform can create files that look
   like theirs. After a suspected MFAWeb compromise, check the owner of any log file you rely on,
@@ -358,6 +363,10 @@ Tracked, understood, and not currently considered exploitable:
   MFAService from binding. That is unavoidable with a fixed pipe name and it now fails closed
   and loudly — the service logs an error, emails `Smtp:NotifyAddress` once, and retries with
   backoff until the name is free. Interception is closed even in that window.
+  Since 0.6.0 the pipe's ACL also denies network logons, so a connection over SMB is refused by
+  the ACL, and
+  MFAWeb connects at the Identification impersonation level, so the server end of the pipe can
+  identify the web account but not act as it.
 - **This only adds allow rules, and removes only rules under its own prefix.** If the protected port is reachable for
   some other reason — a standing allow rule, a blanket accept on the internet-facing interface, a
   permissive default policy, an upstream forward that bypasses the host's INPUT chain — then every

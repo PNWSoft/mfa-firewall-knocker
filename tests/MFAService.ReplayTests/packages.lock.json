@@ -475,6 +475,7 @@
       "mfaservice": {
         "type": "Project",
         "dependencies": {
+          "BCrypt.Net-Next": "[4.1.0, )",
           "Microsoft.Extensions.Hosting.Systemd": "[10.0.5, )",
           "Microsoft.Extensions.Hosting.WindowsServices": "[10.0.5, )",
           "System.Security.Cryptography.ProtectedData": "[10.0.5, )"

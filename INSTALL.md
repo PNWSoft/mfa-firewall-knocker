@@ -119,7 +119,13 @@ All three components read from their own `appsettings.json`. Copy the
 | `BouncerConfig:ExpirationHours` | How long firewall rules stay open. Rules are automatically removed by the sweeper when they expire. **Clamped to 1-48 on the privileged side**, so a larger value is reduced to 48 and logged with a `[CONFIG]` warning — a slipped digit cannot leave a standing grant. Every `AllowedPorts` entry must use a port in 1-65535 and protocol TCP or UDP; an invalid entry fails the grant request before any rule is written. If the firewall command itself fails for one port after another has opened (a held firewall lock, for instance), the request reports an error but the opened port stays open until it expires; signing in again re-applies all of them. |
 | `BouncerConfig:RulePrefix` | Prefix applied to every firewall rule name. Must also match the value in MFAAdmin's config so the `diag` and `reset` commands can find the rules. Letters, digits, space, `_`, `.` and `-` only, 1-64 characters; MFAService refuses to start with anything else, since a quote in the prefix breaks the firewall commands and, on Linux, leaves grants the sweeper can never remove. Use a prefix no other firewall rule on the host starts with: the sweeper treats every rule with the prefix as its own, and reports one without a readable expiry as an error on every pass, with an alert email at most once a day. |
 | `BouncerConfig:Ipv6GrantPrefixLength` | How much of an IPv6 client's address a grant covers: `128` (the default) is the exact address, and anything down to `64` widens the grant to that address's network, so a client whose address changes within its `/64` (privacy addresses, cellular carriers) keeps access. Values outside 64-128 are clamped, with a `[CONFIG]` warning. IPv4 grants are never widened. Applies on both platforms: Windows has always handled IPv6 grants, as the exact address only, until 0.4.0; on Linux IPv6 grants are new in 0.4.0. |
+| `BouncerConfig:IptablesChain` | Linux only, optional. The `iptables`/`ip6tables` chain new grants are written to; absent or empty means `INPUT`. The chain must already exist in both tables, with a jump to it from `INPUT` ahead of any rule that drops the protected port; MFAService does not create or link it. See [Using a dedicated chain](#using-a-dedicated-chain). Letters, digits, `_` and `-`, not starting with `-`, at most 28 characters, and not `FORWARD` or `OUTPUT`; MFAService refuses to start with anything else. |
+| `SiteName` | Optional. Names the site in the email sent when a passkey is registered. Defaults to `MFA Auth`; use the same value as MFAAdmin. |
 | `HttpsCert:PemPath` | **Linux only, and required for expiry alerts there.** Full path to the certificate MFAWeb serves (e.g. `/etc/mfa-auth/tls/current/fullchain.pem`). There is no certificate store on Linux, so without this the expiry watchdog logs `[CERT] Monitor disabled` at startup and never alerts — and an expired certificate means no passkey sign-in at all. |
+
+When a passkey is registered, MFAService emails the account's own address and
+`Smtp:NotifyAddress`, using its `Smtp:*` settings. Without `Smtp:Host` and `Smtp:FromAddress` it
+logs a warning instead and the registration still completes.
 
 ### MFAAdmin — `appsettings.json`
 
@@ -141,7 +147,7 @@ All three components read from their own `appsettings.json`. Copy the
 | Key | Description |
 |-----|-------------|
 | `BouncerUrl` | Base URL of MFAWeb. Used to generate the provisioning links sent in welcome emails. |
-| `RulePrefix` | Must match `BouncerConfig:RulePrefix` in MFAService. Used by `diag` and `reset` commands. |
+| `RulePrefix` | Must match `BouncerConfig:RulePrefix` in MFAService. Used by the `diag`, `delete` and `reset` commands. |
 
 `Smtp:UseSsl` defaults to `true` and requires a validated STARTTLS connection. Set it to
 `false` only when the SMTP relay runs on the same machine: `Smtp:Host` must be `localhost`, a
@@ -372,7 +378,7 @@ set the **same** `HttpsCert:Subject`/`Store`/`Location` values in MFAService's
 
 > **Do not add a `Kestrel:Endpoints:Https:Certificate` block.** MFAWeb deliberately selects
 > the certificate in code at request time (matching on CN *and* SAN, preferring the newest
-> valid one) so that a renewal is picked up without a restart and an expired certificate does
+> valid one that chains to a trusted root) so that a renewal is picked up without a restart and an expired certificate does
 > not stop the service from starting. Kestrel's built-in `Certificate:Subject` binding does a
 > CN-only lookup at startup and **crashes the service the moment that certificate expires**
 > or is replaced by a SAN-only one. The `Https` endpoint should declare only its `Url`.
@@ -607,8 +613,9 @@ LockPersonality=true
 # the same way INSTALL.md already asks for the gate itself (see "Verify the gate is actually
 # gating"), since a too-narrow set fails firewall commands rather than refusing to start.
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_DAC_OVERRIDE CAP_CHOWN CAP_FOWNER
-# AF_INET/AF_INET6 are for the SMTP connection that sends certificate-expiry and IPC alerts;
-# without them this service cannot reach any relay, even a local one, and never alerts.
+# AF_INET/AF_INET6 are for SMTP: certificate-expiry, IPC, sweeper and log-file alerts and the
+# passkey-registration notice. Without them this service cannot reach any relay, even a local
+# one, and never emails.
 RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
 
 # Logging
@@ -739,12 +746,50 @@ automatically when running on Linux — no source changes are required for a sta
 Rules are tracked using an `iptables`/`ip6tables` comment that embeds the rule name, the
 username and the expiry timestamp (e.g. `MFA_Temp_1.2.3.4_22_TCP user:alice@example.com
 exp:1746000000`). Which table a grant's rule lands in is decided by the client's own address
-family, not a config setting. The sweeper reads `iptables -S INPUT` **and** `ip6tables -S
-INPUT` on every pass, finds rules whose expiry has passed in either table, and deletes them.
-`MFAAdmin diag`/`reset` read and clear both tables the same way, and `MFAAdmin delete`
-removes the deleted user's own rules from both. Rules granted by a version before the
+family, not a config setting. The sweeper reads `iptables -S` **and** `ip6tables -S` (every
+chain of the filter table) on every pass, finds rules with the prefix whose expiry has passed
+in either table, and deletes each from the chain it is in. `MFAAdmin diag`/`reset` read and
+clear both tables the same way, and `MFAAdmin delete` removes the deleted user's own rules from
+both. Rules granted by a version before the
 username was recorded have no `user:` part; they are still expired on schedule, and `diag`
 shows their user as `?`.
+
+#### Using a dedicated chain
+
+By default grants go into `INPUT`. With `BouncerConfig:IptablesChain` set (for example `MFA`),
+new grants go into that chain instead. A tool that manages or saves the ruleset (Ansible, a
+`netfilter-persistent` setup) can then be set to leave that chain's contents alone, instead of
+having to tell temporary grants apart from the rules in `INPUT`. A plain `iptables-save` still
+saves every chain, this one included. MFAService adds rules only to that chain and removes only
+rules with its prefix. Creating the chain and the jump to it is part of your firewall
+configuration:
+
+```bash
+iptables  -N MFA
+ip6tables -N MFA
+# Before the rule that drops or rejects the protected port, or grants will open nothing.
+iptables  -I INPUT <position> -j MFA
+ip6tables -I INPUT <position> -j MFA
+```
+
+Then restart MFAService. MFAAdmin needs no setting for this. At startup, and again before each
+grant, MFAService checks the chain against the current ruleset:
+
+- if the chain does not exist, or `FORWARD` or `OUTPUT` reaches it through jumps (a chain such as
+  `DOCKER-USER`, where a grant could open forwarding to hosts behind this one), it logs an error
+  and refuses grants until that is fixed;
+- if `INPUT` does not reach it, directly or through another chain, it logs a warning at startup:
+  grants are written but open nothing.
+
+Check the jump's position relative to your drop rules yourself; MFAService does not check it.
+
+The sweeper, `diag`, `delete` and `reset` find grants in whatever chain they are, so grants
+made before the switch, or before a later change or removal of the setting, still expire on
+schedule. If your firewall configuration flushes the chain when it reloads, open grants are lost
+and users sign in again.
+
+Versions before 0.6.0 read only `INPUT`. Before rolling back to one of them with this setting in
+use, run `MFAAdmin reset` (or flush the chain), or grants in the chain are never expired.
 
 `iptables` and `ip6tables` are run directly from `/usr/sbin` (or `/sbin`), without a shell,
 and with `-w 5`: if another program holds the xtables lock, such as fail2ban, Docker or a
@@ -773,9 +818,9 @@ ufw allow from 1.2.3.4 to any port 22 proto tcp comment "MFA_Temp_1.2.3.4_22_TCP
 ufw allow from 2001:db8::1 to any port 22 proto tcp comment "MFA_Temp_2001:db8::1_22_TCP exp:1746000000"
 ufw delete allow from 1.2.3.4 to any port 22 proto tcp
 
-# List active MFA rules (iptables / ip6tables)
-iptables -S INPUT | grep MFA_Temp
-ip6tables -S INPUT | grep MFA_Temp
+# List active MFA rules (iptables / ip6tables), in every chain
+iptables -S | grep MFA_Temp
+ip6tables -S | grep MFA_Temp
 ```
 
 ---
@@ -800,8 +845,15 @@ Install into `LocalMachine\My` (win-acme, Certify, or an internal CA) and set
 `HttpsCert:{Subject,Store,Location}`. Do **not** add a `Kestrel:...:Certificate` block.
 
 MFAWeb selects the certificate at runtime: it matches the hostname against CN **and** SAN, keeps
-only currently-valid certificates with a private key, picks the newest expiry, and re-checks once
-a minute. A renewal is picked up **without a restart**, and an expired certificate no longer
+only currently-valid certificates with a private key, and re-checks once a minute. Of those it
+picks the newest expiry among certificates whose chain builds to a root this server trusts for
+server authentication (revocation is not checked); if none does, it uses the newest one anyway
+and logs a warning, so a private CA whose root only the clients trust keeps working. MFAService's
+expiry alert watches the certificate MFAWeb would choose; only when there is none does it fall
+back to the same preference ignoring validity dates, so an expired certificate is reported as
+expired. Missing intermediates are not downloaded for the trust check: a certificate whose
+intermediate is not in the local certificate store counts as untrusted, so install the
+intermediate (win-acme does) for the preference to apply. A renewal is picked up **without a restart**, and an expired certificate no longer
 crashes Kestrel at startup. A certificate within `CertAlert:WarnDays` of expiry is flagged on the
 page shown after a passkey sign-in; once it has expired, browsers refuse the site, so the email
 alert from MFAService is the warning that still arrives.
@@ -1061,7 +1113,7 @@ Inspect the rules directly too:
 
 ```bash
 sudo iptables -S INPUT     # look for any accept for the protected port that is not MFA_Temp_*
-sudo ip6tables -S INPUT    # same check for IPv6
+sudo ip6tables -S INPUT    # same check for IPv6 (and the chain in IptablesChain, if set: iptables -S <chain>)
 ip route get 8.8.8.8       # confirms which interface is internet-facing
 ```
 ```powershell
@@ -1262,7 +1314,10 @@ Then:
 
 8. **Upgrade MFAService before MFAWeb.** From 0.2.0 the client verifies the privileged service's
    identity before sending anything, so a newer MFAWeb against an older MFAService is the
-   combination most likely to fail. The reverse order is safe. On Linux the backup in step 1
+   combination most likely to fail. The reverse order is safe for sign-ins. Going from 0.5.x to
+   0.6.0, passkey setup fails ("Service temporarily unavailable") between the two, because
+   MFAService now expects the enrolment password with the setup request; upgrade MFAWeb straight
+   after. On Linux the backup in step 1
    stopped both services; once the new files are in place, start them in that order
    (`sudo systemctl start mfa-service`, then `sudo systemctl start mfa-web`). Expired grants are
    not removed while MFAService is stopped.

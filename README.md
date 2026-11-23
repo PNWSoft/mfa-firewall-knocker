@@ -163,7 +163,7 @@ than trusting its caller.
   instead
 - **In the default passkey-only build, enrolled passkeys add no private key to the user store.**
   The file holds public keys and a user list. Alongside a one-time enrollment password —
-  a bootstrap credential checked exactly once, at registration, never used to log in, and
+  a bootstrap credential used only for passkey registration, never to log in, and
   regenerated fresh by every `add` or `reprovision` — enrollment and reprovisioning also mint a
   short-lived registration token and readiness state. Both read and write access need
   protection: a reader can disclose hashes or race an active enrollment, while a writer can
@@ -179,7 +179,7 @@ than trusting its caller.
   store is DPAPI-encrypted on Windows and plain JSON on Linux; weigh that especially carefully on
   Linux. See [SECURITY.md](SECURITY.md) for the full comparison
 - **TLS cert resilience on both platforms** — Windows selects from the certificate store by CN
-  *and* SAN, newest valid one wins; Linux re-reads the PEM every minute and hot-swaps when the
+  *and* SAN, newest valid one wins (preferring one that chains to a trusted root); Linux re-reads the PEM every minute and hot-swaps when the
   thumbprint changes. Either way a renewal is picked up **without a restart** (verified against a
   real forced renewal), a failed read keeps the last good certificate rather than dropping TLS,
   and an expired cert no longer crashes startup. A certificate nearing expiry is flagged on the
@@ -282,8 +282,10 @@ dotnet build MFA.slnx -c Release -p:AllowTotp=true
 ```
 
 Use the same flag for every component. They are deployed together anyway, since they share the
-`users.dat` schema. A mismatch is not dangerous — one direction leaves unused secrets in the
-database, the other offers a login that always fails — but it is not useful either.
+`users.dat` schema. A mismatch gains nothing: one direction leaves unused secrets in the
+database, the other offers a login that always fails. It can also weaken the passkey-only build:
+an MFAService built with the flag accepts the post-login token verb that the passkey-only build
+leaves out (see SECURITY.md), so a compromised MFAWeb could use it.
 
 > **Moving an existing deployment to a passkey-only build?** Rebuilding stops new secrets being
 > minted but does **not** remove secrets already in the database. Run `MFAAdmin purge-totp` to
@@ -508,7 +510,7 @@ revoke, you know whether you have closed the door or actually removed the person
 - Firewall rules expire after `ExpirationHours`; the sweeper runs every 5 minutes.
 - Passkey registration always requires proof of the enrollment password (or, in a TOTP build, a
   token minted after a TOTP login) —
-  in the default passkey-only build that password is never anything else: it's checked once, at
+  in the default passkey-only build that password is never anything else: it's used only for
   registration, then burned on success or once its 60-minute window expires unused, whichever
   comes first. **That changes once an account confirms TOTP** — from then on the same password is
   also that account's persistent login credential, checked on every `/auth` request, and stops

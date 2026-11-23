@@ -7,7 +7,9 @@
 #     socket (each side checking the other's identity);
 #   - MFAService grants IPv4 and IPv6 access with iptables/ip6tables under its sandbox;
 #   - MFAAdmin diag lists the grants with their user, delete removes that user's grants, and
-#     reset clears the rest.
+#     reset clears the rest;
+#   - with BouncerConfig:IptablesChain set, grants go into that chain; after the setting is
+#     removed again, diag and reset (which do not know the setting) still find grants in both.
 # No config carries DpapiEntropy, which Linux does not use.
 #
 # Why: 0.4.1 passed every other check and still failed at startup on Linux, because the .NET
@@ -158,7 +160,7 @@ s.sendall(sys.argv[1].encode() + b"\n")
 print(s.makefile().readline().strip())' "$1"
 }
 
-reply=$(ipc 'DB:RENEW_PASSKEY_TOKEN|ci-smoke-unknown-token')
+reply=$(ipc "DB:RENEW_PASSKEY_TOKEN|ci-smoke-unknown-token|$(printf %s guess | base64)")
 echo "database request -> $reply"
 [ "$reply" = "ERROR: Token not found or expired" ] || fail "database request: unexpected reply '$reply'"
 
@@ -168,6 +170,12 @@ password=$(sed -n 's/^Password: *//p' <<< "$add_out")
 setup_url=$(sed -n 's/^Passkey Link: *//p' <<< "$add_out")
 [ -n "$password" ] && [ -n "$setup_url" ] || fail "MFAAdmin add printed no credentials: $add_out"
 echo "MFAAdmin add -> user created, setup link ${setup_url%/*}/<token>"
+
+# MFAService checks the enrolment password itself: the real token with a wrong password, as code
+# running as the web account could send it, is refused, and the token stays usable.
+reply=$(ipc "DB:RENEW_PASSKEY_TOKEN|${setup_url##*/}|$(printf %s wrong-password | base64)")
+[ "$reply" = "ERROR: Invalid password" ] || fail "token renewal with a wrong password: unexpected reply '$reply'"
+echo "token renewal with the wrong password -> refused by MFAService"
 
 # --- MFAWeb ----------------------------------------------------------------------------------------
 systemctl start mfa-web || fail "mfa-web failed to start"
@@ -212,16 +220,17 @@ print("passkey setup -> password accepted, MFAService renewed the token over IPC
 PY
 
 # --- Grants, diag, delete, reset -----------------------------------------------------------------
-grant() {   # $1 = address; checks the reply and the rule
+CHAIN=INPUT
+grant() {   # $1 = address; checks the reply and the rule (in $CHAIN)
     local reply table
     reply=$(ipc "$1|$USER_EMAIL")
     echo "firewall request $1 -> $reply"
     [ "$reply" = "SUCCESS" ] || fail "firewall request for $1: unexpected reply '$reply'"
     case $1 in *:*) table=ip6tables ;; *) table=iptables ;; esac
-    grep -q "MFA_Temp_$1_22_TCP user:$USER_EMAIL exp:" <<< "$($table -S INPUT)" \
-        || fail "granted rule for $1 not found in $table"
+    grep -q "MFA_Temp_$1_22_TCP user:$USER_EMAIL exp:" <<< "$($table -S $CHAIN)" \
+        || fail "granted rule for $1 not found in $table $CHAIN"
 }
-mfa_rules() { grep -c 'MFA_Temp_' <<< "$(iptables -S INPUT; ip6tables -S INPUT)" || true; }
+mfa_rules() { grep -c 'MFA_Temp_' <<< "$(iptables -S; ip6tables -S)" || true; }   # every chain
 
 grant 203.0.113.10
 grant 2001:db8::10
@@ -255,6 +264,41 @@ grep -q 'Removed 2 MFA-managed iptables/ip6tables rule(s); chains verified clear
 [ "$(mfa_rules)" -eq 0 ] || fail "rules remain after MFAAdmin reset"
 echo "MFAAdmin reset -> all grants removed"
 
+# --- IptablesChain: grants in a chain of the operator's; readers find grants in any chain -------
+grant 203.0.113.12                       # made before the switch, so it stays in INPUT
+for t in iptables ip6tables; do $t -N MFA; $t -I INPUT 1 -j MFA; done
+set_chain() {   # $1 = chain, or empty to remove the setting; then restart MFAService
+    python3 - "$1" <<'PY'
+import json, sys
+path = "/opt/mfa-service/appsettings.json"
+cfg = json.load(open(path))
+cfg["BouncerConfig"].pop("IptablesChain", None)
+if sys.argv[1]: cfg["BouncerConfig"]["IptablesChain"] = sys.argv[1]
+json.dump(cfg, open(path, "w"), indent=2)
+PY
+    systemctl restart mfa-service; sleep 8
+}
+set_chain MFA
+[ "$(systemctl is-active mfa-service)" = active ] || fail "mfa-service did not restart with IptablesChain set"
+grep -q "New grants go into the 'MFA' chain" /var/log/mfa-auth/mfaservice_$today.log || fail "MFAService did not log the configured chain"
+! grep -qE "does not jump to 'MFA'|chain 'MFA' does not exist|reachable from" /var/log/mfa-auth/mfaservice_$today.log \
+    || fail "MFAService reported the MFA chain as missing or unlinked"
+CHAIN=MFA
+grant 203.0.113.13
+grant 2001:db8::13
+[ "$(grep -c MFA_Temp_ <<< "$(iptables -S INPUT; ip6tables -S INPUT)")" -eq 1 ] || fail "a grant made with IptablesChain set went into INPUT"
+# Back to INPUT without a reset first: the grants in MFA are still found, listed and removed.
+set_chain ""
+[ "$(systemctl is-active mfa-service)" = active ] || fail "mfa-service did not restart without IptablesChain"
+diag_out=$(/opt/mfa-admin/MFAAdmin diag 2>&1) || fail "MFAAdmin diag (chain) exited with status $?: $diag_out"
+[ "$(grep -c "$USER_EMAIL" <<< "$diag_out")" -eq 3 ] || fail "MFAAdmin diag did not list the grants in MFA and INPUT: $diag_out"
+reset_out=$(echo Y | /opt/mfa-admin/MFAAdmin reset 2>&1) || fail "MFAAdmin reset (chain) exited with status $?: $reset_out"
+grep -q 'Removed 3 MFA-managed iptables/ip6tables rule(s); chains verified clear' <<< "$reset_out" \
+    || fail "MFAAdmin reset did not clear the grants in MFA and INPUT: $reset_out"
+[ "$(mfa_rules)" -eq 0 ] || fail "rules remain after MFAAdmin reset (chain)"
+for t in iptables ip6tables; do $t -D INPUT -j MFA; $t -X MFA; done
+echo "IptablesChain=MFA -> grants in MFA; with the setting removed again, diag listed both chains and reset cleared them"
+
 for u in mfa-service mfa-web; do
     [ "$(systemctl is-active $u)" = active ] || fail "$u stopped during the test"
 done
@@ -276,4 +320,4 @@ grep -q 'forged' /var/log/mfa-auth/untrusted-*-mfaadmin_$today.log || fail "the 
 [ "$(stat -c %a /var/log/mfa-auth)" = 3770 ] || fail "MFAAdmin did not restore the log directory's sticky bit (mode $(stat -c %a /var/log/mfa-auth))"
 echo "planted log entries -> set aside and reported; fresh root-owned logs; MFAService kept logging in a non-sticky directory; MFAAdmin restored the sticky bit"
 systemctl stop mfa-web mfa-service
-echo "MFAService and MFAWeb ran under the documented systemd units; provisioning, IPC, grants, diag, delete and reset all worked."
+echo "MFAService and MFAWeb ran under the documented systemd units; provisioning, IPC, grants, diag, delete and reset all worked, in INPUT and in a configured chain."

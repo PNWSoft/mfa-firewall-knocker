@@ -233,19 +233,9 @@ internal static class ServiceLogger
         if (path == _dailyRequested && _dailyWriter != null) return _dailyWriter;
         _dailyWriter?.Dispose();
         _dailyWriter = null;
-        var (actual, note) = PrivilegedLogFile.Prepare(path);
-        // Checked just now and ours; in the sticky directory nobody else can replace it before this
-        // open. Shared for reading and writing -- anything else appending to the day's file seeks to
-        // the end first -- and for deletion (retention).
-        FileStream stream;
-        try { stream = new FileStream(actual, FileMode.Append, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete); }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-        {
-            // Held open by something else with no sharing, for instance. Do not stop logging.
-            string fallback = PrivilegedLogFile.CreateUnique(path);
-            note = (note == null ? "" : note + "; ") + $"could not open {Path.GetFileName(actual)} ({ex.Message}); writing to {Path.GetFileName(fallback)} instead";
-            stream = new FileStream(fallback, FileMode.Append, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete);
-        }
+        // Checked, opened without following a link, and checked again through the handle; see
+        // Shared/PrivilegedLogFile.cs. Falls back to a uniquely named file rather than stop logging.
+        var (stream, _, note) = PrivilegedLogFile.Open(path);
         var writer = new StreamWriter(stream, new UTF8Encoding(false)) { AutoFlush = true };
         if (note != null)
         {
@@ -278,7 +268,12 @@ internal static class ServiceLogger
                 if (DateTime.TryParseExact(datePart, "yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture,
                         System.Globalization.DateTimeStyles.None, out var day)
                     && day < today.AddDays(-LogRetentionDays))
-                    File.Delete(file);
+                {
+                    // Each on its own: one the web account holds open (Windows) must not stop the rest.
+                    try { File.Delete(file); }
+                    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                    { Console.WriteLine($"[LOG ERROR] Could not remove expired log file {Path.GetFileName(file)}: {ex.Message}"); }
+                }
             }
         }
         catch (Exception ex)
@@ -313,6 +308,7 @@ public class FirewallWorkerService : BackgroundService
 {
     private readonly IConfiguration _config;
     private readonly string _rulePrefix;
+    private readonly string _chain;
     private readonly IFirewallCommands _commands;
     private readonly object _firewallLock = new();
 
@@ -340,7 +336,50 @@ public class FirewallWorkerService : BackgroundService
     {
         _config = config;
         _rulePrefix = ValidateRulePrefix(config["BouncerConfig:RulePrefix"] ?? "MFA_Temp_");
+        _chain = ValidateChain(config["BouncerConfig:IptablesChain"]);
         _commands = commands;
+    }
+
+    // BouncerConfig:IptablesChain (Linux): the iptables/ip6tables chain new grants are written to.
+    // Absent or empty means INPUT. Another chain must already exist in both tables, with a jump
+    // to it from INPUT ahead of the host's blocking rules; MFAService never creates or links it.
+    // Grants are read back from every chain (LinuxIptables.ListAllArguments), so this setting
+    // only decides where new ones go. Refusing to start on an invalid name matches RulePrefix:
+    // the value reaches iptables.
+    internal static string ValidateChain(string? configured)
+    {
+        string? chain = LinuxIptables.ValidateChain(configured);
+        if (chain != null) return chain;
+        string message = "[CONFIG] BouncerConfig:IptablesChain must be an iptables chain name: letters, digits, '_' and '-', " +
+                         "not starting with '-', 28 characters at most, and not FORWARD or OUTPUT. Refusing to start.";
+        ServiceLogger.Error(message);
+        throw new InvalidOperationException(message);
+    }
+
+    // Linux, at startup: report a configured chain that is missing, reachable from FORWARD or
+    // OUTPUT (every grant then fails; see LinuxIptables.ChainProblem, checked again per grant), or
+    // not reachable from INPUT (grants are written but open nothing). Reported, not fatal: a
+    // firewall restore may still be running, and the sweeper must keep expiring grants either way.
+    internal void CheckLinuxChain()
+    {
+        if (_chain == LinuxIptables.DefaultChain) return;
+        ServiceLogger.Log($"[CONFIG] New grants go into the '{_chain}' chain (BouncerConfig:IptablesChain).");
+        foreach (string table in LinuxIptables.Tables)
+        {
+            string listing;
+            try { listing = _commands.Iptables(table, LinuxIptables.ListAllArguments); }
+            catch (Exception ex)
+            {
+                ServiceLogger.Error($"[CONFIG] {table}: could not list the rules to check chain '{_chain}': {ex.Message}");
+                continue;
+            }
+            string? problem = LinuxIptables.ChainProblem(listing, _chain);
+            if (problem != null)
+                ServiceLogger.Error($"[CONFIG] {table}: {problem}. Grants will fail until this is fixed.");
+            else if (!LinuxIptables.ReachableFromInput(listing, _chain))
+                ServiceLogger.Warn($"[CONFIG] {table}: INPUT does not jump to '{_chain}', directly or through another chain. " +
+                                   "Grants written there open nothing.");
+        }
     }
 
     // RulePrefix is validated rather than escaped. It reaches single-quoted PowerShell, the
@@ -366,6 +405,11 @@ public class FirewallWorkerService : BackgroundService
         ServiceLogger.Log("[WORKER] Firewall Worker Service starting...");
         try
         {
+            if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                CheckLinuxChain();
+            else if (_chain != LinuxIptables.DefaultChain)
+                ServiceLogger.Warn("[CONFIG] BouncerConfig:IptablesChain applies on Linux only; ignored on Windows.");
+
             var ipc     = RunIpcServerAsync(stoppingToken);
             var sweeper = RunSweeperAsync(stoppingToken);
 
@@ -446,6 +490,14 @@ public class FirewallWorkerService : BackgroundService
                 new NTAccount(gmsaName),
                 PipeAccessRights.ReadWrite,
                 AccessControlType.Allow));
+
+            // Local clients only. A named pipe is also reachable over SMB, where the gMSA's allow
+            // rule above would match a network logon of the same account; MFAWeb always connects
+            // locally, so refuse every network logon outright. Deny rules sort ahead of allow rules.
+            security.AddAccessRule(new PipeAccessRule(
+                new SecurityIdentifier(WellKnownSidType.NetworkSid, null),
+                PipeAccessRights.FullControl,
+                AccessControlType.Deny));
 
             return security;
         }
@@ -661,44 +713,7 @@ public class FirewallWorkerService : BackgroundService
     private bool SendIpcAlert(string subject, string body) => SendAlert("IPC", subject, body);
 
     private bool SendAlert(string monitor, string subject, string body)
-    {
-        var host   = _config["Smtp:Host"];
-        var from   = _config["Smtp:FromAddress"];
-        var notify = _config["Smtp:NotifyAddress"];
-        if (string.IsNullOrWhiteSpace(host) || string.IsNullOrWhiteSpace(from) || string.IsNullOrWhiteSpace(notify))
-        {
-            ServiceLogger.Warn($"[{monitor}] Smtp Host/FromAddress/NotifyAddress not fully configured - cannot send alert.");
-            return false;
-        }
-
-        int  port   = int.TryParse(_config["Smtp:Port"], out var p) ? p : 25;
-        var  user   = _config["Smtp:Username"];
-        var  pass   = _config["Smtp:Password"];
-
-        try
-        {
-            bool useSsl = SmtpTransportPolicy.GetUseSsl(_config, host);
-            using var msg = new MailMessage(from, notify)
-            {
-                Subject = subject,
-                Body    = body + $"\n\n-- MFAService {monitor} monitor"
-            };
-            // SmtpClient.Send is synchronous and defaults to a 100s timeout. This runs from the
-            // startup path, where an unreachable relay is common, so cap it well below that.
-            using var client = new SmtpClient(host, port) { EnableSsl = useSsl, Timeout = 10000 };
-            if (!string.IsNullOrWhiteSpace(user) && !string.IsNullOrWhiteSpace(pass))
-                client.Credentials = new System.Net.NetworkCredential(user, pass);
-
-            client.Send(msg);
-            ServiceLogger.Log($"[{monitor}] Alert email sent to {notify}: {subject}");
-            return true;
-        }
-        catch (Exception ex)
-        {
-            ServiceLogger.Error($"[{monitor}] Failed to send alert email: {ex.Message}");
-            return false;
-        }
-    }
+        => ServiceMail.SendToAdmin(_config, monitor, subject, body + $"\n\n-- MFAService {monitor} monitor");
 
     [SupportedOSPlatform("linux")]
     private async Task RunUnixSocketServerAsync(CancellationToken stoppingToken)
@@ -1417,14 +1432,20 @@ public class FirewallWorkerService : BackgroundService
             // (A different host address in the same widened /64 gets its own ruleName and its
             // own overlapping rule rather than being deduplicated against this one -- simpler and
             // still correct, since the sweeper expires each independently regardless of overlap.)
-            string existing = _commands.Iptables(table, "-S", "INPUT");
+            // The whole table is read, so a rule for this name in another chain (written before
+            // IptablesChain changed) is replaced too. The same listing is used to refuse a chain
+            // that has gone missing or become reachable from FORWARD or OUTPUT since startup.
+            string existing = _commands.Iptables(table, LinuxIptables.ListAllArguments);
+            string? chainProblem = LinuxIptables.ChainProblem(existing, _chain);
+            if (chainProblem != null)
+                throw new InvalidOperationException($"{table}: {chainProblem} (BouncerConfig:IptablesChain).");
             foreach (string line in existing.Split('\n', StringSplitOptions.RemoveEmptyEntries))
             {
                 if (TryGetManagedRule(line, out var name, out _) && name == ruleName)
                     DeleteLinuxRule(table, line);
             }
 
-            _commands.Iptables(table, "-I", "INPUT", "-p", proto, "--dport", port.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            _commands.Iptables(table, "-I", _chain, "-p", proto, "--dport", port.ToString(System.Globalization.CultureInfo.InvariantCulture),
                                "-s", sourceSpec, "-j", "ACCEPT", "-m", "comment", "--comment", comment);
             ServiceLogger.Debug($"[FIREWALL] {table} rule inserted in {fw.ElapsedMilliseconds}ms. Verifying...");
 
@@ -1434,10 +1455,11 @@ public class FirewallWorkerService : BackgroundService
             // comment therefore never matches a rule that exists, which reported every
             // successful Linux grant as [FAILED] while the rule was in fact present and working.
             // Scanning also matches how the upsert above and SweepExpiredRules locate rules.
-            string after = _commands.Iptables(table, "-S", "INPUT");
+            string after = _commands.Iptables(table, LinuxIptables.ListAllArguments);
             bool verified = after
                 .Split('\n', StringSplitOptions.RemoveEmptyEntries)
-                .Any(l => TryGetManagedRule(l, out var name, out var expiry) && name == ruleName && expiry == expEpoch);
+                .Any(l => l.StartsWith($"-A {_chain} ", StringComparison.Ordinal)
+                          && TryGetManagedRule(l, out var name, out var expiry) && name == ruleName && expiry == expEpoch);
 
             if (verified)
                 ServiceLogger.Log($"[SUCCESS] {table} rule verified: {protocol}/{port} OPEN for {sourceSpec}.");
@@ -1654,11 +1676,11 @@ public class FirewallWorkerService : BackgroundService
         }
         else
         {
-            // Linux: parse both 'iptables -S INPUT' (IPv4) and 'ip6tables -S INPUT' (IPv6) and
-            // delete any of our rules whose stored expiry epoch has passed. Grants can land in
-            // either table depending on the client's address family, so both must be swept every
-            // pass, and a failure in one must not skip the other. Update these commands if your
-            // distro uses nftables, ufw, or firewalld instead.
+            // Linux: parse 'iptables -S' (IPv4) and 'ip6tables -S' (IPv6), every chain, and delete
+            // any of our rules whose stored expiry epoch has passed, from the chain it is in.
+            // Grants can land in either table depending on the client's address family, so both
+            // must be swept every pass, and a failure in one must not skip the other. Update these
+            // commands if your distro uses nftables, ufw, or firewalld instead.
             long nowEpoch = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
             // iptables quotes a comment only when it has a space, so match both forms.
             string prefixComment = $"--comment \"{_rulePrefix}", prefixCommentBare = $"--comment {_rulePrefix}";
@@ -1666,14 +1688,14 @@ public class FirewallWorkerService : BackgroundService
             foreach (string table in LinuxIptables.Tables)
             {
                 string rules;
-                try { rules = _commands.Iptables(table, "-S", "INPUT"); }
+                try { rules = _commands.Iptables(table, LinuxIptables.ListAllArguments); }
                 catch (Exception ex) { problems.Add($"could not list {table} rules: {ex.Message}"); continue; }
 
                 foreach (string line in rules.Split('\n', StringSplitOptions.RemoveEmptyEntries))
                 {
                     if (!TryGetManagedRule(line, out var name, out var expiry))
                     {
-                        if (line.TrimStart().StartsWith("-A INPUT ", StringComparison.Ordinal) && (line.Contains(prefixComment, StringComparison.Ordinal) || line.Contains(prefixCommentBare, StringComparison.Ordinal)))
+                        if (line.TrimStart().StartsWith("-A ", StringComparison.Ordinal) && (line.Contains(prefixComment, StringComparison.Ordinal) || line.Contains(prefixCommentBare, StringComparison.Ordinal)))
                             problems.Add($"{table} rule has the prefix but no readable expiry, so it is never removed: {line.Trim()}");
                         continue;
                     }
@@ -1719,7 +1741,7 @@ public class FirewallWorkerService : BackgroundService
     {
         string rule = line.Trim();
         _commands.Iptables(table, LinuxIptables.DeleteArguments(rule));
-        string remaining = _commands.Iptables(table, "-S", "INPUT");
+        string remaining = _commands.Iptables(table, LinuxIptables.ListAllArguments);
         if (remaining.Split('\n', StringSplitOptions.RemoveEmptyEntries).Any(l => l.Trim() == rule))
             throw new InvalidOperationException($"{table} rule remains after deletion.");
     }
@@ -1731,6 +1753,81 @@ public class FirewallWorkerService : BackgroundService
 // NTFS ACLs). SaveUsers() clears and immediately restores ReadOnly around
 // every write, so no periodic sweep is needed.
 // -----------------------------------------------------------------------
+// Mail from MFAService: alerts to Smtp:NotifyAddress, and the passkey-registration notice.
+// System.Net.Mail (BCL), so MFAService takes no mail-library dependency. SmtpTransportPolicy is
+// checked on every send.
+internal static class ServiceMail
+{
+    internal static bool SendToAdmin(IConfiguration config, string tag, string subject, string body)
+    {
+        var notify = config["Smtp:NotifyAddress"];
+        if (string.IsNullOrWhiteSpace(notify))
+        {
+            ServiceLogger.Warn($"[{tag}] Smtp:NotifyAddress is not configured - cannot send alert.");
+            return false;
+        }
+        return Send(config, tag, notify, subject, body);
+    }
+
+    internal static bool Send(IConfiguration config, string tag, string to, string subject, string body)
+    {
+        var host = config["Smtp:Host"];
+        var from = config["Smtp:FromAddress"];
+        if (string.IsNullOrWhiteSpace(host) || string.IsNullOrWhiteSpace(from))
+        {
+            ServiceLogger.Warn($"[{tag}] Smtp Host/FromAddress not fully configured - cannot send email.");
+            return false;
+        }
+
+        var user = config["Smtp:Username"];
+        var pass = config["Smtp:Password"];
+        try
+        {
+            int port = SmtpTransportPolicy.GetPort(config);
+            bool useSsl = SmtpTransportPolicy.GetUseSsl(config, host);
+            using var msg = new MailMessage(from, to) { Subject = subject, Body = body };
+            // SmtpClient.Send is synchronous and defaults to a 100s timeout. Alerts are sent from
+            // the startup path and from check cycles, where an unreachable relay is common.
+            using var client = new SmtpClient(host, port) { EnableSsl = useSsl, Timeout = 10000 };
+            if (!string.IsNullOrWhiteSpace(user) && !string.IsNullOrWhiteSpace(pass))
+                client.Credentials = new System.Net.NetworkCredential(user, pass);
+            client.Send(msg);
+            ServiceLogger.Log($"[{tag}] Email sent to {to}: {subject}");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            ServiceLogger.Error($"[{tag}] Failed to send email to {to}: {ex.Message}");
+            return false;
+        }
+    }
+
+    // Sent when a passkey is registered: to the account's own address and to
+    // Smtp:NotifyAddress. A registration the user did not make (a leaked provisioning email, or
+    // MFAWeb misused) is otherwise visible only in the logs. Sent in the background, so a slow
+    // relay does not delay the registration reply.
+    internal static (string Subject, string UserBody, string AdminBody) PasskeyNotice(string siteName, string username, DateTime whenUtc)
+    {
+        string when = whenUtc.ToString("yyyy-MM-dd HH:mm 'UTC'", System.Globalization.CultureInfo.InvariantCulture);
+        return ($"[{siteName}] Passkey registered for {username}",
+                $"A passkey was registered for {username} at {when}. It can now be used to sign in to {siteName}.\n\n" +
+                "If you did not register it, contact your administrator now.",
+                $"A passkey was registered for {username} at {when}.\n\n-- MFAService");
+    }
+
+    internal static void QueuePasskeyNotice(IConfiguration? config, string username, DateTime whenUtc)
+    {
+        if (config == null) return;
+        var (subject, userBody, adminBody) = PasskeyNotice(config["SiteName"] ?? "MFA Auth", username, whenUtc);
+        _ = Task.Run(() =>
+        {
+            Send(config, "PASSKEY", username, subject, userBody);
+            if (!string.IsNullOrWhiteSpace(config["Smtp:NotifyAddress"]))
+                SendToAdmin(config, "PASSKEY", subject, adminBody);
+        });
+    }
+}
+
 public class DatabaseLockService : BackgroundService
 {
     private static readonly string DbPath = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
@@ -1743,10 +1840,14 @@ public class DatabaseLockService : BackgroundService
     // their writes: a lock file beside the database on both platforms (Shared/DbFileLock.cs,
     // which also says why it is no longer a named mutex). MFAWeb never writes the store and does
     // not take it.
+    // For the passkey-registration notice (ServiceMail.QueuePasskeyNotice); the DB handlers are static.
+    private static IConfiguration? _config;
+
     public DatabaseLockService(IConfiguration config)
     {
         // Required and validated on Windows only; see Shared/DpapiEntropy.cs.
         Entropy = DpapiEntropy.Load(config);
+        _config = config;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -1953,7 +2054,8 @@ public class DatabaseLockService : BackgroundService
     // -----------------------------------------------------------------------
     // DB IPC COMMAND DISPATCHER
     // Called by FirewallWorkerService when a request starts with "DB:"
-    // Commands: BURN_TOTP_TOKEN | CONSUME_TOTP | SET_PASSKEY_TOKEN | UPDATE_SIGN_COUNT | ADD_PASSKEY
+    // Commands: RENEW_PASSKEY_TOKEN | UPDATE_SIGN_COUNT | ADD_PASSKEY, and in the TOTP build only
+    // BURN_TOTP_TOKEN | CONSUME_TOTP | SET_PASSKEY_TOKEN
     // -----------------------------------------------------------------------
     internal static string ProcessDbRequest(string command)
     {
@@ -1974,7 +2076,7 @@ public class DatabaseLockService : BackgroundService
                 // does not have one yet.
                 "SET_PASSKEY_TOKEN"   when parts.Length == 4 => SetPasskeyToken(parts[1].Trim(), parts[2].Trim(), parts[3].Trim()),
 #endif
-                "RENEW_PASSKEY_TOKEN" when parts.Length == 2 => RenewPasskeyToken(parts[1].Trim()),
+                "RENEW_PASSKEY_TOKEN" when parts.Length == 3 => RenewPasskeyToken(parts[1].Trim(), parts[2].Trim()),
                 "UPDATE_SIGN_COUNT"   when parts.Length == 3 => UpdateSignCount(parts[1].Trim(), parts[2].Trim()),
                 "ADD_PASSKEY"         when parts.Length == 5 => AddPasskey(parts[1].Trim(), parts[2].Trim(), parts[3].Trim(), parts[4].Trim()),
                 _ => "ERROR: Unknown DB command"
@@ -2022,10 +2124,18 @@ public class DatabaseLockService : BackgroundService
 #endif  // ALLOW_TOTP
 
     // Atomically burns the old passkey provisioning token (e.g. from the email link) and
-    // issues a fresh short-lived one.  Called immediately after password verification so the
-    // email link becomes worthless, and only the in-page token can complete registration.
-    private static string RenewPasskeyToken(string oldToken)
+    // issues a fresh short-lived, registration-ready one, so the email link becomes worthless
+    // and only the in-page token can complete registration.
+    //
+    // The enrolment password is checked here, against the stored hash, not only in MFAWeb. This
+    // is what sets PasskeyRegistrationReady, so trusting MFAWeb's check let code running as the
+    // web account enrol its own passkey on any account that had a live provisioning token and no
+    // passkey yet. The password arrives base64-encoded (UTF-8), since it may contain '|'.
+    private static string RenewPasskeyToken(string oldToken, string passwordBase64)
     {
+        string? password = DecodeEnrolmentPassword(passwordBase64);
+        if (password == null) return "ERROR: Invalid password";
+
         using var lk = AcquireDbLock();
         if (lk == null) return "ERROR: DB lock timeout";
 
@@ -2035,15 +2145,44 @@ public class DatabaseLockService : BackgroundService
             return "ERROR: Token not found or expired";
         if (user.PasskeyCredentials.Count > 0)
             return "ERROR: User already has passkeys";
+        if (!EnrolmentPasswordMatches(user, password))
+        {
+            ServiceLogger.Warn($"[SECURITY] Rejected passkey token renewal for '{user.Username}': password does not match");
+            return "ERROR: Invalid password";
+        }
 
         string newToken = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32))
             .Replace('+', '-').Replace('/', '_').TrimEnd('=');
         user.PasskeyProvisioningToken      = newToken;
         user.PasskeyProvisioningExpiresUtc = DateTime.UtcNow.AddMinutes(5);
-        user.PasskeyRegistrationReady      = true;   // password was just verified upstream
+        user.PasskeyRegistrationReady      = true;   // password verified above
         SaveUsers(users);
         ServiceLogger.Log($"[DB] Passkey provisioning token renewed for '{user.Username}' (old token invalidated)");
         return newToken;
+    }
+
+    // MFAWeb refuses longer passwords before asking (see IpcFirewallClient.MaxEnrolmentPasswordBytes),
+    // and the whole request is capped at 1024 bytes anyway.
+    internal const int MaxEnrolmentPasswordBytes = 256;
+
+    // Null for anything that is not base64 of 1-256 bytes of valid UTF-8.
+    internal static string? DecodeEnrolmentPassword(string passwordBase64)
+    {
+        byte[] bytes;
+        try { bytes = Convert.FromBase64String(passwordBase64); }
+        catch (FormatException) { return null; }
+        if (bytes.Length == 0 || bytes.Length > MaxEnrolmentPasswordBytes) return null;
+        try { return new UTF8Encoding(false, true).GetString(bytes); }
+        catch (DecoderFallbackException) { return null; }
+    }
+
+    // BCrypt.Verify throws rather than returning false on an empty or malformed hash, and the hash
+    // is cleared once a passkey is registered.
+    internal static bool EnrolmentPasswordMatches(UserEntry user, string password)
+    {
+        if (string.IsNullOrEmpty(user.PasswordHash)) return false;
+        try { return BCrypt.Net.BCrypt.Verify(password, user.PasswordHash); }
+        catch (Exception ex) when (ex is BCrypt.Net.SaltParseException or ArgumentException) { return false; }
     }
 
 #if ALLOW_TOTP
@@ -2179,6 +2318,7 @@ public class DatabaseLockService : BackgroundService
         if (!user.TotpConfirmed) user.PasswordHash = "";
         SaveUsers(users);
         ServiceLogger.Log($"[DB] Passkey credential registered for '{user.Username}'");
+        ServiceMail.QueuePasskeyNotice(_config, user.Username, DateTime.UtcNow);
         return "SUCCESS";
     }
 
@@ -2241,10 +2381,9 @@ internal static class TotpReplayProtection
 
 // -----------------------------------------------------------------------
 // CERTIFICATE MONITOR SERVICE
-// Watches the Windows cert store for the site's TLS certificate and emails
-// the admins before it expires. Lives here (not in MFAWeb) so the alert still
-// fires in the exact failure mode we care about: when no usable cert exists and
-// MFAWeb can't serve HTTPS. Windows-only; a no-op elsewhere.
+// Watches the site's TLS certificate -- the Windows store, or HttpsCert:PemPath on Linux -- and
+// emails the admins before it expires. Lives here (not in MFAWeb) so the alert still fires in
+// the exact failure mode we care about: when no usable cert exists and MFAWeb can't serve HTTPS.
 // -----------------------------------------------------------------------
 public class CertificateMonitorService : BackgroundService
 {
@@ -2418,14 +2557,28 @@ public class CertificateMonitorService : BackgroundService
         using var store = new X509Store(_storeName, _storeLocation);
         store.Open(OpenFlags.OpenExistingOnly | OpenFlags.ReadOnly);
 
-        X509Certificate2? best = null;
+        var matching = new List<X509Certificate2>();
         foreach (var cert in store.Certificates)
         {
             bool matches;
             try { matches = cert.MatchesHostname(_hostname); }
             catch { matches = false; }
-            if (matches && (best is null || cert.NotAfter > best.NotAfter))
-                best = cert;
+            if (matches) matching.Add(cert);
+        }
+        // First MFAWeb's own choice (SelectBestCertificate: private key, valid now, trusted chain
+        // preferred; Shared/CertTrust.cs), so this watches the certificate actually served. Only
+        // when MFAWeb would find none is the same preference applied ignoring validity dates, so
+        // an expired certificate is reported as expired; and with no private key on any of them,
+        // all matching certificates are considered, so the alert still names one.
+        var now = DateTime.Now;
+        var (best, _) = CertTrust.PickPreferred(
+            matching.Where(c => c.HasPrivateKey && c.NotBefore <= now && c.NotAfter >= now),
+            c => CertTrust.ChainsToTrustedRoot(c));
+        if (best is null)
+        {
+            var withKey = matching.Where(c => c.HasPrivateKey).ToList();
+            (best, _) = CertTrust.PickPreferred(withKey.Count > 0 ? withKey : matching,
+                                                c => CertTrust.ChainsToTrustedRoot(c, ignoreTime: true));
         }
         return best is null ? (false, default, "") : (true, best.NotAfter, best.Thumbprint);
     }
@@ -2439,41 +2592,7 @@ public class CertificateMonitorService : BackgroundService
 
     private bool SendEmail(string subject, string body)
     {
-        var host   = _config["Smtp:Host"];
-        var from   = _config["Smtp:FromAddress"];
-        var notify = _config["Smtp:NotifyAddress"];
-        if (string.IsNullOrWhiteSpace(host) || string.IsNullOrWhiteSpace(from) || string.IsNullOrWhiteSpace(notify))
-        {
-            ServiceLogger.Warn("[CERT] Smtp Host/FromAddress/NotifyAddress not fully configured - cannot send certificate alert.");
-            return false;
-        }
-
-        int  port   = int.TryParse(_config["Smtp:Port"], out var p) ? p : 25;
-        var  user   = _config["Smtp:Username"];
-        var  pass   = _config["Smtp:Password"];
-
-        try
-        {
-            bool useSsl = SmtpTransportPolicy.GetUseSsl(_config, host);
-            using var msg = new MailMessage(from, notify)
-            {
-                Subject = subject,
-                Body    = body + "\n\n-- MFAService certificate monitor"
-            };
-            // Bounded like the IPC alert path: a hung relay must not stall a check cycle.
-            using var client = new SmtpClient(host, port) { EnableSsl = useSsl, Timeout = 10000 };
-            if (!string.IsNullOrWhiteSpace(user) && !string.IsNullOrWhiteSpace(pass))
-                client.Credentials = new System.Net.NetworkCredential(user, pass);
-
-            client.Send(msg);
-            ServiceLogger.Log($"[CERT] Alert email sent to {notify}: {subject}");
-            return true;
-        }
-        catch (Exception ex)
-        {
-            ServiceLogger.Error($"[CERT] Failed to send alert email: {ex.Message}");
-            return false;
-        }
+        return ServiceMail.SendToAdmin(_config, "CERT", subject, body + "\n\n-- MFAService certificate monitor");
     }
 }
 

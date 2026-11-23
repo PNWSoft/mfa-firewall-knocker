@@ -288,7 +288,9 @@ else
 
     // Cache the selected cert and refresh at most once a minute, so an expiring
     // cert is swapped for a freshly-issued replacement without a restart.
-    X509Certificate2? cachedCert = SelectBestCertificate(certSubject, certStoreName, certStoreLocation);
+    // What was last logged about the selection, so the once-a-minute refresh logs only changes.
+    string? lastSelectionLog = null;
+    X509Certificate2? cachedCert = SelectBestCertificate(certSubject, certStoreName, certStoreLocation, ref lastSelectionLog);
     DateTime cacheExpiry = DateTime.Now.AddMinutes(1);
     object certLock = new();
     if (cachedCert is null)
@@ -307,7 +309,7 @@ else
                 || DateTime.Now < cachedCert.NotBefore;
             if (stale)
             {
-                var picked = SelectBestCertificate(certSubject, certStoreName, certStoreLocation);
+                var picked = SelectBestCertificate(certSubject, certStoreName, certStoreLocation, ref lastSelectionLog);
                 if (picked is not null) cachedCert = picked; // keep last good cert if the store momentarily has none
                 cacheExpiry = DateTime.Now.AddMinutes(1);
                 CertStatus.Update(cachedCert, certWarnDays);
@@ -325,27 +327,34 @@ else
     });
 }
 
-// Selects the newest, currently-valid certificate with a private key that is
-// valid for the requested hostname. Matches against the Subject CN *and* the
-// Subject Alternative Name entries — Let's Encrypt certs often carry the host
-// only in the SAN with an empty Subject, so a CN-only lookup misses them.
-// Returns null if none qualifies.
-static X509Certificate2? SelectBestCertificate(string hostname, StoreName storeName, StoreLocation storeLocation)
+// Selects a currently-valid certificate with a private key that is valid for the requested
+// hostname: the newest one whose chain builds to a trusted root, or else the newest one with a
+// warning (see Shared/CertTrust.cs). Matches against the Subject CN *and* the Subject Alternative
+// Name entries — Let's Encrypt certs often carry the host only in the SAN with an empty Subject,
+// so a CN-only lookup misses them. Returns null if none qualifies.
+static X509Certificate2? SelectBestCertificate(string hostname, StoreName storeName, StoreLocation storeLocation, ref string? lastLogged)
 {
     try
     {
         using var store = new X509Store(storeName, storeLocation);
         store.Open(OpenFlags.OpenExistingOnly | OpenFlags.ReadOnly);
         var now = DateTime.Now;
-        var match = store.Certificates
+        var candidates = store.Certificates
             .OfType<X509Certificate2>()
             .Where(c => c.HasPrivateKey
                 && c.NotBefore <= now && c.NotAfter >= now
-                && c.MatchesHostname(hostname))
-            .OrderByDescending(c => c.NotAfter)
-            .FirstOrDefault();
+                && c.MatchesHostname(hostname));
+        var (match, trusted) = CertTrust.PickPreferred(candidates, CertTrust.ChainsToTrustedRootCached);
+        // Logged when the choice or its trust changes, not on every refresh.
+        string state = match is null ? "none" : $"{match.Thumbprint}|{trusted}";
+        if (state == lastLogged) return match;
+        lastLogged = state;
         if (match is not null)
             AuditLogger.Log($"TLS certificate selected for '{hostname}': subject '{match.Subject}', thumbprint {match.Thumbprint}, expires {match.NotAfter:u}");
+        if (match is not null && !trusted)
+            AuditLogger.Warn($"TLS certificate {match.Thumbprint} for '{hostname}' does not chain to a root this server trusts " +
+                             "for server authentication, and no matching certificate does. Using it anyway; browsers will " +
+                             "accept it only if they trust its issuer.");
         return match;
     }
     catch (Exception ex)
@@ -550,7 +559,9 @@ app.MapPost("/auth", async (HttpContext context, IAntiforgery antiforgery, IConf
     }
 
     string username = mailAddress.Address;
-    AuditLogger.Log($"Login attempt from {ProbeLog.DisplayEmail(username)}");
+    // Debug only: this runs for every attempt before any check, so at Info it would be an
+    // attacker-driven log line outside ProbeLog's cap.
+    AuditLogger.Debug($"Login attempt from {ProbeLog.DisplayEmail(username)}");
 
     // 2. Get Client IP Address — TCP connection only, no proxy headers (by design)
     string clientIp = context.Connection.RemoteIpAddress?.ToString() ?? "";
@@ -599,7 +610,10 @@ app.MapPost("/auth", async (HttpContext context, IAntiforgery antiforgery, IConf
     if (!credentialsValid)
     {
         if (monitorTotpFailure) LoginFailureMonitor.RecordFailure(username, clientIp);
-        AuditLogger.Warn("Failed - Invalid credentials or expired code");
+        // Through ProbeLog (capped per source and overall), like the passkey flow's failures.
+        // The per-account threshold above is still recorded and alerted on, uncapped.
+        RecordProbe(context, $"TOTP sign-in failed for {ProbeLog.DisplayEmail(username)}: invalid credentials or expired code",
+                    monitorTotpFailure ? username : null);
         await SendDenyResponse(context, "Invalid credentials or expired code.");
         return;
     }
@@ -931,7 +945,9 @@ app.MapPost("/setup-passkey", async (HttpContext context, IAntiforgery antiforge
             // together with PasskeyProvisioningToken, so a live token should mean a real hash.
             // Guarded anyway, same pattern as the other two password checks: BCrypt.Verify throws
             // rather than returning false on an empty hash.
-            pkBadPassword = string.IsNullOrEmpty(user.PasswordHash) || !BCrypt.Net.BCrypt.Verify(password, user.PasswordHash);
+            pkBadPassword = string.IsNullOrEmpty(user.PasswordHash)
+                || Encoding.UTF8.GetByteCount(password) > IpcFirewallClient.MaxEnrolmentPasswordBytes
+                || !BCrypt.Net.BCrypt.Verify(password, user.PasswordHash);
         }
     }
 
@@ -956,8 +972,9 @@ app.MapPost("/setup-passkey", async (HttpContext context, IAntiforgery antiforge
     // Burn the email-link token immediately and replace it with a fresh 5-minute token.
     // Once the legitimate user has verified their password, a copy of the emailed link no longer
     // registers anything. (The password travels in the same email, so this guards a leaked link,
-    // not a compromised mailbox; see INSTALL.md.)
-    string? registrationToken = await IpcFirewallClient.RenewPasskeyTokenAsync(token);
+    // not a compromised mailbox; see INSTALL.md.) MFAService checks the password again itself:
+    // it is the side that marks the token registration-ready.
+    string? registrationToken = await IpcFirewallClient.RenewPasskeyTokenAsync(token, password);
     if (registrationToken == null)
     {
         AuditLogger.Warn($"[IPC] Failed to renew passkey token for '{username}'");
@@ -1767,13 +1784,17 @@ public static class IpcFirewallClient
         => await SendDbCommandAsync(FormattableString.Invariant($"DB:CONSUME_TOTP|{username}|{timeStep}|{secretFingerprint}"));
 #endif
 
+    // Matches MFAService's limit; a longer password is refused here without asking it.
+    internal const int MaxEnrolmentPasswordBytes = 256;
+
     /// <summary>
-    /// Atomically replaces the old passkey provisioning token with a new short-lived one.
-    /// Returns the new token on success, or null on failure.
+    /// Atomically replaces the old passkey provisioning token with a new short-lived one, after
+    /// MFAService has checked the password. Returns the new token on success, or null on failure.
     /// </summary>
-    public static async Task<string?> RenewPasskeyTokenAsync(string oldToken)
+    public static async Task<string?> RenewPasskeyTokenAsync(string oldToken, string password)
     {
-        string request = $"DB:RENEW_PASSKEY_TOKEN|{oldToken}";
+        // Base64, since a password may contain '|' or a line break, which delimit the request.
+        string request = $"DB:RENEW_PASSKEY_TOKEN|{oldToken}|{Convert.ToBase64String(Encoding.UTF8.GetBytes(password))}";
         try
         {
             string? response = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
@@ -1823,7 +1844,11 @@ public static class IpcFirewallClient
     private static async Task<string?> SendViaPipeAsync(string request)
     {
         using var cts  = new CancellationTokenSource(TimeoutMs);
-        using var pipe = new NamedPipeClientStream(".", PipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
+        // Identification, not the default: without an explicit level Windows lets the server
+        // impersonate this account. MFAService never impersonates, and a process that took the
+        // pipe name would get no usable token from us (it is also refused below before we write).
+        using var pipe = new NamedPipeClientStream(".", PipeName, PipeDirection.InOut, PipeOptions.Asynchronous,
+                                                   TokenImpersonationLevel.Identification);
 
         AuditLogger.Debug($"[IPC] Connecting to pipe...");
         await pipe.ConnectAsync(TimeoutMs, cts.Token);
@@ -2115,10 +2140,10 @@ public static class LoginFailureMonitor
             AuditLogger.Warn("[SECURITY] AccountAlert:SendEmail is enabled but Smtp Host/FromAddress/NotifyAddress is not fully configured.");
             return;
         }
-        int  port   = int.TryParse(cfg["Smtp:Port"], out var p) ? p : 25;
         string? user = cfg["Smtp:Username"], pass = cfg["Smtp:Password"];
         try
         {
+            int  port   = SmtpTransportPolicy.GetPort(cfg);
             bool useSsl = SmtpTransportPolicy.GetUseSsl(cfg, host);
             using var msg = new MailMessage(from, notify)
             {

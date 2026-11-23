@@ -25,6 +25,16 @@ using Microsoft.Extensions.Configuration;
 // There is no switch to relax this; an operator without a local relay configures TLS.
 internal static class SmtpTransportPolicy
 {
+    // Smtp:Port: absent means 25; anything present must be a port number. A typo fails the send
+    // with a message naming the setting, instead of quietly sending to port 25.
+    internal static int GetPort(IConfiguration config)
+    {
+        string? v = config["Smtp:Port"];
+        if (string.IsNullOrWhiteSpace(v)) return 25;
+        if (int.TryParse(v, out var p) && p >= 1 && p <= 65535) return p;
+        throw new InvalidOperationException($"Smtp:Port value '{v}' is not a valid port (1-65535).");
+    }
+
     internal static bool GetUseSsl(IConfiguration config, string host)
     {
         string? configured = config["Smtp:UseSsl"];

@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Security.Cryptography.X509Certificates;
 using System.Text.RegularExpressions;
 using Microsoft.Extensions.Configuration;
 
@@ -355,8 +356,80 @@ Test("iptables runs without a shell, waits for the lock, and deletes the exact l
         "--dport", "22", "-m", "comment", "--comment", "MFA Temp_8.8.8.8_22_TCP user:a@example.com exp:9", "-j", "ACCEPT" }));
     // Exactly as iptables 1.8.10 prints a comment holding ' " and \ (captured from a real ruleset).
     Check(LinuxIptables.SplitRuleLine(@"-A INPUT -m comment --comment ""a\'b \""q\"" back\\slash"" -j ACCEPT")[5] == @"a'b ""q"" back\slash");
-    Throws<InvalidOperationException>(() => LinuxIptables.DeleteArguments("-A FORWARD -j ACCEPT"));
+    Throws<InvalidOperationException>(() => LinuxIptables.DeleteArguments("-N MFA"));
+    Throws<InvalidOperationException>(() => LinuxIptables.DeleteArguments("-A -F -j ACCEPT"));
     Throws<InvalidOperationException>(() => LinuxIptables.DeleteArguments("-A INPUT --comment \"unterminated"));
+    // A rule in another chain is deleted from that chain.
+    Check(LinuxIptables.DeleteArguments(line.Replace("-A INPUT ", "-A MFA "))[1] == "MFA");
+});
+Test("IptablesChain: absent means INPUT; other names are checked before they reach iptables", () =>
+{
+    Check(LinuxIptables.ValidateChain(null) == "INPUT" && LinuxIptables.ValidateChain("") == "INPUT");
+    Check(LinuxIptables.ValidateChain("MFA") == "MFA" && LinuxIptables.ValidateChain("INPUT") == "INPUT");
+    Check(LinuxIptables.ValidateChain("mfa_grants-1") == "mfa_grants-1" && LinuxIptables.ValidateChain(new string('A', 28)) != null);
+    foreach (string bad in new[] { "-F", "-j", "MFA X", "MFA;rm", "MFA\"", "FORWARD", "OUTPUT", "MFA\n", new string('A', 29) })
+        Check(LinuxIptables.ValidateChain(bad) == null);
+    Throws<InvalidOperationException>(() => new FirewallWorkerService(new ConfigurationBuilder().AddInMemoryCollection(
+        new[] { new KeyValuePair<string, string?>("BouncerConfig:IptablesChain", "-F") }).Build(), new FakeCommands()));
+
+    // The chain must exist, and must not be reachable from FORWARD or OUTPUT (DOCKER-USER, say).
+    const string Base = "-P INPUT DROP\n-P FORWARD DROP\n-P OUTPUT ACCEPT\n";
+    Check(LinuxIptables.ChainProblem(Base, "INPUT") == null);
+    Check(LinuxIptables.ChainProblem(Base, "MFA")!.Contains("does not exist"));
+    Check(LinuxIptables.ChainProblem(Base + "-N MFA\n-A INPUT -j MFA", "MFA") == null);
+    Check(LinuxIptables.ChainProblem(Base + "-N DOCKER-USER\n-N MFA\n-A FORWARD -j DOCKER-USER\n-A DOCKER-USER -j MFA", "MFA")!.Contains("reachable from FORWARD"));
+    Check(LinuxIptables.ChainProblem(Base + "-N MFA\n-A OUTPUT -g MFA", "MFA")!.Contains("reachable from OUTPUT"));
+    // Reaching it from INPUT through another chain counts; a comment mentioning it does not.
+    Check(LinuxIptables.ReachableFromInput(Base + "-N F\n-N MFA\n-A INPUT -j F\n-A F -j MFA", "MFA"));
+    Check(!LinuxIptables.ReachableFromInput(Base + "-N MFA\n-A INPUT -m comment --comment \"-j MFA\" -j ACCEPT", "MFA"));
+});
+Test("IptablesChain: new grants go into the chain; grants in any chain are replaced, expired and found", () =>
+{
+    var commands = new FakeCommands();
+    commands.Chains.Add("MFA");
+    commands.Chains.Add("OLD");
+    commands.Rules.Add("-A INPUT -j MFA");
+    // A grant from before the switch for the same address and port, and expired ones in INPUT
+    // and in a chain that is no longer configured.
+    commands.Rules.Add(Rule("MFA_Temp_8.8.8.8_22_TCP user:review@example.com", DateTimeOffset.UtcNow.AddMinutes(30).ToUnixTimeSeconds()));
+    commands.Rules.Add(Rule("MFA_Temp_9.9.9.9_22_TCP", 1).Replace("8.8.8.8/32", "9.9.9.9/32"));
+    commands.Rules.Add(Rule("MFA_Temp_6.6.6.6_22_TCP", 1).Replace("-A INPUT ", "-A OLD ").Replace("8.8.8.8/32", "6.6.6.6/32"));
+    var worker = WorkerWithChain(commands, "MFA");
+    Check(worker.ProcessFirewallRequest(Request) == "SUCCESS");
+    Check(commands.SeenScripts.Any(c => c.StartsWith("iptables -I MFA ")) && !commands.SeenScripts.Any(c => c.StartsWith("iptables -I INPUT")));
+    Check(commands.Rules.Count(r => r.Contains("MFA_Temp_8.8.8.8")) == 1 && commands.Rules.Single(r => r.Contains("MFA_Temp_8.8.8.8")).StartsWith("-A MFA "));
+
+    commands.Rules.Add(Rule("MFA_Temp_7.7.7.7_22_TCP", 1).Replace("-A INPUT ", "-A MFA ").Replace("8.8.8.8/32", "7.7.7.7/32"));
+    worker.SweepExpiredRules();
+    Check(commands.Rules.Count(r => r.Contains("MFA_Temp_")) == 1 && commands.Rules.Any(r => r.StartsWith("-A MFA ") && r.Contains("MFA_Temp_8.8.8.8")));
+});
+Test("IptablesChain: a missing chain, or one reachable from FORWARD, refuses grants; sweeping carries on", () =>
+{
+    var commands = new FakeCommands();
+    commands.Rules.Add(Rule("MFA_Temp_8.8.8.8_22_TCP", 1));
+    var worker = WorkerWithChain(commands, "MFA");
+    string log = CaptureConsole(() => worker.CheckLinuxChain());
+    Check(log.Contains("chain 'MFA' does not exist"));
+    worker.SweepExpiredRules();   // the expired INPUT grant goes; the missing chain is not a sweeper problem
+    Check(commands.Rules.Count == 0);
+    Check(worker.ProcessFirewallRequest(Request).StartsWith("ERROR:") && !commands.SeenScripts.Any(c => c.Contains(" -I ")));
+
+    // Present but not reached from INPUT: a warning; grants are still written.
+    commands.Chains.Add("MFA");
+    log = CaptureConsole(() => worker.CheckLinuxChain());
+    Check(log.Contains("INPUT does not jump to 'MFA'") && !log.Contains("does not exist"));
+    commands.Rules.Add("-A INPUT -j MFA");
+    commands.Rules6.Add("-A INPUT -j MFA");
+    log = CaptureConsole(() => worker.CheckLinuxChain());
+    Check(!log.Contains("jump to") && !log.Contains("does not exist"));
+
+    // Reached from FORWARD as well: refused at startup and on every grant.
+    commands.Chains.Add("DOCKER-USER");
+    commands.Rules.Add("-A FORWARD -j DOCKER-USER");
+    commands.Rules.Add("-A DOCKER-USER -j MFA");
+    log = CaptureConsole(() => worker.CheckLinuxChain());
+    Check(log.Contains("reachable from FORWARD"));
+    Check(worker.ProcessFirewallRequest(Request).StartsWith("ERROR:") && !commands.SeenScripts.Any(c => c.Contains(" -I ")));
 });
 Test("DpapiEntropy is required and validated on Windows only", () =>
 {
@@ -478,10 +551,10 @@ Test("privileged log files: only a regular file of our own is used; anything els
     {
         // Missing: created. Present and ours: used as is, with no note.
         string day = Path.Combine(dir, "mfaservice_2026-01-01.log");
-        var (created, note) = PrivilegedLogFile.Prepare(day);
+        var (created, note) = PrepareLog(day);
         Check(created == day && File.Exists(day) && (note == null || note.Contains("not sticky")));
         File.AppendAllText(day, "ours");
-        (created, note) = PrivilegedLogFile.Prepare(day);
+        (created, note) = PrepareLog(day);
         Check(created == day && File.ReadAllText(day) == "ours" && (note == null || note.Contains("not sticky")));
 
         if (!OperatingSystem.IsWindows())
@@ -491,17 +564,17 @@ Test("privileged log files: only a regular file of our own is used; anything els
 
             string link = Path.Combine(dir, "mfaservice_2026-01-02.log");
             File.CreateSymbolicLink(link, target);
-            (created, note) = PrivilegedLogFile.Prepare(link);
+            (created, note) = PrepareLog(link);
             Check(created == link && new FileInfo(link).LinkTarget == null && note!.Contains("set aside"));
 
             string hard = Path.Combine(dir, "mfaservice_2026-01-03.log");
             Check(Process.Start("ln", new[] { target, hard })!.WaitForExit(5000));
-            (created, note) = PrivilegedLogFile.Prepare(hard);
+            (created, note) = PrepareLog(hard);
             Check(created == hard && note!.Contains("hard link"));
 
             string fifo = Path.Combine(dir, "mfaservice_2026-01-04.log");
             Check(Process.Start("mkfifo", new[] { fifo })!.WaitForExit(5000));
-            (created, note) = PrivilegedLogFile.Prepare(fifo);   // must not block
+            (created, note) = PrepareLog(fifo);   // must not block
             Check(created == fifo && (File.GetUnixFileMode(fifo) & UnixFileMode.UserWrite) != 0 && note!.Contains("not a regular file"));
             File.AppendAllText(fifo, "ok");                      // a regular file now: does not block
 
@@ -510,6 +583,90 @@ Test("privileged log files: only a regular file of our own is used; anything els
         }
     }
     finally { Directory.Delete(dir, true); }
+});
+Test("privileged log files: the stream returned is the checked file, and a swap after the check is caught", () =>
+{
+    string dir = Path.Combine(Path.GetTempPath(), "mfa-logs-" + Guid.NewGuid().ToString("N"));
+    Directory.CreateDirectory(dir);
+    try
+    {
+        string day = Path.Combine(dir, "mfaservice_2026-02-01.log");
+        File.WriteAllText(day, "first\n");
+        var (stream, used, _) = PrivilegedLogFile.Open(day);
+        using (var w = new StreamWriter(stream)) w.Write("second\n");
+        Check(used == day && File.ReadAllText(day) == "first\nsecond\n");
+
+        if (!OperatingSystem.IsWindows())
+        {
+            // Between the check and the open, the file is replaced by a link and then by a pipe.
+            string target = Path.Combine(dir, "target.txt");
+            File.WriteAllText(target, "untouched");
+            foreach (string kind in new[] { "link", "fifo" })
+            {
+                PrivilegedLogFile.AfterCheckForTests = p =>
+                {
+                    PrivilegedLogFile.AfterCheckForTests = null;
+                    File.Delete(p);
+                    if (kind == "link") File.CreateSymbolicLink(p, target);
+                    else Check(Process.Start("mkfifo", new[] { p })!.WaitForExit(5000));
+                };
+                try
+                {
+                    var (s2, used2, note2) = PrivilegedLogFile.Open(day);   // must not block on the pipe
+                    using (var w = new StreamWriter(s2)) w.Write("third");
+                    Check(used2 == day && note2!.Contains("changed between its check and its opening") && note2.Contains("set aside"));
+                    Check(File.ReadAllText(day) == "third" && new FileInfo(day).LinkTarget == null);
+                }
+                finally { PrivilegedLogFile.AfterCheckForTests = null; }
+                File.Delete(day);
+                File.WriteAllText(day, "ours");
+            }
+            Check(File.ReadAllText(target) == "untouched");
+        }
+    }
+    finally { PrivilegedLogFile.AfterCheckForTests = null; Directory.Delete(dir, true); }
+});
+Test("passkey enrolment: MFAService checks the password itself", () =>
+{
+    var user = new UserEntry { Username = "a@example.com", PasswordHash = BCrypt.Net.BCrypt.HashPassword("pa|ss\nword") };
+    string? decoded = DatabaseLockService.DecodeEnrolmentPassword(Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes("pa|ss\nword")));
+    Check(decoded == "pa|ss\nword" && DatabaseLockService.EnrolmentPasswordMatches(user, decoded));
+    Check(!DatabaseLockService.EnrolmentPasswordMatches(user, "wrong"));
+    Check(!DatabaseLockService.EnrolmentPasswordMatches(new UserEntry { PasswordHash = "" }, "anything"));
+    Check(!DatabaseLockService.EnrolmentPasswordMatches(new UserEntry { PasswordHash = "not-a-hash" }, "anything"));
+    foreach (string bad in new[] { "", "not base64!", Convert.ToBase64String(new byte[] { 0xC3, 0x28 }),
+                                   Convert.ToBase64String(new byte[DatabaseLockService.MaxEnrolmentPasswordBytes + 1]) })
+        Check(DatabaseLockService.DecodeEnrolmentPassword(bad) == null);
+    Check(DatabaseLockService.DecodeEnrolmentPassword(Convert.ToBase64String(new byte[DatabaseLockService.MaxEnrolmentPasswordBytes])) != null);
+    // A token alone is no longer a request MFAService understands, and a malformed password is
+    // refused before the database is read.
+    Check(DatabaseLockService.ProcessDbRequest("RENEW_PASSKEY_TOKEN|token") == "ERROR: Unknown DB command");
+    Check(DatabaseLockService.ProcessDbRequest("RENEW_PASSKEY_TOKEN|token|not base64!") == "ERROR: Invalid password");
+});
+Test("passkey registration notice names the account and the time", () =>
+{
+    var (subject, userBody, adminBody) = ServiceMail.PasskeyNotice("Example VPN", "a@example.com", new DateTime(2026, 11, 23, 18, 5, 0, DateTimeKind.Utc));
+    Check(subject == "[Example VPN] Passkey registered for a@example.com");
+    Check(userBody.Contains("a@example.com at 2026-11-23 18:05 UTC") && userBody.Contains("contact your administrator"));
+    Check(adminBody.Contains("a@example.com at 2026-11-23 18:05 UTC"));
+});
+Test("certificate choice prefers a trusted chain over a newer untrusted certificate", () =>
+{
+    using var key = System.Security.Cryptography.ECDsa.Create();
+    X509Certificate2 Make(int days) => new System.Security.Cryptography.X509Certificates.CertificateRequest(
+        "CN=mfa.example.com", key, System.Security.Cryptography.HashAlgorithmName.SHA256)
+        .CreateSelfSigned(DateTimeOffset.UtcNow.AddDays(-1), DateTimeOffset.UtcNow.AddDays(days));
+    using var older = Make(30);
+    using var newer = Make(90);
+    // A self-signed certificate does not chain to a trusted root.
+    Check(!CertTrust.ChainsToTrustedRoot(newer) && !CertTrust.ChainsToTrustedRoot(newer, ignoreTime: true));
+    var (pick, trusted) = CertTrust.PickPreferred(new[] { newer, older }, c => c == older);
+    Check(pick == older && trusted);
+    // None trusted: the newest is still used, so a server whose clients trust a private CA keeps working.
+    (pick, trusted) = CertTrust.PickPreferred(new[] { older, newer }, _ => false);
+    Check(pick == newer && !trusted);
+    (pick, _) = CertTrust.PickPreferred(Array.Empty<X509Certificate2>(), _ => true);
+    Check(pick == null);
 });
 Test("Windows privileged log files: links and files we cannot inspect are set aside", () =>
 {
@@ -533,12 +690,12 @@ Test("Windows privileged log files: links and files we cannot inspect are set as
 
         string link = Path.Combine(dir, "mfaservice_2026-01-01.log");
         File.CreateSymbolicLink(link, target);
-        var (used, note) = PrivilegedLogFile.Prepare(link);
+        var (used, note) = PrepareLog(link);
         Check(used == link && !new FileInfo(link).Attributes.HasFlag(FileAttributes.ReparsePoint) && note!.Contains("set aside"));
 
         string hard = Path.Combine(dir, "mfaservice_2026-01-02.log");
         Run("cmd.exe", "/c", "mklink", "/H", hard, target);
-        (used, note) = PrivilegedLogFile.Prepare(hard);
+        (used, note) = PrepareLog(hard);
         Check(used == hard && note!.Contains("hard link"));
 
         // Owned by LOCAL SERVICE, with a DACL that leaves us out, so its owner cannot be read.
@@ -549,9 +706,26 @@ Test("Windows privileged log files: links and files we cannot inspect are set as
         // Either outcome is safe: set aside and replaced, or -- when Windows refuses even the
         // rename, as it can for a file whose DACL leaves us out -- left in place while the log
         // goes to a uniquely named file. Never written to, and always reported.
-        (used, note) = PrivilegedLogFile.Prepare(foreign);
+        (used, note) = PrepareLog(foreign);
         Check(note!.Contains("owned by another account") && File.Exists(used) && File.ReadAllText(used) == "");
         Check(used == foreign ? note.Contains("set aside") : note.Contains("writing to"));
+
+        // A file of ours, replaced by a link between the check and the open.
+        string swapped = Path.Combine(dir, "mfaservice_2026-01-04.log");
+        File.WriteAllText(swapped, "ours");
+        PrivilegedLogFile.AfterCheckForTests = p =>
+        {
+            PrivilegedLogFile.AfterCheckForTests = null;
+            File.Delete(p);
+            File.CreateSymbolicLink(p, target);
+        };
+        try
+        {
+            (used, note) = PrepareLog(swapped);
+            Check(used == swapped && note!.Contains("changed between its check and its opening")
+                  && !new FileInfo(swapped).Attributes.HasFlag(FileAttributes.ReparsePoint));
+        }
+        finally { PrivilegedLogFile.AfterCheckForTests = null; }
 
         Check(File.ReadAllText(target) == "untouched");
         Check(Directory.GetFileSystemEntries(dir, "untrusted-*").Length >= 2);
@@ -649,6 +823,13 @@ void Test(string name, Action action)
     catch (Exception ex) { failed++; Console.WriteLine($"FAIL {name}: {ex}"); }
 }
 static void Check(bool condition) { if (!condition) throw new Exception("Assertion failed"); }
+// PrivilegedLogFile.Open, with the stream closed: for the tests that look at the files.
+static (string Path, string? Note) PrepareLog(string path)
+{
+    var (stream, used, note) = PrivilegedLogFile.Open(path);
+    stream.Dispose();
+    return (used, note);
+}
 static T Throws<T>(Action action) where T : Exception
 {
     try { action(); }
@@ -701,6 +882,16 @@ static FirewallWorkerService WorkerWithPrefix(IFirewallCommands commands, string
         .Append(new KeyValuePair<string, string?>("BouncerConfig:RulePrefix", prefix));
     return new FirewallWorkerService(new ConfigurationBuilder().AddInMemoryCollection(entries).Build(), commands);
 }
+static FirewallWorkerService WorkerWithChain(FakeCommands commands, string chain)
+{
+    var entries = new[]
+    {
+        new KeyValuePair<string, string?>("BouncerConfig:AllowedPorts:0", "22/TCP"),
+        new KeyValuePair<string, string?>("BouncerConfig:RulePrefix", "MFA_Temp_"),
+        new KeyValuePair<string, string?>("BouncerConfig:IptablesChain", chain),
+    };
+    return new FirewallWorkerService(new ConfigurationBuilder().AddInMemoryCollection(entries).Build(), commands);
+}
 static FirewallWorkerService WorkerWithIpv6PrefixLength(FakeCommands commands, int prefixLength, params string[] ports)
 {
     if (ports.Length == 0) ports = new[] { "22/TCP" };
@@ -727,6 +918,8 @@ sealed class FakeCommands : IFirewallCommands
     public string SweeperOutput { get; init; } = "";
     public List<string> Rules { get; } = new();
     public List<string> Rules6 { get; } = new();
+    // Chains that exist in both tables. Rule lines carry their own chain ("-A <chain> ...").
+    public HashSet<string> Chains { get; } = new() { "INPUT" };
     public HashSet<string> WindowsNames { get; } = new();
     public List<string> SeenScripts { get; } = new();
 
@@ -755,19 +948,31 @@ sealed class FakeCommands : IFirewallCommands
         if (Array.IndexOf(LinuxIptables.Tables, table) < 0) throw new Exception("Unexpected table");
         var (rules, mask) = table == "iptables" ? (Rules, "32") : (Rules6, "128");
 
-        if (args is ["-S", "INPUT"]) return string.Join('\n', rules);
-        if (args.Length > 2 && args[0] == "-D" && args[1] == "INPUT")
+        if (args is ["-S"])
+        {
+            var header = new[] { "-P INPUT ACCEPT", "-P FORWARD ACCEPT", "-P OUTPUT ACCEPT" }
+                .Concat(Chains.Where(c => c != "INPUT").Select(c => $"-N {c}"));
+            return string.Join('\n', header.Concat(rules));
+        }
+        if (args is ["-S", var listed])
+        {
+            if (!Chains.Contains(listed)) throw new InvalidOperationException("Command failed with code 1");
+            var lines = rules.Where(r => r.StartsWith($"-A {listed} ", StringComparison.Ordinal));
+            return string.Join('\n', (listed == "INPUT" ? new[] { "-P INPUT ACCEPT" } : new[] { $"-N {listed}" }).Concat(lines));
+        }
+        if (args.Length > 2 && args[0] == "-D" && Chains.Contains(args[1]))
         {
             if (FailDelete) throw new InvalidOperationException("Command failed with code 1");
             if (FailDeleteMatching != null && string.Join(' ', args).Contains(FailDeleteMatching))
                 throw new InvalidOperationException("Command failed with code 1");
             // Delete only on an exact match of the parsed rule, as iptables -D does.
             if (!IgnoreDelete)
-                rules.RemoveAll(r => LinuxIptables.SplitRuleLine(r).Skip(2).SequenceEqual(args.Skip(2)));
+                rules.RemoveAll(r => LinuxIptables.SplitRuleLine(r) is var a && a[1] == args[1] && a.Skip(2).SequenceEqual(args.Skip(2)));
             return "";
         }
-        if (args.Length > 2 && args[0] == "-I" && args[1] == "INPUT")
+        if (args.Length > 2 && args[0] == "-I")
         {
+            if (!Chains.Contains(args[1])) throw new InvalidOperationException("Command failed with code 1");
             if (FailInsert) throw new InvalidOperationException("Command failed with code 1");
             if (!IgnoreInsert)
             {
@@ -777,7 +982,7 @@ sealed class FakeCommands : IFirewallCommands
                 string source = Arg("-s");
                 if (!source.Contains('/')) source += $"/{mask}";
                 string proto = Arg("-p");
-                rules.Add($"-A INPUT -s {source} -p {proto} -m {proto} --dport {Arg("--dport")} -m comment --comment \"{Arg("--comment")}\" -j ACCEPT");
+                rules.Add($"-A {args[1]} -s {source} -p {proto} -m {proto} --dport {Arg("--dport")} -m comment --comment \"{Arg("--comment")}\" -j ACCEPT");
             }
             return "";
         }

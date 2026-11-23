@@ -2,6 +2,11 @@
   "version": 1,
   "dependencies": {
     "net10.0": {
+      "BCrypt.Net-Next": {
+        "type": "Transitive",
+        "resolved": "4.1.0",
+        "contentHash": "5YT3DKllmtkyW68PjURu/V1TOe4MKiByKwsRNVcfYE1S5KuFTeozdmKzyNzolKiQF391OXCaQtINvYT3j1ERzQ=="
+      },
       "Microsoft.Extensions.Configuration": {
         "type": "Transitive",
         "resolved": "10.0.5",
@@ -320,6 +325,7 @@
       "mfaservice": {
         "type": "Project",
         "dependencies": {
+          "BCrypt.Net-Next": "[4.1.0, )",
           "Microsoft.Extensions.Hosting.Systemd": "[10.0.5, )",
           "Microsoft.Extensions.Hosting.WindowsServices": "[10.0.5, )",
           "System.Security.Cryptography.ProtectedData": "[10.0.5, )"

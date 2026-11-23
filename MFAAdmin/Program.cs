@@ -110,19 +110,9 @@ namespace MFAAdmin
             if (path == _dailyRequested && _dailyWriter != null) return _dailyWriter;
             _dailyWriter?.Dispose();
             _dailyWriter = null;
-            var (actual, note) = PrivilegedLogFile.Prepare(path);
-            // Checked just now and ours; in the sticky directory nobody else can replace it before this
-            // open. Shared for reading and writing -- two MFAAdmin runs at once both append to the day's
-            // file, each seeking to the end first -- and for deletion (retention).
-            FileStream stream;
-            try { stream = new FileStream(actual, FileMode.Append, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete); }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-            {
-                // Held open by something else with no sharing, for instance. Do not stop logging.
-                string fallback = PrivilegedLogFile.CreateUnique(path);
-                note = (note == null ? "" : note + "; ") + $"could not open {Path.GetFileName(actual)} ({ex.Message}); writing to {Path.GetFileName(fallback)} instead";
-                stream = new FileStream(fallback, FileMode.Append, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete);
-            }
+            // Checked, opened without following a link, and checked again through the handle; see
+            // Shared/PrivilegedLogFile.cs. Falls back to a uniquely named file rather than stop logging.
+            var (stream, _, note) = PrivilegedLogFile.Open(path);
             var writer = new StreamWriter(stream, new UTF8Encoding(false)) { AutoFlush = true };
             if (note != null)
                 writer.WriteLine($"[{DateTime.UtcNow:yyyy-MM-dd HH:mm:ss} UTC] [WRN] [SECURITY] Log file: {note}");
@@ -152,7 +142,12 @@ namespace MFAAdmin
                     if (DateTime.TryParseExact(datePart, "yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture,
                             System.Globalization.DateTimeStyles.None, out var day)
                         && day < today.AddDays(-LogRetentionDays))
-                        File.Delete(file);
+                    {
+                        // Each on its own: one the web account holds open (Windows) must not stop the rest.
+                        try { File.Delete(file); }
+                        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                        { Console.WriteLine($"[LOG ERROR] Could not remove expired log file {Path.GetFileName(file)}: {ex.Message}"); }
+                    }
                 }
             }
             catch (Exception ex)
@@ -507,13 +502,7 @@ namespace MFAAdmin
         // error. The distinction matters most for UseSsl: silently reading garbage as `false`
         // would downgrade the provisioning email (temp password + setup tokens) to cleartext
         // SMTP. A typo must fail the send, never weaken it.
-        static int SmtpPort()
-        {
-            string? v = Config["Smtp:Port"];
-            if (string.IsNullOrWhiteSpace(v)) return 25;
-            if (int.TryParse(v, out var p) && p >= 1 && p <= 65535) return p;
-            throw new InvalidOperationException($"Smtp:Port value '{v}' is not a valid port (1-65535).");
-        }
+        static int SmtpPort() => SmtpTransportPolicy.GetPort(Config);
 
         static bool SmtpUseSsl(string host) => SmtpTransportPolicy.GetUseSsl(Config, host);
 
@@ -1076,8 +1065,9 @@ namespace MFAAdmin
 
         // Linux: MFAService writes each rule's comment as "<name> user:<email> exp:<epoch>" (see
         // OpenFirewallPort and LinuxIptables.Comment). Deletes this user's grants from both
-        // tables, then re-reads them and reports what is left rather than assuming success.
-        // 'untagged' counts managed rules written before the user tag existed.
+        // tables, in whatever chain they are, then re-reads them and reports what is left rather
+        // than assuming success. 'untagged' counts managed rules written before the user tag
+        // existed. A table that cannot be read does not stop the other one; it is reported after.
         static (int Removed, int Remaining, int Untagged) RevokeLinuxRulesForUser(string username)
         {
             bool IsUsers(string line, out bool untagged)
@@ -1089,20 +1079,32 @@ namespace MFAAdmin
             }
 
             int removed = 0, remaining = 0, untaggedCount = 0;
+            var unreadable = new List<string>();
             foreach (string table in LinuxIptables.Tables)
             {
-                foreach (string line in ListInputRules(table))
+                try
                 {
-                    if (!IsUsers(line, out _)) continue;
-                    RunIptables(table, LinuxIptables.DeleteArguments(line), out int rc);
-                    if (rc == 0) removed++;
+                    foreach (string line in ListRules(table))
+                    {
+                        if (!IsUsers(line, out _)) continue;
+                        // A line that cannot be turned into a delete stays, and is counted below.
+                        try { RunIptables(table, LinuxIptables.DeleteArguments(line), out int rc); if (rc == 0) removed++; }
+                        catch (InvalidOperationException ex) { AdminLogger.Error($"[ERROR] Could not remove {table} rule: {ex.Message}: {line.Trim()}"); }
+                    }
+                    foreach (string line in ListRules(table))
+                    {
+                        if (IsUsers(line, out bool untagged)) remaining++;
+                        else if (untagged) untaggedCount++;
+                    }
                 }
-                foreach (string line in ListInputRules(table))
+                catch (Exception ex) when (ex is InvalidOperationException or System.ComponentModel.Win32Exception)
                 {
-                    if (IsUsers(line, out bool untagged)) remaining++;
-                    else if (untagged) untaggedCount++;
+                    unreadable.Add(ex.Message);
                 }
             }
+            if (unreadable.Count > 0)
+                throw new InvalidOperationException($"{string.Join("; ", unreadable)}; {removed} rule(s) for this user were " +
+                                                    "removed from the table(s) that could be read");
             return (removed, remaining, untaggedCount);
         }
 
@@ -1491,26 +1493,31 @@ namespace MFAAdmin
                 // populates, so diag always showed nothing regardless of how many sessions were
                 // open. The rule comment is "<RulePrefix><ip>_<port>_<proto> user:<email> exp:<epoch>";
                 // rules granted before the user tag existed show "?" in the User column.
-                Console.WriteLine("Querying iptables/ip6tables for active MFA sessions...\n");
+                Console.WriteLine("Querying iptables/ip6tables (every chain) for active MFA sessions...\n");
 
                 var mine = new List<(string Line, string? User, long Expiry)>();
-                try
+                bool allRead = true;
+                foreach (string table in LinuxIptables.Tables)
                 {
-                    foreach (string table in LinuxIptables.Tables)
-                        foreach (string line in ListInputRules(table))
+                    try
+                    {
+                        foreach (string line in ListRules(table))
                             if (LinuxIptables.TryParseManagedRule(line, RulePrefix, out _, out long expiry, out string? user))
                                 mine.Add((line, user, expiry));
-                }
-                catch (Exception ex)
-                {
-                    AdminLogger.Error($"[ERROR] Could not read the firewall rules: {ex.Message}");
-                    Environment.ExitCode = 1;
-                    return;
+                    }
+                    catch (Exception ex) when (ex is InvalidOperationException or System.ComponentModel.Win32Exception)
+                    {
+                        // Keep going: the other table's grants are still worth listing.
+                        AdminLogger.Error($"[ERROR] Could not read the {table} rules: {ex.Message}");
+                        Environment.ExitCode = 1;
+                        allRead = false;
+                    }
                 }
 
                 if (mine.Count == 0)
                 {
-                    Console.WriteLine("No active MFA firewall rules found.");
+                    Console.WriteLine(allRead ? "No active MFA firewall rules found."
+                                              : "No active MFA firewall rules found in the table that could be read.");
                 }
                 else
                 {
@@ -1572,11 +1579,13 @@ namespace MFAAdmin
 
         // Throws if the listing fails: an empty result must mean an empty chain, never "could not
         // read it", or delete and reset would report that no rule was found while one is open.
-        static string[] ListInputRules(string table)
+        // Every chain of the table: grants are found by their comment wherever they are, so this
+        // does not need to know MFAService's BouncerConfig:IptablesChain.
+        static string[] ListRules(string table)
         {
-            string output = RunIptables(table, new[] { "-S", "INPUT" }, out int exitCode);
+            string output = RunIptables(table, LinuxIptables.ListAllArguments, out int exitCode);
             if (exitCode != 0)
-                throw new InvalidOperationException($"'{table} -S INPUT' failed with exit code {exitCode}");
+                throw new InvalidOperationException($"'{table} -S' failed with exit code {exitCode}");
             return output.Split('\n', StringSplitOptions.RemoveEmptyEntries);
         }
 
@@ -1638,33 +1647,54 @@ namespace MFAAdmin
                     // emergency revocation silently removed nothing while telling the operator
                     // access was closed.
                     //
-                    // Mirror MFAService's sweeper: enumerate '<table> -S INPUT' for both tables
-                    // and delete each matching rule by replaying it with -D instead of -A. Then
-                    // RE-READ each chain and report what actually happened rather than assuming
-                    // it worked.
+                    // Mirror MFAService's sweeper: enumerate '<table> -S' (every chain) for both
+                    // tables and delete each matching rule by replaying it with -D instead of -A.
+                    // Then RE-READ each table and report what actually happened rather than
+                    // assuming it worked. A table that cannot be read does not stop the other.
                     int attempted = 0, failed = 0, remaining = 0;
+                    var unreadable = new List<string>();
 
                     foreach (string table in LinuxIptables.Tables)
                     {
-                        foreach (string line in ListInputRules(table))
+                        try
                         {
-                            if (!IsManagedRule(line)) continue;
+                            foreach (string line in ListRules(table))
+                            {
+                                if (!IsManagedRule(line)) continue;
 
-                            attempted++;
-                            RunIptables(table, LinuxIptables.DeleteArguments(line), out int rc);
-                            if (rc != 0) failed++;
+                                attempted++;
+                                // One line that cannot be turned into a delete must not stop the rest.
+                                try { RunIptables(table, LinuxIptables.DeleteArguments(line), out int rc); if (rc != 0) failed++; }
+                                catch (InvalidOperationException ex)
+                                {
+                                    failed++;
+                                    AdminLogger.Error($"[ERROR] Could not remove {table} rule: {ex.Message}: {line.Trim()}");
+                                }
+                            }
+
+                            remaining += ListRules(table).Count(IsManagedRule);
                         }
-
-                        remaining += ListInputRules(table).Count(IsManagedRule);
+                        catch (Exception ex) when (ex is InvalidOperationException or System.ComponentModel.Win32Exception)
+                        {
+                            unreadable.Add(ex.Message);
+                        }
                     }
 
-                    if (remaining > 0)
+                    if (unreadable.Count > 0)
+                    {
+                        Environment.ExitCode = 1;
+                        AdminLogger.Error(
+                            $"[ERROR] Could not read every table ({string.Join("; ", unreadable)}); grants in it may still be open. " +
+                            $"Removed {attempted - failed} rule(s) from the rest. Check with: iptables -S | grep {RulePrefix} " +
+                            $"and ip6tables -S | grep {RulePrefix}");
+                    }
+                    else if (remaining > 0)
                     {
                         Environment.ExitCode = 1;
                         AdminLogger.Error(
                             $"[ERROR] {remaining} MFA-managed iptables/ip6tables rule(s) REMAIN after reset ({failed} delete(s) failed). " +
-                            "Access is still open. Remove them manually: iptables -S INPUT | grep " + RulePrefix +
-                            " (and ip6tables -S INPUT for IPv6).");
+                            "Access is still open. Remove them manually: iptables -S | grep " + RulePrefix +
+                            " (and ip6tables -S for IPv6).");
                     }
                     else if (attempted == 0)
                         AdminLogger.Log("[INFO] No MFA-managed iptables/ip6tables rules were present. Nothing to remove.");
