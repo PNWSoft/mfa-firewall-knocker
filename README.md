@@ -168,8 +168,8 @@ than trusting its caller.
   short-lived registration token and readiness state. Both read and write access need
   protection: a reader can disclose hashes or race an active enrollment, while a writer can
   enroll their own credential. MFAService and MFAAdmin — the only two writers — serialize
-  against each other through a cross-process lock (a named mutex on Windows, a lock file on
-  Linux); the internet-facing MFAWeb never writes the
+  against each other through a lock file beside the database; the internet-facing MFAWeb
+  never writes the
   store directly, and reads it without that same serialization
 - **Building with `-p:AllowTotp=true` changes that**, and it is the main reason the flag is not
   the default. TOTP verification is `HMAC-SHA1(secret, timestep)`, so the server must keep each
@@ -407,7 +407,7 @@ A few that are easy to get wrong:
 - **`BouncerConfig:Ipv6GrantPrefixLength`** — defaults to `128` (exact host address, matching
   IPv4). Set between `64` and `128` to widen an IPv6 grant to the client's containing network, so
   a privacy-address or cellular-carrier rotation within the same `/64` doesn't strand the grant.
-  See the note under Prerequisites for the trade-off this makes.
+  See the IPv6 roaming note under [Requirements](#requirements) for the trade-off this makes.
 - **`LogoUrl`** — leave empty to use the bundled knocker logo, or point it at your own image.
 
 > **Do not put a reverse proxy in front of MFAWeb.** It deliberately ignores `X-Forwarded-For` and
@@ -506,7 +506,8 @@ revoke, you know whether you have closed the door or actually removed the person
   enrollment password hash, and active enrollment tokens still make the database confidential.
   Protect it with the filesystem permissions documented in INSTALL.md.
 - Firewall rules expire after `ExpirationHours`; the sweeper runs every 5 minutes.
-- Passkey registration always requires proof of the enrollment password or a post-login token —
+- Passkey registration always requires proof of the enrollment password (or, in a TOTP build, a
+  token minted after a TOTP login) —
   in the default passkey-only build that password is never anything else: it's checked once, at
   registration, then burned on success or once its 60-minute window expires unused, whichever
   comes first. **That changes once an account confirms TOTP** — from then on the same password is

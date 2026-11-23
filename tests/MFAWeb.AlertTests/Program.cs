@@ -165,6 +165,62 @@ try
         });
     }
 
+    // One source that is over its own limit must not use up the shared budget every user draws
+    // from. Small limits keep it quick: 5 per source, 20 shared. Each client binds its own
+    // loopback address, so each is a separate source to the rate limiter.
+    string limitRoot = Path.Combine(root, "limits");
+    Directory.CreateDirectory(limitRoot);
+    await using (var limitServer = await TestWeb.StartAsync(limitRoot, Array.Empty<Fixture>(),
+        new Dictionary<string, string> { ["RateLimitPerWindow"] = "5", ["GlobalRateLimitPerWindow"] = "20" }))
+    {
+        await Run("requests rejected by a source's own limit do not drain the shared login budget", async () =>
+        {
+            using var flood = TestWeb.ClientFrom(limitServer.Address, "127.0.0.2");
+            int admitted = 0, limited = 0;
+            for (int i = 0; i < 40; i++)
+            {
+                using var response = await flood.GetAsync("/");
+                if (response.StatusCode == HttpStatusCode.TooManyRequests) limited++; else admitted++;
+            }
+            Assert(admitted == 5 && limited == 35, $"Expected 5 admitted and 35 limited from one source, saw {admitted} and {limited}.");
+
+            using var other = TestWeb.ClientFrom(limitServer.Address, "127.0.0.3");
+            using var otherResponse = await other.GetAsync("/");
+            Assert(otherResponse.StatusCode != HttpStatusCode.TooManyRequests,
+                "A different source was refused: one source's rejected requests drained the shared budget.");
+
+            // The shared backstop still caps many sources combined: 6 of its 20 permits are used
+            // above, so five fresh sources sending 5 each get 14 admitted between them.
+            int sharedAdmitted = 0;
+            for (int source = 10; source < 15; source++)
+            {
+                using var client = TestWeb.ClientFrom(limitServer.Address, $"127.0.0.{source}");
+                for (int i = 0; i < 5; i++)
+                {
+                    using var response = await client.GetAsync("/");
+                    if (response.StatusCode != HttpStatusCode.TooManyRequests) sharedAdmitted++;
+                }
+            }
+            Assert(sharedAdmitted == 14, $"Expected the shared budget to admit 14 more across sources, saw {sharedAdmitted}.");
+        });
+    }
+
+    await Run("IPv6 sources are keyed per /56, and /56s in one /48 share the /48 tier", () =>
+    {
+        var a = IPAddress.Parse("2001:db8:0:1100::1");
+        var b = IPAddress.Parse("2001:db8:0:11ff::2");   // same /56 as a
+        var c = IPAddress.Parse("2001:db8:0:2200::1");   // another /56 in the same /48
+        var d = IPAddress.Parse("2001:db8:1:1100::1");   // another /48
+        Assert(RateLimitKeys.Source(a) == RateLimitKeys.Source(b), "Addresses in one /56 were not one source.");
+        Assert(RateLimitKeys.Source(a) != RateLimitKeys.Source(c), "Two /56s were keyed as one source.");
+        Assert(RateLimitKeys.Ipv6Network(a) == RateLimitKeys.Ipv6Network(c), "Two /56s in one /48 did not share the /48 tier.");
+        Assert(RateLimitKeys.Ipv6Network(a) != RateLimitKeys.Ipv6Network(d), "Different /48s shared the /48 tier.");
+        Assert(RateLimitKeys.Ipv6Network(IPAddress.Parse("203.0.113.1")) == null
+               && RateLimitKeys.Ipv6Network(IPAddress.Parse("::ffff:203.0.113.1")) == null, "IPv4 was given an IPv6 network tier.");
+        Assert(RateLimitKeys.Source(IPAddress.Parse("::ffff:203.0.113.1")) == "203.0.113.1", "An IPv4-mapped address was not keyed as IPv4.");
+        return Task.CompletedTask;
+    });
+
     await Run("successful authentication clears the account's previous failures", () =>
     {
         AuditLogger.LogDirectory = Path.Combine(root, "direct-monitor");
@@ -370,11 +426,35 @@ sealed class TestWeb : IAsyncDisposable
     private readonly Process process;
     private readonly string logDirectory;
     public HttpClient Client { get; }
+    public Uri Address { get; }
+
+    // A client whose connections come from the given loopback address, so the server sees it as
+    // a distinct source. Every 127.x.x.x address is loopback on both Windows and Linux.
+    public static HttpClient ClientFrom(Uri address, string sourceIp)
+    {
+        var handler = new SocketsHttpHandler
+        {
+            ConnectCallback = async (context, cancellationToken) =>
+            {
+                var socket = new System.Net.Sockets.Socket(System.Net.Sockets.AddressFamily.InterNetwork,
+                    System.Net.Sockets.SocketType.Stream, System.Net.Sockets.ProtocolType.Tcp);
+                try
+                {
+                    socket.Bind(new IPEndPoint(IPAddress.Parse(sourceIp), 0));
+                    await socket.ConnectAsync(context.DnsEndPoint, cancellationToken);
+                    return new System.Net.Sockets.NetworkStream(socket, ownsSocket: true);
+                }
+                catch { socket.Dispose(); throw; }
+            }
+        };
+        return new HttpClient(handler) { BaseAddress = address, Timeout = TimeSpan.FromSeconds(15) };
+    }
 
     private TestWeb(Process process, Uri address, string logDirectory)
     {
         this.process = process;
         this.logDirectory = logDirectory;
+        Address = address;
         Client = new HttpClient(new HttpClientHandler { CookieContainer = new CookieContainer() })
         {
             BaseAddress = address, Timeout = TimeSpan.FromSeconds(15)

@@ -18,6 +18,7 @@ ServiceLogger.LogDirectory = Path.Combine(AppContext.BaseDirectory, "test-logs")
 const string Request = "8.8.8.8|review@example.com";
 const string RequestV6 = "2001:4860:4860::8888|review@example.com";
 int failed = 0;
+int ran = 0;
 Test("subprocess exit failure includes stderr", () =>
 {
     var error = Throws<InvalidOperationException>(() => FirewallCommandRunner.Run(Child("failure")));
@@ -181,6 +182,9 @@ Test("invalid port configuration never reports success", () =>
     var commands = new FakeCommands();
     Check(Worker(commands, "invalid", "0/TCP", "22/OTHER").ProcessFirewallRequest(Request).StartsWith("ERROR:"));
     Check(commands.Rules.Count == 0);
+    // A valid entry before a bad one must not be opened either: no partial grant.
+    Check(Worker(commands, "22/TCP", "bad").ProcessFirewallRequest(Request).StartsWith("ERROR:"));
+    Check(commands.Rules.Count == 0 && !commands.SeenScripts.Any(s => s.Contains(" -I ")));
 });
 Test("IPv6 zone ID is rejected before it can reach a shell command", () =>
 {
@@ -373,32 +377,274 @@ Test("DpapiEntropy is required and validated on Windows only", () =>
         Check(DpapiEntropy.Load(Entropy("REPLACE-WITH-A-UNIQUE-RANDOM-STRING")).Length == 0);
     }
 });
-Test("the Linux database lock file excludes a second holder until released", () =>
+Test("the database lock file excludes a second holder until released", () =>
 {
+    // On Windows the lock file is SYSTEM and Administrators only, as MFAService (LocalSystem) and
+    // MFAAdmin (elevated) run; an unelevated test process cannot open it. CI runs elevated.
+    if (OperatingSystem.IsWindows() && !IsElevated())
+    {
+        Console.WriteLine("  (skipped: needs an elevated process on Windows)");
+        return;
+    }
     string dir = Path.Combine(Path.GetTempPath(), "mfa-lock-" + Guid.NewGuid().ToString("N"));
     Directory.CreateDirectory(dir);
     try
     {
         string db = Path.Combine(dir, "users.json");
-        using (var first = LinuxDbLock.TryAcquire(db, TimeSpan.FromSeconds(1)))
+        // A lock file that already exists with inherited permissions is corrected on first use.
+        if (OperatingSystem.IsWindows()) File.WriteAllText(Path.Combine(dir, "users.lock"), "");
+        using (var first = DbFileLock.TryAcquire(db, TimeSpan.FromSeconds(1)))
         {
             Check(first != null);
             var watch = Stopwatch.StartNew();
-            Check(LinuxDbLock.TryAcquire(db, TimeSpan.FromMilliseconds(300)) == null);
+            Check(DbFileLock.TryAcquire(db, TimeSpan.FromMilliseconds(300)) == null);
             Check(watch.Elapsed >= TimeSpan.FromMilliseconds(250));
         }
-        using (var again = LinuxDbLock.TryAcquire(db, TimeSpan.FromSeconds(1))) Check(again != null);
+        using (var again = DbFileLock.TryAcquire(db, TimeSpan.FromSeconds(1))) Check(again != null);
         Check(File.Exists(Path.Combine(dir, "users.lock")));
         if (!OperatingSystem.IsWindows())
             Check(File.GetUnixFileMode(Path.Combine(dir, "users.lock")) == (UnixFileMode.UserRead | UnixFileMode.UserWrite));
+        // Its own protected ACL, not the directory's inherited one (which lets the web account
+        // read the database directory): SYSTEM and Administrators only.
+        if (OperatingSystem.IsWindows())
+            Check(LockFileAclIsPrivate(Path.Combine(dir, "users.lock")));
     }
     finally { Directory.Delete(dir, true); }
 });
-Console.WriteLine(failed == 0 ? "All 33 regression checks passed." : $"{failed} regression check(s) failed.");
+Test("Windows grants record their expiry in invariant form under any system culture", () =>
+{
+    // ':' in a .NET format string is the culture's time separator: '.' in fi-FI, da-DK, id-ID.
+    // The sweeper parses this text, so a culture-formatted expiry was never removed.
+    var previous = System.Globalization.CultureInfo.CurrentCulture;
+    try
+    {
+        foreach (var culture in new[] { "fi-FI", "da-DK", "id-ID", "th-TH" })
+        {
+            System.Globalization.CultureInfo.CurrentCulture = new System.Globalization.CultureInfo(culture);
+            var commands = new FakeCommands { IsWindows = true };
+            Check(Worker(commands).ProcessFirewallRequest(Request) == "SUCCESS");
+            string script = commands.SeenScripts.First(s => s.Contains("New-NetFirewallRule"));
+            var exp = Regex.Match(script, @"Exp: (\d{4})-\d{2}-\d{2} \d{2}:\d{2} UTC'");
+            // Gregorian year even under th-TH (whose calendar is 543 years ahead); +1 allows a
+            // run that straddles New Year.
+            Check(exp.Success && int.Parse(exp.Groups[1].Value) is var year
+                  && (year == DateTime.UtcNow.Year || year == DateTime.UtcNow.Year + 1));
+        }
+    }
+    finally { System.Globalization.CultureInfo.CurrentCulture = previous; }
+});
+Test("Windows expiry carries on past a failed or unreadable rule and reports both", () =>
+{
+    var commands = new FakeCommands
+    {
+        IsWindows = true,
+        SweeperOutput = string.Join('\n',
+            "REMOVED|MFA_Temp_8.8.8.8_22_TCP",
+            "FAILED|MFA_Temp_9.9.9.9_22_TCP|access denied",
+            "UNPARSEABLE|MFA_Temp_1.1.1.1_22_TCP",
+            "REMOVED|MFA_Temp_4.4.4.4_22_TCP")
+    };
+    string log = CaptureConsole(() =>
+    {
+        var error = Throws<InvalidOperationException>(() => Worker(commands).SweepExpiredRules());
+        Check(error.Message.Contains("MFA_Temp_9.9.9.9_22_TCP: access denied") && error.Message.Contains("MFA_Temp_1.1.1.1_22_TCP has the prefix but no readable expiry")
+              && error.Message.Contains("removed 2 rule(s)"));
+    });
+    Check(log.Contains("removed: MFA_Temp_8.8.8.8_22_TCP") && log.Contains("removed: MFA_Temp_4.4.4.4_22_TCP"));
+    // The script itself handles each rule on its own and accepts the older '.' time separator.
+    string script = commands.SeenScripts.Single(s => s.Contains("Remove-NetFirewallRule"));
+    Check(script.Contains("[:.]") && script.Contains("catch") && script.Contains("[cultureinfo]::InvariantCulture"));
+});
+Test("Linux expiry carries on past a rule it cannot delete, in both tables", () =>
+{
+    var commands = new FakeCommands { FailDeleteMatching = "9.9.9.9" };
+    commands.Rules.Add(Rule("MFA_Temp_9.9.9.9_22_TCP", 1).Replace("8.8.8.8/32", "9.9.9.9/32"));
+    commands.Rules.Add(Rule("MFA_Temp_8.8.8.8_22_TCP", 1));
+    commands.Rules6.Add(Rule6("MFA_Temp_2001:4860:4860::8888_22_TCP", 1));
+    commands.Rules.Add("-A INPUT -s 7.7.7.7/32 -p tcp -m tcp --dport 22 -m comment --comment \"MFA_Temp_7.7.7.7_22_TCP\" -j ACCEPT");
+    // iptables prints a one-word comment without quotes.
+    commands.Rules.Add("-A INPUT -s 6.6.6.6/32 -p tcp -m tcp --dport 22 -m comment --comment MFA_Temp_mine -j ACCEPT");
+    var error = Throws<InvalidOperationException>(() => Worker(commands).SweepExpiredRules());
+    Check(error.Message.Contains("MFA_Temp_9.9.9.9_22_TCP") && error.Message.Contains("no readable expiry") && error.Message.Contains("removed 2 rule(s)"));
+    Check(error.Message.Contains("MFA_Temp_7.7.7.7_22_TCP") && error.Message.Contains("--comment MFA_Temp_mine"));
+    Check(commands.Rules.Count == 3 && commands.Rules6.Count == 0);
+    Check(commands.Rules.Any(r => r.Contains("9.9.9.9")) && commands.Rules.Any(r => r.Contains("7.7.7.7")));
+});
+Test("privileged log files: only a regular file of our own is used; anything else is set aside", () =>
+{
+    string dir = Path.Combine(Path.GetTempPath(), "mfa-logs-" + Guid.NewGuid().ToString("N"));
+    Directory.CreateDirectory(dir);
+    try
+    {
+        // Missing: created. Present and ours: used as is, with no note.
+        string day = Path.Combine(dir, "mfaservice_2026-01-01.log");
+        var (created, note) = PrivilegedLogFile.Prepare(day);
+        Check(created == day && File.Exists(day) && (note == null || note.Contains("not sticky")));
+        File.AppendAllText(day, "ours");
+        (created, note) = PrivilegedLogFile.Prepare(day);
+        Check(created == day && File.ReadAllText(day) == "ours" && (note == null || note.Contains("not sticky")));
+
+        if (!OperatingSystem.IsWindows())
+        {
+            string target = Path.Combine(dir, "target.txt");
+            File.WriteAllText(target, "untouched");
+
+            string link = Path.Combine(dir, "mfaservice_2026-01-02.log");
+            File.CreateSymbolicLink(link, target);
+            (created, note) = PrivilegedLogFile.Prepare(link);
+            Check(created == link && new FileInfo(link).LinkTarget == null && note!.Contains("set aside"));
+
+            string hard = Path.Combine(dir, "mfaservice_2026-01-03.log");
+            Check(Process.Start("ln", new[] { target, hard })!.WaitForExit(5000));
+            (created, note) = PrivilegedLogFile.Prepare(hard);
+            Check(created == hard && note!.Contains("hard link"));
+
+            string fifo = Path.Combine(dir, "mfaservice_2026-01-04.log");
+            Check(Process.Start("mkfifo", new[] { fifo })!.WaitForExit(5000));
+            (created, note) = PrivilegedLogFile.Prepare(fifo);   // must not block
+            Check(created == fifo && (File.GetUnixFileMode(fifo) & UnixFileMode.UserWrite) != 0 && note!.Contains("not a regular file"));
+            File.AppendAllText(fifo, "ok");                      // a regular file now: does not block
+
+            Check(File.ReadAllText(target) == "untouched");
+            Check(Directory.GetFileSystemEntries(dir, "untrusted-*").Length == 3);
+        }
+    }
+    finally { Directory.Delete(dir, true); }
+});
+Test("Windows privileged log files: links and files we cannot inspect are set aside", () =>
+{
+    if (!OperatingSystem.IsWindows()) return;
+    if (!IsElevated()) { Console.WriteLine("  (skipped: needs an elevated process on Windows)"); return; }
+    string dir = Path.Combine(Path.GetTempPath(), "mfa-wlogs-" + Guid.NewGuid().ToString("N"));
+    Directory.CreateDirectory(dir);
+    static void Run(string file, params string[] args)
+    {
+        var psi = new ProcessStartInfo(file) { UseShellExecute = false, CreateNoWindow = true,
+                                               RedirectStandardOutput = true, RedirectStandardError = true };
+        foreach (var a in args) psi.ArgumentList.Add(a);
+        using var proc = Process.Start(psi)!;
+        proc.WaitForExit(15000);
+        if (proc.ExitCode != 0) throw new Exception($"{file} {string.Join(' ', args)} failed: {proc.StandardError.ReadToEnd()}");
+    }
+    try
+    {
+        string target = Path.Combine(dir, "target.txt");
+        File.WriteAllText(target, "untouched");
+
+        string link = Path.Combine(dir, "mfaservice_2026-01-01.log");
+        File.CreateSymbolicLink(link, target);
+        var (used, note) = PrivilegedLogFile.Prepare(link);
+        Check(used == link && !new FileInfo(link).Attributes.HasFlag(FileAttributes.ReparsePoint) && note!.Contains("set aside"));
+
+        string hard = Path.Combine(dir, "mfaservice_2026-01-02.log");
+        Run("cmd.exe", "/c", "mklink", "/H", hard, target);
+        (used, note) = PrivilegedLogFile.Prepare(hard);
+        Check(used == hard && note!.Contains("hard link"));
+
+        // Owned by LOCAL SERVICE, with a DACL that leaves us out, so its owner cannot be read.
+        string foreign = Path.Combine(dir, "mfaservice_2026-01-03.log");
+        File.WriteAllText(foreign, "[forged]");
+        Run("icacls.exe", foreign, "/setowner", "*S-1-5-19");
+        Run("icacls.exe", foreign, "/inheritance:r", "/grant:r", "*S-1-5-19:F");
+        // Either outcome is safe: set aside and replaced, or -- when Windows refuses even the
+        // rename, as it can for a file whose DACL leaves us out -- left in place while the log
+        // goes to a uniquely named file. Never written to, and always reported.
+        (used, note) = PrivilegedLogFile.Prepare(foreign);
+        Check(note!.Contains("not created by this account") && File.Exists(used) && File.ReadAllText(used) == "");
+        Check(used == foreign ? note.Contains("set aside") : note.Contains("writing to"));
+
+        Check(File.ReadAllText(target) == "untouched");
+        Check(Directory.GetFileSystemEntries(dir, "untrusted-*").Length >= 2);
+    }
+    finally
+    {
+        Run("takeown.exe", "/f", dir, "/r", "/d", "y");
+        Run("icacls.exe", dir, "/reset", "/t", "/q");
+        Directory.Delete(dir, true);
+    }
+});
+Test("an IPv4-mapped IPv6 address is granted as IPv4", () =>
+{
+    var commands = new FakeCommands();
+    Check(Worker(commands).ProcessFirewallRequest("::ffff:8.8.8.8|review@example.com") == "SUCCESS");
+    Check(commands.Rules.Count == 1 && commands.Rules6.Count == 0 && commands.Rules[0].Contains("-s 8.8.8.8/32 "));
+});
+Test("an IPv4-mapped private or loopback address is refused", () =>
+{
+    var commands = new FakeCommands();
+    foreach (string mapped in new[] { "::ffff:10.0.0.1", "::ffff:127.0.0.1", "::ffff:192.168.1.1" })
+        Check(Worker(commands).ProcessFirewallRequest($"{mapped}|review@example.com") != "SUCCESS");
+    Check(commands.Rules.Count == 0 && commands.Rules6.Count == 0);
+});
+// The host reads appsettings.json only: an appsettings.{Environment}.json beside the program,
+// which only someone with write access there could have created, must not override it.
+Test("configuration ignores environment-named settings files", () =>
+{
+    string dir = Path.Combine(Path.GetTempPath(), "mfa-cfg-" + Guid.NewGuid().ToString("N")[..8]);
+    Directory.CreateDirectory(dir);
+    try
+    {
+        File.WriteAllText(Path.Combine(dir, "appsettings.json"), "{\"FirewallService\":{\"GmsaAccount\":\"mfaweb\"}}");
+        File.WriteAllText(Path.Combine(dir, "appsettings.Production.json"), "{\"FirewallService\":{\"GmsaAccount\":\"attacker\"}}");
+        var b = Microsoft.Extensions.Hosting.Host.CreateApplicationBuilder(new Microsoft.Extensions.Hosting.HostApplicationBuilderSettings
+            { ContentRootPath = dir, EnvironmentName = "Production" });
+        Check(b.Configuration["FirewallService:GmsaAccount"] == "attacker");   // the default would use it
+        ConfigFiles.UseAppSettingsJsonOnly(b.Configuration);
+        Check(b.Configuration["FirewallService:GmsaAccount"] == "mfaweb");
+    }
+    finally { Directory.Delete(dir, true); }
+});
+// Runs the real expiry script against the real Windows Firewall, using disabled rules under a
+// random prefix that are always removed afterwards. Opt-in: it needs an elevated process and
+// changes the machine's firewall configuration, so CI's throwaway Windows runner turns it on.
+if (OperatingSystem.IsWindows() && Environment.GetEnvironmentVariable("MFA_LIVE_FIREWALL_TESTS") == "1")
+    Test("Windows expiry against the real firewall: old and new formats, beyond-max, unreadable", () =>
+    {
+        string prefix = "MFAtest" + Guid.NewGuid().ToString("N")[..8] + "_";
+        string Make(string suffix, string description)
+        {
+            string name = prefix + suffix;
+            FirewallWorkerService.RunPowerShell($"New-NetFirewallRule -Name '{name}' -DisplayName '{name}' " +
+                $"-Description '{description}' -Direction Inbound -Protocol TCP -LocalPort 22 " +
+                "-RemoteAddress 192.0.2.10 -Action Allow -Enabled False | Out-Null");
+            return name;
+        }
+        bool Exists(string name) => FirewallWorkerService.RunPowerShell(
+            $"Get-NetFirewallRule -ErrorAction Stop | Where-Object {{ $_.Name -eq '{name}' }} | Select-Object -ExpandProperty Name").Trim() == name;
+        try
+        {
+            var invariant = System.Globalization.CultureInfo.InvariantCulture;
+            string colon = Make("expired_colon", "User: a@example.com Exp: 2000-01-01 00:00 UTC");
+            string dot = Make("expired_dot", "User: a@example.com Exp: 2000-01-01 00.00 UTC");
+            string liveRule = Make("live", $"User: a@example.com Exp: {DateTime.UtcNow.AddHours(2).ToString("yyyy-MM-dd HH:mm", invariant)} UTC");
+            string thai = Make("beyond_max", $"User: a@example.com Exp: {DateTime.UtcNow.Year + 543}-01-01 00:00 UTC");
+            string unreadable = Make("unreadable", "no expiry here");
+
+            var error = Throws<InvalidOperationException>(() => WorkerWithPrefix(new SystemFirewallCommands(), prefix).SweepExpiredRules());
+            Check(error.Message.Contains(unreadable) && error.Message.Contains("removed 3 rule(s)"));
+            Check(!Exists(colon) && !Exists(dot) && !Exists(thai));
+            Check(Exists(liveRule) && Exists(unreadable));
+        }
+        finally
+        {
+            FirewallWorkerService.RunPowerShell($"Get-NetFirewallRule -ErrorAction SilentlyContinue | " +
+                $"Where-Object {{ $_.Name -like '{prefix}*' }} | Remove-NetFirewallRule");
+        }
+    });
+Test("Linux expiry removes a rule whose expiry is beyond the maximum a grant can have", () =>
+{
+    var commands = new FakeCommands();
+    commands.Rules.Add(Rule("MFA_Temp_8.8.8.8_22_TCP", DateTimeOffset.UtcNow.AddDays(30).ToUnixTimeSeconds()));
+    commands.Rules.Add(Rule("MFA_Temp_8.8.8.8_2222_TCP", DateTimeOffset.UtcNow.AddHours(47).ToUnixTimeSeconds()));
+    Worker(commands).SweepExpiredRules();
+    Check(commands.Rules.Count == 1 && commands.Rules[0].Contains("_2222_TCP"));
+});
+Console.WriteLine(failed == 0 ? $"All {ran} regression checks passed." : $"{failed} regression check(s) failed.");
 return failed == 0 ? 0 : 1;
 
 void Test(string name, Action action)
 {
+    ran++;
     try { action(); Console.WriteLine($"PASS {name}"); }
     catch (Exception ex) { failed++; Console.WriteLine($"FAIL {name}: {ex}"); }
 }
@@ -416,6 +662,27 @@ static string CaptureConsole(Action action)
     try { Console.SetOut(captured); action(); return captured.ToString(); }
     finally { Console.SetOut(previous); }
 }
+[System.Runtime.Versioning.SupportedOSPlatform("windows")]
+static bool LockFileAclIsPrivate(string path)
+{
+    var acl = new FileInfo(path).GetAccessControl();
+    if (!acl.AreAccessRulesProtected) return false;
+    foreach (System.Security.AccessControl.FileSystemAccessRule rule in
+             acl.GetAccessRules(true, true, typeof(System.Security.Principal.SecurityIdentifier)))
+    {
+        var sid = (System.Security.Principal.SecurityIdentifier)rule.IdentityReference;
+        if (!sid.IsWellKnown(System.Security.Principal.WellKnownSidType.LocalSystemSid)
+            && !sid.IsWellKnown(System.Security.Principal.WellKnownSidType.BuiltinAdministratorsSid))
+            return false;
+    }
+    return true;
+}
+static bool IsElevated()
+{
+    if (!OperatingSystem.IsWindows()) return Environment.UserName == "root";
+    using var identity = System.Security.Principal.WindowsIdentity.GetCurrent();
+    return new System.Security.Principal.WindowsPrincipal(identity).IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator);
+}
 static ProcessStartInfo Child(string mode)
 {
     var start = new ProcessStartInfo(Environment.ProcessPath!);
@@ -427,7 +694,7 @@ static ProcessStartInfo Child(string mode)
 }
 static FirewallWorkerService Worker(FakeCommands commands, params string[] ports)
     => WorkerWithPrefix(commands, "MFA_Temp_", ports);
-static FirewallWorkerService WorkerWithPrefix(FakeCommands commands, string prefix, params string[] ports)
+static FirewallWorkerService WorkerWithPrefix(IFirewallCommands commands, string prefix, params string[] ports)
 {
     if (ports.Length == 0) ports = new[] { "22/TCP" };
     var entries = ports.Select((port, index) => new KeyValuePair<string, string?>($"BouncerConfig:AllowedPorts:{index}", port))
@@ -454,6 +721,10 @@ sealed class FakeCommands : IFirewallCommands
     public bool IgnoreInsert { get; init; }
     public bool FailDelete { get; init; }
     public bool IgnoreDelete { get; init; }
+    // Fail only the deletion of rules whose line contains this text (Linux).
+    public string? FailDeleteMatching { get; init; }
+    // What the Windows expiry script prints, line by line (REMOVED|, FAILED|, UNPARSEABLE|).
+    public string SweeperOutput { get; init; } = "";
     public List<string> Rules { get; } = new();
     public List<string> Rules6 { get; } = new();
     public HashSet<string> WindowsNames { get; } = new();
@@ -465,7 +736,7 @@ sealed class FakeCommands : IFirewallCommands
         if (script.Contains("Remove-NetFirewallRule"))
         {
             if (FailDelete) throw new InvalidOperationException("Expired rule remains after deletion");
-            return "";
+            return SweeperOutput;
         }
         if (script.Contains("New-NetFirewallRule"))
         {
@@ -488,6 +759,8 @@ sealed class FakeCommands : IFirewallCommands
         if (args.Length > 2 && args[0] == "-D" && args[1] == "INPUT")
         {
             if (FailDelete) throw new InvalidOperationException("Command failed with code 1");
+            if (FailDeleteMatching != null && string.Join(' ', args).Contains(FailDeleteMatching))
+                throw new InvalidOperationException("Command failed with code 1");
             // Delete only on an exact match of the parsed rule, as iptables -D does.
             if (!IgnoreDelete)
                 rules.RemoveAll(r => LinuxIptables.SplitRuleLine(r).Skip(2).SequenceEqual(args.Skip(2)));

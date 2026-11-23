@@ -26,6 +26,14 @@ using System.Text.RegularExpressions;
 
 Directory.SetCurrentDirectory(AppContext.BaseDirectory);
 
+// Format and parse with the invariant culture everywhere. Log timestamps, log file names (and
+// the dates their 90-day cleanup reads back), and the expiry stored in Windows firewall rules all
+// use .NET format strings, in which ':' is the culture's time separator and 'yyyy' is the year in
+// the culture's calendar. On a Finnish or Thai system those differ, which once left Windows grants
+// that the sweeper could never parse, and so never removed.
+System.Globalization.CultureInfo.DefaultThreadCurrentCulture = System.Globalization.CultureInfo.InvariantCulture;
+System.Globalization.CultureInfo.CurrentCulture = System.Globalization.CultureInfo.InvariantCulture;
+
 // Handle informational flags before anything starts. Without this every argument was silently
 // ignored and the service ran regardless, so `MFAService --version` -- an entirely reasonable
 // thing for an operator to type -- started a second privileged instance instead of printing a
@@ -63,6 +71,7 @@ if (args.Length > 0)
 }
 
 var builder = Host.CreateApplicationBuilder(args);
+ConfigFiles.UseAppSettingsJsonOnly(builder.Configuration);   // see Shared/ConfigFiles.cs
 ServiceLogger.SetMinLevel(builder.Configuration["Logging:AppMinLevel"]);
 
 var _asm = Assembly.GetExecutingAssembly();
@@ -172,13 +181,80 @@ internal static class ServiceLogger
             lock (_lock)
             {
                 DeleteExpiredLogs("mfaservice_");
-                File.AppendAllText(path, entry + Environment.NewLine);
+                var writer = DailyWriter(path);
+                try
+                {
+                    // MFAAdmin, or a second MFAService instance starting up, may have appended
+                    // since; write at the current end.
+                    writer.BaseStream.Seek(0, SeekOrigin.End);
+                    writer.WriteLine(entry);
+                }
+                catch
+                {
+                    // The held file went wrong (truncated, say). Drop it, so the next line goes back
+                    // through the checks and a fresh open instead of failing for the rest of the day.
+                    var held = _dailyWriter;
+                    _dailyWriter = null;   // first: Dispose flushes, and can throw again
+                    try { held?.Dispose(); } catch { }
+                    throw;
+                }
             }
         }
         catch (Exception ex)
         {
             Console.WriteLine($"[LOG ERROR] Could not write to log file: {ex.Message}");
         }
+    }
+
+    // The web account can create files in the log directory, so before the first write to each
+    // day's file make sure it is this process's own (see Shared/PrivilegedLogFile.cs), then keep
+    // that file open and write through the handle for the rest of the day. Reopening it by name for
+    // each line would follow whatever is at the name by then: if the file were removed during the
+    // day, the web account could put a link there. Caller holds _lock. If it throws, this entry
+    // goes to the console only and the next write tries again.
+    private static string? _dailyRequested;
+    private static StreamWriter? _dailyWriter;
+    private static string? _pendingLogFileNote;
+
+    // The latest note about the log file (something set aside, a non-sticky directory), once: a
+    // planted file means the web account is misbehaving, which should not be visible only in a log
+    // it can see and crowd.
+    internal static string? TakeLogFileNote()
+    {
+        lock (_lock)
+        {
+            var note = _pendingLogFileNote;
+            _pendingLogFileNote = null;
+            return note;
+        }
+    }
+    private static StreamWriter DailyWriter(string path)
+    {
+        if (path == _dailyRequested && _dailyWriter != null) return _dailyWriter;
+        _dailyWriter?.Dispose();
+        _dailyWriter = null;
+        var (actual, note) = PrivilegedLogFile.Prepare(path);
+        // Checked just now and ours; in the sticky directory nobody else can replace it before this
+        // open. Shared for reading and writing -- anything else appending to the day's file seeks to
+        // the end first -- and for deletion (retention).
+        FileStream stream;
+        try { stream = new FileStream(actual, FileMode.Append, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete); }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // Held open by something else with no sharing, for instance. Do not stop logging.
+            string fallback = PrivilegedLogFile.CreateUnique(path);
+            note = (note == null ? "" : note + "; ") + $"could not open {Path.GetFileName(actual)} ({ex.Message}); writing to {Path.GetFileName(fallback)} instead";
+            stream = new FileStream(fallback, FileMode.Append, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete);
+        }
+        var writer = new StreamWriter(stream, new UTF8Encoding(false)) { AutoFlush = true };
+        if (note != null)
+        {
+            writer.WriteLine($"[{DateTime.UtcNow:yyyy-MM-dd HH:mm:ss} UTC] [WARN] [SECURITY] Log file: {SanitizeForLog(note)}");
+            _pendingLogFileNote = note;   // emailed by the sweeper's next pass
+        }
+        _dailyRequested = path;
+        _dailyWriter = writer;
+        return writer;
     }
 
     // Daily files are kept for LogRetentionDays, then deleted by the first write of a new UTC day.
@@ -196,7 +272,9 @@ internal static class ServiceLogger
         {
             foreach (var file in Directory.EnumerateFiles(LogDirectory, prefix + "*.log"))
             {
-                string datePart = Path.GetFileNameWithoutExtension(file).Substring(prefix.Length);
+                // The date is the first 10 characters after the prefix; a fallback file adds a suffix.
+                string rest = Path.GetFileNameWithoutExtension(file).Substring(prefix.Length);
+                string datePart = rest.Length >= 10 ? rest[..10] : rest;
                 if (DateTime.TryParseExact(datePart, "yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture,
                         System.Globalization.DateTimeStyles.None, out var day)
                     && day < today.AddDays(-LogRetentionDays))
@@ -580,14 +658,16 @@ public class FirewallWorkerService : BackgroundService
         }
     }
 
-    private bool SendIpcAlert(string subject, string body)
+    private bool SendIpcAlert(string subject, string body) => SendAlert("IPC", subject, body);
+
+    private bool SendAlert(string monitor, string subject, string body)
     {
         var host   = _config["Smtp:Host"];
         var from   = _config["Smtp:FromAddress"];
         var notify = _config["Smtp:NotifyAddress"];
         if (string.IsNullOrWhiteSpace(host) || string.IsNullOrWhiteSpace(from) || string.IsNullOrWhiteSpace(notify))
         {
-            ServiceLogger.Warn("[IPC] Smtp Host/FromAddress/NotifyAddress not fully configured - cannot send IPC alert.");
+            ServiceLogger.Warn($"[{monitor}] Smtp Host/FromAddress/NotifyAddress not fully configured - cannot send alert.");
             return false;
         }
 
@@ -601,7 +681,7 @@ public class FirewallWorkerService : BackgroundService
             using var msg = new MailMessage(from, notify)
             {
                 Subject = subject,
-                Body    = body + "\n\n-- MFAService IPC monitor"
+                Body    = body + $"\n\n-- MFAService {monitor} monitor"
             };
             // SmtpClient.Send is synchronous and defaults to a 100s timeout. This runs from the
             // startup path, where an unreachable relay is common, so cap it well below that.
@@ -610,12 +690,12 @@ public class FirewallWorkerService : BackgroundService
                 client.Credentials = new System.Net.NetworkCredential(user, pass);
 
             client.Send(msg);
-            ServiceLogger.Log($"[IPC] Alert email sent to {notify}: {subject}");
+            ServiceLogger.Log($"[{monitor}] Alert email sent to {notify}: {subject}");
             return true;
         }
         catch (Exception ex)
         {
-            ServiceLogger.Error($"[IPC] Failed to send alert email: {ex.Message}");
+            ServiceLogger.Error($"[{monitor}] Failed to send alert email: {ex.Message}");
             return false;
         }
     }
@@ -662,10 +742,21 @@ public class FirewallWorkerService : BackgroundService
 
             // Hold the lock across probe-unlink-bind so two starting instances cannot both
             // conclude the socket is stale and unlink each other's.
+            // 0600: taking the lock needs only an open file, so with the unit's UMask (0027) the
+            // file was readable by the mfaipc group -- and the web account could hold the lock
+            // while MFAService restarted, making every start look like a duplicate. /run is
+            // root-only, so nobody else can create the file first; tighten one an earlier version
+            // left behind as well.
             try
             {
-                instanceLock = new FileStream(lockPath, FileMode.OpenOrCreate,
-                                              FileAccess.ReadWrite, FileShare.None);
+                instanceLock = new FileStream(lockPath, new FileStreamOptions
+                {
+                    Mode = FileMode.OpenOrCreate,
+                    Access = FileAccess.ReadWrite,
+                    Share = FileShare.None,
+                    UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite,
+                });
+                File.SetUnixFileMode(lockPath, UnixFileMode.UserRead | UnixFileMode.UserWrite);
             }
             catch (IOException)
             {
@@ -1052,6 +1143,9 @@ public class FirewallWorkerService : BackgroundService
         }
         if (!System.Net.IPAddress.TryParse(ip, out var parsedIp))
             return "ERROR: Invalid IP address";
+        // An IPv4-mapped IPv6 address (::ffff:a.b.c.d) is an IPv4 client; grant it as IPv4, or the
+        // rule would go to the IPv6 table and never match its traffic. MFAWeb already converts it.
+        if (parsedIp.IsIPv4MappedToIPv6) parsedIp = parsedIp.MapToIPv4();
         ip = parsedIp.ToString();
         // Defense in depth: re-enforce the "external addresses only" policy on the
         // privileged side, so a compromised/bypassed MFAWeb cannot make SYSTEM open
@@ -1119,7 +1213,10 @@ public class FirewallWorkerService : BackgroundService
             // Serialize grants and expiry so the sweeper cannot delete a concurrently renewed rule.
             lock (_firewallLock)
             {
-                // 3. APPLY RULES FOR ALL CONFIGURED PORTS
+                // 3. VALIDATE EVERY CONFIGURED PORT, THEN APPLY THEM
+                // All entries are checked before any rule is written, so a bad later entry cannot
+                // leave the earlier ports open behind an ERROR reply.
+                var ports = new List<(int Port, string Protocol)>();
                 foreach (var portProto in allowedPorts)
                 {
                     var ppParts = portProto.Split('/');
@@ -1144,8 +1241,11 @@ public class FirewallWorkerService : BackgroundService
                         throw new InvalidOperationException($"Protocol in '{portProto}' must be TCP or UDP.");
                     }
 
-                    OpenFirewallPort(ip, port, username, protocol, expirationHours, ipv6PrefixLength);
+                    ports.Add((port, protocol));
                 }
+
+                foreach (var (port, protocol) in ports)
+                    OpenFirewallPort(ip, port, username, protocol, expirationHours, ipv6PrefixLength);
             }
 
             ServiceLogger.Log($"[IPC] Request completed in {sw.ElapsedMilliseconds}ms");
@@ -1211,7 +1311,9 @@ public class FirewallWorkerService : BackgroundService
     // -----------------------------------------------------------------------
     private void OpenFirewallPort(string ip, int port, string username, string protocol, int expirationHours, int ipv6PrefixLength)
     {
-        string expiresClean = DateTime.UtcNow.AddHours(expirationHours).ToString("yyyy-MM-dd HH:mm UTC");
+        // Invariant culture: ':' in a .NET format string is the culture's time separator, which is '.'
+        // in some locales -- and the sweeper parses this text to decide when the rule expires.
+        string expiresClean = DateTime.UtcNow.AddHours(expirationHours).ToString("yyyy-MM-dd HH:mm 'UTC'", System.Globalization.CultureInfo.InvariantCulture);
         string ruleName     = $"{_rulePrefix}{ip}_{port}_{protocol}";
         var fw = System.Diagnostics.Stopwatch.StartNew();
         ServiceLogger.Log($"[FIREWALL] Configuring rule: {ruleName}...");
@@ -1354,7 +1456,7 @@ public class FirewallWorkerService : BackgroundService
         string full   = $"$ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue'; Import-Module NetSecurity -ErrorAction Stop; {script}";
         string base64 = Convert.ToBase64String(Encoding.Unicode.GetBytes(full));
 
-        var psi = new ProcessStartInfo("powershell.exe",
+        var psi = new ProcessStartInfo(WindowsPowerShell.ExePath,
             $"-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand {base64}")
         {
             CreateNoWindow       = true,
@@ -1399,14 +1501,56 @@ public class FirewallWorkerService : BackgroundService
         }
 
         ServiceLogger.Log("[SWEEPER] Starting...");
-        try { SweepExpiredRules(); }
-        catch (Exception ex) { ServiceLogger.Error($"[SWEEPER ERROR] {ex.Message}"); }
+        SweepAndReport();
         using var timer = new PeriodicTimer(TimeSpan.FromMinutes(5));
 
         while (await timer.WaitForNextTickAsync(stoppingToken))
+            SweepAndReport();
+    }
+
+    // A failed pass is logged every time. Two in a row (ten minutes) also send an email, at most
+    // once a day: a rule that cannot be removed stays open past its expiry, which is exactly the
+    // standing access this service exists to prevent, so it must not be visible only in a log.
+    // A single failure is not emailed, since a briefly held firewall lock can cause one.
+    private int _consecutiveSweepFailures;
+    private DateTime _lastSweepAlertUtc = DateTime.MinValue;
+
+    private DateTime _lastLogFileAlertUtc = DateTime.MinValue;
+
+    private void SweepAndReport()
+    {
+        string? logNote = ServiceLogger.TakeLogFileNote();
+        if (logNote != null && DateTime.UtcNow - _lastLogFileAlertUtc > TimeSpan.FromHours(24))
         {
-            try { SweepExpiredRules(); }
-            catch (Exception ex) { ServiceLogger.Error($"[SWEEPER ERROR] {ex.Message}"); }
+            bool sent = SendAlert("LOGFILE", $"[MFA] Problem with MFAService's log file on {Environment.MachineName}",
+                "MFAService found something wrong with its log file or directory:\n\n" + logNote +
+                "\n\nA file it did not create, at a log file's name, was most likely put there by the web " +
+                "account (MFAWeb), which can create files in the log directory. Check MFAWeb. A directory " +
+                "that is not sticky should be mode 3770 (INSTALL.md); running MFAAdmin as root restores it. " +
+                "This email is sent at most once a day; every occurrence is in the log.");
+            if (sent) _lastLogFileAlertUtc = DateTime.UtcNow;
+        }
+
+        try
+        {
+            SweepExpiredRules();
+            _consecutiveSweepFailures = 0;
+        }
+        catch (Exception ex)
+        {
+            _consecutiveSweepFailures++;
+            ServiceLogger.Error($"[SWEEPER ERROR] {ex.Message}");
+            if (_consecutiveSweepFailures >= 2 && DateTime.UtcNow - _lastSweepAlertUtc > TimeSpan.FromHours(24))
+            {
+                // The daily throttle starts only once an email actually went out, so a mail
+                // failure does not silence the alert for a day.
+                bool sent = SendAlert("SWEEPER", $"[MFA] Firewall rules are not being expired on {Environment.MachineName}",
+                    $"The firewall sweeper has failed {_consecutiveSweepFailures} passes in a row. Rules it " +
+                    "cannot remove stay open past their expiry.\n\nLatest error:\n" + ex.Message +
+                    "\n\nCheck 'MFAAdmin diag' and remove any expired rule by hand. Further failures are " +
+                    "logged on every pass; this email is sent at most once a day.");
+                if (sent) _lastSweepAlertUtc = DateTime.UtcNow;
+            }
         }
     }
 
@@ -1420,38 +1564,92 @@ public class FirewallWorkerService : BackgroundService
     {
         ServiceLogger.Log("[SWEEPER] Checking for expired rules...");
 
+        // Each rule is handled on its own: a rule that cannot be deleted, or one that carries the
+        // prefix but no readable expiry, is recorded and the pass carries on with the rest.
+        // Stopping at the first failure left every later rule open, pass after pass. Failures are
+        // reported together at the end (RunSweeperAsync logs them and alerts by email).
+        var problems = new List<string>();
+        int removed = 0;
+
         if (_commands.IsWindows)
         {
+            // The expiry in the rule description is written with the invariant culture (see
+            // OpenFirewallPort). Older versions used the system culture, whose time separator is
+            // '.' in some locales (fi-FI, da-DK, id-ID), so accept either and normalize; such a
+            // rule used to match nothing and was never removed.
+            //
+            // An expiry further ahead than MaxExpirationHours (plus an hour of slack) cannot have
+            // been written by this version, so it is removed too: a rule from an older version on
+            // a non-Gregorian system calendar (th-TH wrote the year as 2569), or an altered
+            // description, would otherwise stay open indefinitely.
+            //
+            // Rules are removed first and then checked with one listing, made with errors stopping
+            // the script, so a failed lookup is a failure rather than taken to mean the rules are
+            // gone. (Listing after every removal made a large batch overrun the command timeout.)
             string reaperScript = $@"
                 $rules = Get-NetFirewallRule -ErrorAction Stop | Where-Object {{ $_.DisplayName -like '{_rulePrefix}*' }}
-                $nowUtcString = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm')
+                $nowUtc = (Get-Date).ToUniversalTime()
+                $nowUtcString = $nowUtc.ToString('yyyy-MM-dd HH:mm', [cultureinfo]::InvariantCulture)
+                $maxUtcString = $nowUtc.AddHours({MaxExpirationHours + 1}).ToString('yyyy-MM-dd HH:mm', [cultureinfo]::InvariantCulture)
+                $removed = @()
 
                 foreach ($rule in $rules) {{
-                    if ($rule.Description -match 'Exp:\s*(\d{{4}}-\d{{2}}-\d{{2}}\s\d{{2}}:\d{{2}})') {{
-                        $expString = $matches[1]
-                        if ($nowUtcString -ge $expString) {{
-                            Remove-NetFirewallRule -Name $rule.Name -ErrorAction Stop
-                            if (Get-NetFirewallRule -ErrorAction Stop | Where-Object {{ $_.Name -eq $rule.Name }}) {{
-                                throw ('Expired rule remains after deletion: ' + $rule.Name)
+                    if ($rule.Description -match 'Exp:\s*(\d{{4}}-\d{{2}}-\d{{2}}\s\d{{2}})[:.](\d{{2}})') {{
+                        $expString = $matches[1] + ':' + $matches[2]
+                        $beyondMax = $expString -gt $maxUtcString
+                        if ($nowUtcString -ge $expString -or $beyondMax) {{
+                            try {{
+                                Remove-NetFirewallRule -Name $rule.Name -ErrorAction Stop
+                                $removed += ,@($rule, $beyondMax, $expString)
+                            }} catch {{
+                                Write-Output ('FAILED|' + $rule.DisplayName + '|' + $_.Exception.Message)
                             }}
-                            Write-Output $rule.DisplayName
+                        }}
+                    }} else {{
+                        Write-Output ('UNPARSEABLE|' + $rule.DisplayName)
+                    }}
+                }}
+
+                if ($removed.Count -gt 0) {{
+                    $still = @(Get-NetFirewallRule -ErrorAction Stop | ForEach-Object {{ $_.Name }})
+                    foreach ($entry in $removed) {{
+                        $rule = $entry[0]
+                        if ($still -contains $rule.Name) {{
+                            Write-Output ('FAILED|' + $rule.DisplayName + '|the rule remains after deletion')
+                        }} elseif ($entry[1]) {{
+                            Write-Output ('BEYONDMAX|' + $rule.DisplayName + '|' + $entry[2])
+                        }} else {{
+                            Write-Output ('REMOVED|' + $rule.DisplayName)
                         }}
                     }}
                 }}
             ";
 
             string results = _commands.PowerShell(reaperScript).Trim();
-
-            if (!string.IsNullOrWhiteSpace(results))
+            foreach (string line in results.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
             {
-                var removed = results.Split(new[] { Environment.NewLine }, StringSplitOptions.RemoveEmptyEntries);
-                foreach (var rule in removed)
-                    ServiceLogger.Log($"[SWEEPER] Expired rule removed: {rule}");
-                ServiceLogger.Log($"[SWEEPER] Done. Removed {removed.Length} rule(s).");
-            }
-            else
-            {
-                ServiceLogger.Log("[SWEEPER] No expired rules found.");
+                string[] parts = line.Split('|', 3);
+                switch (parts[0])
+                {
+                    case "REMOVED" when parts.Length >= 2:
+                        ServiceLogger.Log($"[SWEEPER] Expired rule removed: {parts[1]}");
+                        removed++;
+                        break;
+                    case "BEYONDMAX" when parts.Length >= 2:
+                        ServiceLogger.Warn($"[SWEEPER] Removed rule {parts[1]}: its expiry ({(parts.Length > 2 ? parts[2] : "?")}) is " +
+                                           $"more than {MaxExpirationHours} hours ahead, which this version never writes.");
+                        removed++;
+                        break;
+                    case "FAILED" when parts.Length >= 2:
+                        problems.Add($"could not remove expired rule {parts[1]}: {(parts.Length > 2 ? parts[2] : "unknown error")}");
+                        break;
+                    case "UNPARSEABLE" when parts.Length >= 2:
+                        problems.Add($"rule {parts[1]} has the prefix but no readable expiry, so it is never removed");
+                        break;
+                    default:
+                        problems.Add($"unexpected sweeper output: {line}");
+                        break;
+                }
             }
         }
         else
@@ -1459,26 +1657,55 @@ public class FirewallWorkerService : BackgroundService
             // Linux: parse both 'iptables -S INPUT' (IPv4) and 'ip6tables -S INPUT' (IPv6) and
             // delete any of our rules whose stored expiry epoch has passed. Grants can land in
             // either table depending on the client's address family, so both must be swept every
-            // pass. Update these commands if your distro uses nftables, ufw, or firewalld instead.
+            // pass, and a failure in one must not skip the other. Update these commands if your
+            // distro uses nftables, ufw, or firewalld instead.
             long nowEpoch = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-            int  count    = 0;
+            // iptables quotes a comment only when it has a space, so match both forms.
+            string prefixComment = $"--comment \"{_rulePrefix}", prefixCommentBare = $"--comment {_rulePrefix}";
 
             foreach (string table in LinuxIptables.Tables)
             {
-                string rules = _commands.Iptables(table, "-S", "INPUT");
+                string rules;
+                try { rules = _commands.Iptables(table, "-S", "INPUT"); }
+                catch (Exception ex) { problems.Add($"could not list {table} rules: {ex.Message}"); continue; }
+
                 foreach (string line in rules.Split('\n', StringSplitOptions.RemoveEmptyEntries))
                 {
-                    if (!TryGetManagedRule(line, out var name, out var expiry) || nowEpoch < expiry) continue;
-                    DeleteLinuxRule(table, line);
-                    ServiceLogger.Log($"[SWEEPER] Expired {table} rule removed: {name}");
-                    count++;
+                    if (!TryGetManagedRule(line, out var name, out var expiry))
+                    {
+                        if (line.TrimStart().StartsWith("-A INPUT ", StringComparison.Ordinal) && (line.Contains(prefixComment, StringComparison.Ordinal) || line.Contains(prefixCommentBare, StringComparison.Ordinal)))
+                            problems.Add($"{table} rule has the prefix but no readable expiry, so it is never removed: {line.Trim()}");
+                        continue;
+                    }
+                    // An expiry further ahead than MaxExpirationHours (plus an hour of slack) was
+                    // not written by this version -- an altered comment -- so remove it too.
+                    bool beyondMax = expiry > nowEpoch + (MaxExpirationHours + 1) * 3600L;
+                    if (nowEpoch < expiry && !beyondMax) continue;
+                    try
+                    {
+                        DeleteLinuxRule(table, line);
+                        if (beyondMax)
+                            ServiceLogger.Warn($"[SWEEPER] Removed {table} rule {name}: its expiry is more than " +
+                                               $"{MaxExpirationHours} hours ahead, which this version never writes.");
+                        else
+                            ServiceLogger.Log($"[SWEEPER] Expired {table} rule removed: {name}");
+                        removed++;
+                    }
+                    catch (Exception ex)
+                    {
+                        problems.Add($"could not remove expired {table} rule {name}: {ex.Message}");
+                    }
                 }
             }
-
-            ServiceLogger.Log(count > 0
-                ? $"[SWEEPER] Done. Removed {count} rule(s)."
-                : "[SWEEPER] No expired rules found.");
         }
+
+        if (problems.Count > 0)
+            throw new InvalidOperationException(
+                $"{problems.Count} problem(s); removed {removed} rule(s). " + string.Join("; ", problems));
+
+        ServiceLogger.Log(removed > 0
+            ? $"[SWEEPER] Done. Removed {removed} rule(s)."
+            : "[SWEEPER] No expired rules found.");
     }
 
     // iptables -S quotes comments containing spaces. Match the complete generated comment,
@@ -1513,44 +1740,13 @@ public class DatabaseLockService : BackgroundService
     private static byte[] Entropy = Array.Empty<byte>();
 
     // Cross-process lock shared by MFAService and MFAAdmin, the only two writers, to serialize
-    // their writes. MFAWeb never writes the store and does not take it. On Windows it is a named
-    // mutex, ACL-restricted so only SYSTEM, Builtin Administrators, and the gMSA can acquire it,
-    // created in the constructor so the service account name comes from appsettings. On Linux it
-    // is a lock file beside the database; see Shared/LinuxDbLock.cs for why not a mutex.
-    private static System.Threading.Mutex? _dbMutex;
-
+    // their writes: a lock file beside the database on both platforms (Shared/DbFileLock.cs,
+    // which also says why it is no longer a named mutex). MFAWeb never writes the store and does
+    // not take it.
     public DatabaseLockService(IConfiguration config)
     {
         // Required and validated on Windows only; see Shared/DpapiEntropy.cs.
         Entropy = DpapiEntropy.Load(config);
-        if (OperatingSystem.IsWindows())
-            _dbMutex ??= CreateSecureDbMutex(config["FirewallService:GmsaAccount"]);
-    }
-
-    [SupportedOSPlatform("windows")]
-    private static System.Threading.Mutex CreateSecureDbMutex(string? serviceAccount)
-    {
-        const string mutexName = @"Global\MFA_DB_LOCK";
-
-        var security = new MutexSecurity();
-
-        // SYSTEM — full control
-        security.AddAccessRule(new MutexAccessRule(
-            new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null),
-            MutexRights.FullControl, AccessControlType.Allow));
-
-        // Builtin Administrators — covers MFAAdmin running elevated
-        security.AddAccessRule(new MutexAccessRule(
-            new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null),
-            MutexRights.FullControl, AccessControlType.Allow));
-
-        // gMSA service account — runs MFAWeb and MFAService
-        if (!string.IsNullOrWhiteSpace(serviceAccount))
-            security.AddAccessRule(new MutexAccessRule(
-                new NTAccount(serviceAccount),
-                MutexRights.FullControl, AccessControlType.Allow));
-
-        return MutexAcl.Create(false, mutexName, out _, security);
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -1675,7 +1871,7 @@ public class DatabaseLockService : BackgroundService
     private static void SaveUsers(List<UserEntry> users)
     {
         // Clear ReadOnly before writing; restore it immediately after.
-        // The caller always holds the cross-process mutex, so no other writer
+        // The caller always holds the cross-process lock, so no other writer
         // can race between the attribute clear and the attribute restore.
         if (File.Exists(DbPath))
         {
@@ -1772,8 +1968,12 @@ public class DatabaseLockService : BackgroundService
                 "CONSUME_TOTP"        when parts.Length == 4 => TotpReplayProtection.Consume(
                     parts[1].Trim(), parts[2].Trim(), parts[3].Trim(),
                     AcquireDbLock, LoadUsers, SaveUsers, DateTimeOffset.UtcNow),
-#endif
+                // Mints a registration-ready token after a TOTP login. Only the TOTP build's
+                // /auth route calls it, so the passkey-only build has no such verb: in that build
+                // it would let a compromised MFAWeb enrol its own passkey on any account that
+                // does not have one yet.
                 "SET_PASSKEY_TOKEN"   when parts.Length == 4 => SetPasskeyToken(parts[1].Trim(), parts[2].Trim(), parts[3].Trim()),
+#endif
                 "RENEW_PASSKEY_TOKEN" when parts.Length == 2 => RenewPasskeyToken(parts[1].Trim()),
                 "UPDATE_SIGN_COUNT"   when parts.Length == 3 => UpdateSignCount(parts[1].Trim(), parts[2].Trim()),
                 "ADD_PASSKEY"         when parts.Length == 5 => AddPasskey(parts[1].Trim(), parts[2].Trim(), parts[3].Trim(), parts[4].Trim()),
@@ -1846,10 +2046,23 @@ public class DatabaseLockService : BackgroundService
         return newToken;
     }
 
+#if ALLOW_TOTP
+    // MFAWeb mints a 32-byte base64url token valid for 10 minutes; accept nothing weaker or longer.
+    private static readonly TimeSpan MaxPostLoginTokenLifetime = TimeSpan.FromMinutes(10);
+    private static readonly Regex PostLoginTokenPattern = new(@"^[A-Za-z0-9_-]{43,128}\z");
+
     private static string SetPasskeyToken(string username, string pkToken, string expiresUtcIso)
     {
-        if (!DateTime.TryParse(expiresUtcIso, null, System.Globalization.DateTimeStyles.RoundtripKind, out var expiresUtc))
+        if (!PostLoginTokenPattern.IsMatch(pkToken))
+            return "ERROR: Invalid token";
+        if (!DateTime.TryParse(expiresUtcIso, System.Globalization.CultureInfo.InvariantCulture,
+                System.Globalization.DateTimeStyles.RoundtripKind, out var expiresUtc))
             return "ERROR: Invalid expiry date";
+        expiresUtc = expiresUtc.ToUniversalTime();
+        if (expiresUtc <= DateTime.UtcNow)
+            return "ERROR: Invalid expiry date";
+        if (expiresUtc > DateTime.UtcNow + MaxPostLoginTokenLifetime)
+            expiresUtc = DateTime.UtcNow + MaxPostLoginTokenLifetime;
 
         using var lk = AcquireDbLock();
         if (lk == null) return "ERROR: DB lock timeout";
@@ -1866,6 +2079,7 @@ public class DatabaseLockService : BackgroundService
         ServiceLogger.Log($"[DB] Passkey provisioning token set for '{username}'");
         return "SUCCESS";
     }
+#endif
 
     private static string UpdateSignCount(string credentialId, string newCountStr)
     {
@@ -1920,14 +2134,22 @@ public class DatabaseLockService : BackgroundService
         var user = users.FirstOrDefault(u => TokenEquals(u.PasskeyProvisioningToken, provToken));
         if (user == null || user.PasskeyProvisioningExpiresUtc == null || DateTime.UtcNow > user.PasskeyProvisioningExpiresUtc)
             return "ERROR: Provisioning token not found or expired";
-        // Authoritative gate: an emailed provisioning token is not registration-ready
+        // Gate in the database writer: an emailed provisioning token is not registration-ready
         // until the password has been verified (RenewPasskeyToken) or it was minted
-        // post-login (SetPasskeyToken). Blocks registering a passkey straight from an
-        // intercepted email link without the password.
+        // post-login (SetPasskeyToken, TOTP build only). Blocks registering a passkey from a
+        // leaked copy of the emailed link without the password. (The password is in the same
+        // email, so this does not protect against a compromised mailbox; see INSTALL.md.)
         if (!user.PasskeyRegistrationReady)
         {
             ServiceLogger.Warn($"[DB] Rejected passkey registration for '{user.Username}': token not password-verified");
             return "ERROR: Registration not authorized";
+        }
+        // One passkey per account, enforced here as well as where tokens are minted: this is the
+        // write that adds the credential, so it must not rely on an earlier check alone.
+        if (user.PasskeyCredentials.Count > 0)
+        {
+            ServiceLogger.Warn($"[DB] Rejected passkey registration for '{user.Username}': account already has a passkey");
+            return "ERROR: User already has passkeys";
         }
 
         // MFAWeb already checks this, but against an earlier LoadUsers snapshot -- two
@@ -1962,39 +2184,19 @@ public class DatabaseLockService : BackgroundService
 
     private static IDisposable? AcquireDbLock()
     {
-        if (!OperatingSystem.IsWindows())
+        try { return DbFileLock.TryAcquire(DbPath, TimeSpan.FromSeconds(10)); }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            try { return LinuxDbLock.TryAcquire(DbPath, TimeSpan.FromSeconds(10)); }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-            {
-                ServiceLogger.Error($"[DB LOCK] Could not open the database lock file: {ex.Message}");
-                return null;
-            }
+            ServiceLogger.Error($"[DB LOCK] Could not open the database lock file: {ex.Message}");
+            return null;
         }
-        try
-        {
-            if (!_dbMutex!.WaitOne(TimeSpan.FromSeconds(10))) return null;
-        }
-        catch (AbandonedMutexException)
-        {
-            // A prior process crashed while holding the lock; Windows transferred ownership to us.
-            ServiceLogger.Warn("[DB LOCK] Mutex was abandoned by a prior process - ownership transferred, proceeding.");
-        }
-        return new DbLock(_dbMutex!);
-    }
-
-    private sealed class DbLock : IDisposable
-    {
-        readonly Mutex _m;
-        internal DbLock(Mutex m) => _m = m;
-        public void Dispose() => _m.ReleaseMutex();
     }
 
 }
 
 #if ALLOW_TOTP
-// Keep the read/check/write in one synchronous critical section: Mutex ownership is
-// thread-affine, and two requests must never both accept the same or an older step.
+// Keep the read/check/write in one synchronous critical section: two requests must never both
+// accept the same or an older step.
 // The callbacks use the existing authoritative DB lock and atomic, flushed save.
 internal static class TotpReplayProtection
 {
@@ -2290,9 +2492,9 @@ public class UserEntry
     public string? PasskeyProvisioningToken { get; set; }
     public DateTime? PasskeyProvisioningExpiresUtc { get; set; }
     // True only after the password has been verified (RenewPasskeyToken) or for a
-    // token minted post-login (SetPasskeyToken). The emailed provisioning token is
-    // NOT registration-ready. AddPasskey enforces this so an intercepted email link
-    // cannot register a credential without passing the password gate.
+    // token minted post-login (SetPasskeyToken, TOTP build only). The emailed provisioning
+    // token is NOT registration-ready. AddPasskey enforces this so a leaked copy of the link
+    // alone cannot register a credential without passing the password gate.
     public bool PasskeyRegistrationReady { get; set; } = false;
 }
 

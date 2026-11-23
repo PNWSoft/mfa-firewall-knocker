@@ -131,10 +131,25 @@ try
         Assert(threw, "A failed save returned success.");
         Assert(store.ReadUser().LastAcceptedTotpTimeStep == null, "Failed persistence changed the on-disk record.");
     });
+    Run("the post-login passkey token verb rejects weak tokens and expiries before any database access", () =>
+    {
+        string expiry = DateTime.UtcNow.AddMinutes(5).ToString("O");
+        foreach (string token in new[] { "", "short", new string('a', 42), new string('a', 43) + "!", new string('a', 129) })
+            Assert(DatabaseLockService.ProcessDbRequest($"SET_PASSKEY_TOKEN|user@example.test|{token}|{expiry}") == "ERROR: Invalid token",
+                $"A malformed token was accepted: '{token}'.");
+        string good = new string('a', 43);
+        Assert(DatabaseLockService.ProcessDbRequest($"SET_PASSKEY_TOKEN|user@example.test|{good}|{DateTime.UtcNow.AddMinutes(-1):O}") == "ERROR: Invalid expiry date",
+            "An expiry in the past was accepted.");
+        Assert(DatabaseLockService.ProcessDbRequest($"SET_PASSKEY_TOKEN|user@example.test|{good}|not-a-date") == "ERROR: Invalid expiry date",
+            "An unparseable expiry was accepted.");
+    });
 #else
     Run("the default service rejects the optional TOTP consume command", () =>
         Assert(DatabaseLockService.ProcessDbRequest("CONSUME_TOTP|user@example.test|123|fingerprint") == "ERROR: Unknown DB command",
             "The passkey-only service exposed a TOTP command."));
+    Run("the default service has no post-login passkey token verb", () =>
+        Assert(DatabaseLockService.ProcessDbRequest($"SET_PASSKEY_TOKEN|user@example.test|{new string('a', 43)}|{DateTime.UtcNow.AddMinutes(5):O}") == "ERROR: Unknown DB command",
+            "The passkey-only service still accepts SET_PASSKEY_TOKEN, which only the TOTP build needs."));
 #endif
 
     Console.WriteLine($"PASS: {passed} replay protection regression checks.");

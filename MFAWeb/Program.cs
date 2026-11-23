@@ -34,14 +34,38 @@ using System.Reflection;
 
 Directory.SetCurrentDirectory(AppContext.BaseDirectory);
 
+// Format and parse with the invariant culture everywhere. Log timestamps, log file names (and
+// the dates their 90-day cleanup reads back), and the expiry stored in Windows firewall rules all
+// use .NET format strings, in which ':' is the culture's time separator and 'yyyy' is the year in
+// the culture's calendar. On a Finnish or Thai system those differ, which once left Windows grants
+// that the sweeper could never parse, and so never removed.
+System.Globalization.CultureInfo.DefaultThreadCurrentCulture = System.Globalization.CultureInfo.InvariantCulture;
+System.Globalization.CultureInfo.CurrentCulture = System.Globalization.CultureInfo.InvariantCulture;
+
 var builder = WebApplication.CreateBuilder(args);
+ConfigFiles.UseAppSettingsJsonOnly(builder.Configuration);   // see Shared/ConfigFiles.cs
 
 // --- Security: Rate Limiting ---
 int rateLimitPerWindow = builder.Configuration.GetValue<int>("RateLimitPerWindow", 20);
-// Backstop across every partition combined, so partitioning (see RateLimitPartitionKey below)
-// isn't the only thing standing between the login endpoints and a flood. Deliberately generous --
-// sized well above what a real login burst from a few legitimate users would produce.
+// Backstop across every partition combined, so partitioning (see RateLimitKeys below) isn't the
+// only thing standing between the login endpoints and a flood. It is also the one limit every
+// user shares: the higher it is, the more sources it takes to use it up.
+// - Passkey-only build: passkey sign-in cannot be guessed, so the cap bounds password-hashing
+//   work, and a generous 2000 keeps it hard to exhaust.
+// - TOTP build: the cap is what bounds distributed guessing of a 6-digit code once a password is
+//   known (no lockout, by design), so it defaults to 200 there. With 3 valid codes in a million,
+//   enough sources to use the whole cap have an even chance of a correct code within about ten
+//   hours at 2000, and within about four days at 200. Failed attempts are logged and alerted.
+#if ALLOW_TOTP
 int globalRateLimitPerWindow = builder.Configuration.GetValue<int>("GlobalRateLimitPerWindow", 200);
+#else
+int globalRateLimitPerWindow = builder.Configuration.GetValue<int>("GlobalRateLimitPerWindow", 2000);
+#endif
+// Per IPv6 /48 (256 of the /56s each source is keyed on), a multiple of the per-source limit: a
+// /48 is cheap to obtain from many hosting providers, and without this tier it would get 256
+// separate per-source budgets. Ten times, not less: cellular carriers often give each device a
+// /64 out of a shared /48, so unrelated users can share this budget.
+int ipv6NetworkRateLimitPerWindow = rateLimitPerWindow * 10;
 // Per-source cap for requests outside the app's routes (static files, unmatched paths, wrong
 // methods). One login page load includes a handful of static files,
 // and several users behind one NAT address share the budget, so it sits well above
@@ -51,62 +75,59 @@ builder.Services.AddRateLimiter(options =>
 {
     options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
 
-    // The shared backstop covers the app's own routes only -- those carrying LoginRateLimit, which
-    // also limits each source. Everything else gets a per-source budget of its own: static files,
-    // unmatched paths, and a known path with the wrong method (routing gives that a synthetic
-    // "405" endpoint with no rate-limit metadata, so "has an endpoint" alone is not enough). When
-    // any of these drew from the shared bucket, one source could 429 every user's login. So
-    // draining the shared bucket takes at least globalRateLimitPerWindow / rateLimitPerWindow
-    // distinct sources.
-    options.GlobalLimiter = System.Threading.RateLimiting.PartitionedRateLimiter.Create<HttpContext, string>(httpContext =>
-        httpContext.GetEndpoint()?.Metadata.GetMetadata<Microsoft.AspNetCore.RateLimiting.EnableRateLimitingAttribute>() != null
-            ? RateLimitPartition.GetFixedWindowLimiter("global", _ =>
-                new FixedWindowRateLimiterOptions
-                {
-                    PermitLimit = globalRateLimitPerWindow,
-                    Window = TimeSpan.FromMinutes(5),
-                    QueueLimit = 0
-                })
-            : RateLimitPartition.GetFixedWindowLimiter("static:" + RateLimitPartitionKey(httpContext.Connection.RemoteIpAddress), _ =>
-                new FixedWindowRateLimiterOptions
-                {
-                    PermitLimit = StaticRateLimitPerWindow,
-                    Window = TimeSpan.FromMinutes(5),
-                    QueueLimit = 0
-                }));
+    // All limiting happens here, as a chain: each source's own limit first; then, for the app's own
+    // routes only, the source's IPv6 /48 and the shared backstop. A chained limiter stops at the
+    // first limiter that refuses, so a request refused by an earlier limit never draws on the
+    // later, wider ones.
+    //
+    // That order is the point. The shared bucket used to be the global limiter and each source's
+    // limit the endpoint policy, and ASP.NET Core acquires the global limiter first; fixed-window
+    // permits are not returned when a later limiter refuses. So one source, over its own limit
+    // and receiving nothing but 429s, still drained the shared bucket and kept every other user
+    // from signing in.
+    //
+    // "The app's own routes" are those carrying the LoginRateLimit policy. Everything else --
+    // static files, unmatched paths, a known path with the wrong method (routing gives that a
+    // synthetic "405" endpoint with no rate-limit metadata, so "has an endpoint" alone is not
+    // enough) -- gets a per-source budget of its own and never touches the shared bucket.
+    //
+    // Always the TCP connection's remote address -- never X-Forwarded-For or X-Real-IP. Trusting
+    // proxy headers would let an attacker spoof their address and bypass both this and the
+    // public-IP enforcement below. MFAWeb is deployed directly on the internet without a reverse
+    // proxy, so Connection.RemoteIpAddress is always the true client address.
+    static bool IsAppRoute(HttpContext httpContext) =>
+        httpContext.GetEndpoint()?.Metadata.GetMetadata<Microsoft.AspNetCore.RateLimiting.EnableRateLimitingAttribute>() != null;
 
-    options.AddPolicy("LoginRateLimit", httpContext =>
+    var perSource = System.Threading.RateLimiting.PartitionedRateLimiter.Create<HttpContext, string>(httpContext =>
     {
-        // Always use the TCP connection's remote address — never X-Forwarded-For or
-        // X-Real-IP headers.  Trusting proxy headers would allow an attacker to spoof
-        // their IP and bypass rate limiting and the public-IP enforcement below.
-        // By design, MFAWeb is deployed directly on the internet without a reverse
-        // proxy so that Connection.RemoteIpAddress is always the true client address.
-        string clientIp = RateLimitPartitionKey(httpContext.Connection.RemoteIpAddress);
-
-        return RateLimitPartition.GetFixedWindowLimiter(clientIp, _ =>
-            new FixedWindowRateLimiterOptions
-            {
-                PermitLimit = rateLimitPerWindow,
-                Window = TimeSpan.FromMinutes(5),
-                QueueLimit = 0
-            });
+        string source = RateLimitKeys.Source(httpContext.Connection.RemoteIpAddress);
+        return IsAppRoute(httpContext)
+            ? RateLimitPartition.GetFixedWindowLimiter("app:" + source, _ =>
+                new FixedWindowRateLimiterOptions { PermitLimit = rateLimitPerWindow, Window = TimeSpan.FromMinutes(5), QueueLimit = 0 })
+            : RateLimitPartition.GetFixedWindowLimiter("static:" + source, _ =>
+                new FixedWindowRateLimiterOptions { PermitLimit = StaticRateLimitPerWindow, Window = TimeSpan.FromMinutes(5), QueueLimit = 0 });
     });
+    var perIpv6Network = System.Threading.RateLimiting.PartitionedRateLimiter.Create<HttpContext, string>(httpContext =>
+    {
+        string? network = RateLimitKeys.Ipv6Network(httpContext.Connection.RemoteIpAddress);
+        return IsAppRoute(httpContext) && network != null
+            ? RateLimitPartition.GetFixedWindowLimiter("net:" + network, _ =>
+                new FixedWindowRateLimiterOptions { PermitLimit = ipv6NetworkRateLimitPerWindow, Window = TimeSpan.FromMinutes(5), QueueLimit = 0 })
+            : RateLimitPartition.GetNoLimiter("no-ipv6-network");
+    });
+    var shared = System.Threading.RateLimiting.PartitionedRateLimiter.Create<HttpContext, string>(httpContext =>
+        IsAppRoute(httpContext)
+            ? RateLimitPartition.GetFixedWindowLimiter("shared", _ =>
+                new FixedWindowRateLimiterOptions { PermitLimit = globalRateLimitPerWindow, Window = TimeSpan.FromMinutes(5), QueueLimit = 0 })
+            : RateLimitPartition.GetNoLimiter("not-an-app-route"));
+    options.GlobalLimiter = System.Threading.RateLimiting.PartitionedRateLimiter.CreateChained(perSource, perIpv6Network, shared);
+
+    // The policy marks the app's own routes (see IsAppRoute); it limits nothing itself, since
+    // the chain above already applies both limits. Every mapped route must keep
+    // .RequireRateLimiting("LoginRateLimit"), or its requests move to the static per-source budget.
+    options.AddPolicy("LoginRateLimit", _ => RateLimitPartition.GetNoLimiter("app-route"));
 });
 
-// A residential IPv6 allocation is often a whole /56 or /64 -- partitioning on the full 128-bit
-// address lets an attacker get a fresh bucket on every request just by flipping host bits. Bucket
-// IPv6 on the /56 prefix instead. IPv4 addresses are scarce enough that the full address is fine.
-static string RateLimitPartitionKey(System.Net.IPAddress? address)
-{
-    if (address == null) return "unknown";
-    if (address.IsIPv4MappedToIPv6) address = address.MapToIPv4();
-    if (address.AddressFamily != System.Net.Sockets.AddressFamily.InterNetworkV6)
-        return address.ToString();
-
-    byte[] bytes = address.GetAddressBytes();
-    return "v6:" + Convert.ToHexString(bytes, 0, 7); // first 56 bits
-}
 
 builder.Services.AddAntiforgery();
 // Required for systemd units declaring Type=notify -- see the note in MFAService.
@@ -483,7 +504,7 @@ app.MapGet("/", async (HttpContext context, IAntiforgery antiforgery) =>
         </head>
         <body>
             <div class='login-box'>
-                <img src='{(string.IsNullOrEmpty(logoUrl) ? "/knocker.png" : logoUrl)}' alt='Logo' class='logo' />
+                <img src='{(string.IsNullOrEmpty(logoUrl) ? "/knocker.png" : System.Net.WebUtility.HtmlEncode(logoUrl))}' alt='Logo' class='logo' />
                 <div class='ip-display'>Connecting IP: <strong>{IpDisplayHtml(clientIp)}</strong></div>
 
                 <input type='email' id='usernameField' placeholder='Email Address' autocomplete='username webauthn' />
@@ -933,8 +954,9 @@ app.MapPost("/setup-passkey", async (HttpContext context, IAntiforgery antiforge
     AuditLogger.Log($"Passkey provisioning password verified for '{username}'");
 
     // Burn the email-link token immediately and replace it with a fresh 5-minute token.
-    // This ensures the intercepted provisioning link cannot be used to register an
-    // attacker-controlled device after the legitimate user has verified their password.
+    // Once the legitimate user has verified their password, a copy of the emailed link no longer
+    // registers anything. (The password travels in the same email, so this guards a leaked link,
+    // not a compromised mailbox; see INSTALL.md.)
     string? registrationToken = await IpcFirewallClient.RenewPasskeyTokenAsync(token);
     if (registrationToken == null)
     {
@@ -1086,9 +1108,10 @@ app.MapPost("/passkey/verify", async (HttpContext context, IConfiguration config
         return;
     }
 
-    // Logged only once the request is bound to a challenge issued for this account, which
-    // /passkey/challenge hands out only for accounts with a registered passkey.
-    AuditLogger.Log($"Passkey verify attempt from '{username}'");
+    // Debug only: anyone who fetches a challenge for a known enrolled address can reach this line
+    // by posting junk, so at Info it would be an uncapped pre-auth log line. The outcome (a
+    // granted login, or a capped [PROBE] line for a failed assertion) is what gets logged.
+    AuditLogger.Debug($"Passkey verify attempt from '{username}'");
 
     AuthenticatorAssertionRawResponse? clientAssertion;
     try { clientAssertion = JsonSerializer.Deserialize<AuthenticatorAssertionRawResponse>(assertionJson); }
@@ -1226,8 +1249,10 @@ app.MapPost("/passkey/verify", async (HttpContext context, IConfiguration config
         </html>");
 }).RequireRateLimiting("LoginRateLimit");
 
+#if ALLOW_TOTP
 // -----------------------------------------------------------------------
 // PASSKEY REGISTRATION: Page (linked from TOTP success screen)
+// Only the TOTP build links here; the passkey-only build registers through /setup-passkey.
 // -----------------------------------------------------------------------
 app.MapGet("/register-passkey/{token}", async (HttpContext context, string token) =>
 {
@@ -1259,7 +1284,7 @@ app.MapGet("/register-passkey/{token}", async (HttpContext context, string token
                 button {{ width: 100%; padding: 13px; background: #007acc; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; font-size: 1em; margin-top: 10px; }}
                 button:hover {{ background: #005999; }}
                 button:disabled {{ background: #333; color: #666; cursor: default; }}
-                #status {{ margin-top: 16px; font-size: 0.9em; color: #aaa; min-height: 1.4em; }}
+                div#status {{ margin-top: 16px; font-size: 0.9em; color: #aaa; min-height: 1.4em; }}
                 .success {{ color: #0f0 !important; }}
                 .error   {{ color: #f66 !important; }}
             </style>
@@ -1276,6 +1301,7 @@ app.MapGet("/register-passkey/{token}", async (HttpContext context, string token
         </body>
         </html>");
 }).RequireRateLimiting("LoginRateLimit");
+#endif  // ALLOW_TOTP
 
 // -----------------------------------------------------------------------
 // PASSKEY REGISTRATION: Begin (generate attestation options)
@@ -1424,7 +1450,9 @@ app.MapPost("/passkey/register/complete", async (HttpContext context) =>
     }
     catch (Exception ex)
     {
-        AuditLogger.Warn($"Passkey registration failed for '{regUsername}': {ex.Message}");
+        // Through ProbeLog: Fido2's message echoes request fields, which ProbeLog neutralizes and
+        // length-caps, and a client holding a registration token can repeat this at will.
+        RecordProbe(context, $"Passkey registration failed for '{regUsername}': {ex.Message}", regUsername);
         context.Response.StatusCode = 400;
         await context.Response.WriteAsync("Passkey registration failed.");
         return;
@@ -1598,10 +1626,10 @@ static string ClientIpForDisplay(HttpContext context)
 }
 
 static void RecordProbe(HttpContext context, string message, string? existingAccount = null) =>
-    ProbeLog.Record(RateLimitPartitionKey(context.Connection.RemoteIpAddress), ClientIpForDisplay(context), message, existingAccount);
+    ProbeLog.Record(RateLimitKeys.Source(context.Connection.RemoteIpAddress), ClientIpForDisplay(context), message, existingAccount);
 
 static void CountOutOfDomainProbe(HttpContext context) =>
-    ProbeLog.CountOutOfDomain(RateLimitPartitionKey(context.Connection.RemoteIpAddress));
+    ProbeLog.CountOutOfDomain(RateLimitKeys.Source(context.Connection.RemoteIpAddress));
 
 static bool IsPublicIpAddress(string ipString)
 {
@@ -1682,7 +1710,7 @@ public class UserEntry
     public string? PasskeyProvisioningToken { get; set; }
     public DateTime? PasskeyProvisioningExpiresUtc { get; set; }
     // Set true only after the password gate (RenewPasskeyToken) or a post-login
-    // token (SetPasskeyToken). The emailed provisioning token stays false, so it
+    // token (SetPasskeyToken, TOTP build only). The emailed provisioning token stays false, so it
     // cannot drive passkey registration without verifying the password first.
     public bool PasskeyRegistrationReady { get; set; } = false;
 }
@@ -1731,10 +1759,10 @@ public static class IpcFirewallClient
         }
     }
 
+#if ALLOW_TOTP
     public static async Task<bool> BurnTotpTokenAsync(string token)
         => await SendDbCommandAsync($"DB:BURN_TOTP_TOKEN|{token}");
 
-#if ALLOW_TOTP
     public static async Task<bool> ConsumeTotpAsync(string username, long timeStep, string secretFingerprint)
         => await SendDbCommandAsync(FormattableString.Invariant($"DB:CONSUME_TOTP|{username}|{timeStep}|{secretFingerprint}"));
 #endif
@@ -1763,8 +1791,10 @@ public static class IpcFirewallClient
         }
     }
 
+#if ALLOW_TOTP
     public static async Task<bool> SetPasskeyProvisionTokenAsync(string username, string pkToken, DateTime expiresUtc)
         => await SendDbCommandAsync($"DB:SET_PASSKEY_TOKEN|{username}|{pkToken}|{expiresUtc:O}");
+#endif
 
     public static async Task<bool> UpdateSignCountAsync(string credentialId, uint newCount)
         => await SendDbCommandAsync($"DB:UPDATE_SIGN_COUNT|{credentialId}|{newCount}");
@@ -2123,6 +2153,31 @@ public static class LoginFailureMonitor
 // allowance to hide a later probe's individual line; the summary still counts it, and a
 // suppressed probe is lost reconnaissance detail, not lost authentication security. Constants,
 // not config, per the project's preference for fewer switches.
+// What counts as one source for rate limiting and probe logging.
+public static class RateLimitKeys
+{
+    // An IPv4 address is its own source. A customer's IPv6 allocation is usually a whole /56 or
+    // /64, so keying on the full 128-bit address would hand an attacker a fresh bucket for every
+    // request just by changing host bits: IPv6 is keyed on its /56 prefix instead.
+    public static string Source(System.Net.IPAddress? address)
+    {
+        if (address == null) return "unknown";
+        if (address.IsIPv4MappedToIPv6) address = address.MapToIPv4();
+        if (address.AddressFamily != System.Net.Sockets.AddressFamily.InterNetworkV6)
+            return address.ToString();
+        return "v6:" + Convert.ToHexString(address.GetAddressBytes(), 0, 7);   // first 56 bits
+    }
+
+    // The /48 containing an IPv6 source, for the wider tier; null for IPv4.
+    public static string? Ipv6Network(System.Net.IPAddress? address)
+    {
+        if (address == null || address.IsIPv4MappedToIPv6
+            || address.AddressFamily != System.Net.Sockets.AddressFamily.InterNetworkV6)
+            return null;
+        return "v6:" + Convert.ToHexString(address.GetAddressBytes(), 0, 6);  // first 48 bits
+    }
+}
+
 public static class ProbeLog
 {
     private const int MaxLinesPerSourcePerWindow = 5;

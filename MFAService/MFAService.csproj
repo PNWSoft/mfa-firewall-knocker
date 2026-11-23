@@ -3,7 +3,7 @@
   <PropertyGroup>
     <OutputType>Exe</OutputType>
     <TargetFramework>net10.0</TargetFramework>
-    <Version>0.5.0</Version>
+    <Version>0.5.1</Version>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <ApplicationIcon>knocker.ico</ApplicationIcon>
@@ -15,7 +15,10 @@
     <Compile Include="..\Shared\SmtpTransportPolicy.cs" Link="SmtpTransportPolicy.cs" />
     <Compile Include="..\Shared\DpapiEntropy.cs" Link="DpapiEntropy.cs" />
     <Compile Include="..\Shared\LinuxIptables.cs" Link="LinuxIptables.cs" />
-    <Compile Include="..\Shared\LinuxDbLock.cs" Link="LinuxDbLock.cs" />
+    <Compile Include="..\Shared\DbFileLock.cs" Link="DbFileLock.cs" />
+    <Compile Include="..\Shared\WindowsPowerShell.cs" Link="WindowsPowerShell.cs" />
+    <Compile Include="..\Shared\PrivilegedLogFile.cs" Link="PrivilegedLogFile.cs" />
+    <Compile Include="..\Shared\ConfigFiles.cs" Link="ConfigFiles.cs" />
   </ItemGroup>
 
   <ItemGroup>

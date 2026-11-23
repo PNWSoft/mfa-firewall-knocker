@@ -144,9 +144,8 @@ It does not open anything.
 
 `MFAAdmin reset` removes every MFA-granted rule and does not require MFAService. It runs elevated
 and issues the firewall commands directly — `Remove-NetFirewallRule` on Windows, `iptables -D` and
-`ip6tables -D` on Linux. On Linux it then re-reads the rule list and reports what remains rather than assuming the
-deletions succeeded; on Windows it issues the removal and reports success without a corresponding
-re-check. This applies to emergency revocation generally, not only to outages. `MFAAdmin diag`
+`ip6tables -D` on Linux. On both platforms it then re-reads the rule list and reports what remains
+rather than assuming the deletions succeeded, and exits non-zero if any do. This applies to emergency revocation generally, not only to outages. `MFAAdmin diag`
 lists the rules without removing them.
 
 `reset` removes every grant, so all users must re-authenticate afterwards. `MFAAdmin delete`
@@ -313,7 +312,15 @@ logs, or bypass the passkey-registration one-time-password gate.
   total within its trust scope. MFAService's independent re-validation bounds the blast
   radius (public IPs only, configured ports only, time-limited) rather than preventing it.
   Reports that assume arbitrary code execution as the MFAWeb service account are describing
-  this known boundary.
+  this known boundary. That includes registering a passkey on an account that has none yet: in
+  the default build, an account part-way through setup (provisioned, with its setup link still
+  live); in a TOTP build, any account without a passkey. An account that already has a passkey
+  cannot get a second one this way. It also covers the log directory MFAWeb
+  shares with MFAService and MFAAdmin: the web account can read their logs on Windows, can make
+  them switch to a differently named file, and on either platform can create files that look
+  like theirs. After a suspected MFAWeb compromise, check the owner of any log file you rely on,
+  and check when each account's passkey was registered (`MFAAdmin list` shows the most recent
+  registration for each account).
 - **First use of a phished TOTP code**, when TOTP is explicitly enabled. A captured, unused code
   can be submitted before its owner; successful time-steps are persisted and rejected on reuse.
 - **Anything requiring Administrator or root** on the host. Those principals already own the
@@ -351,7 +358,7 @@ Tracked, understood, and not currently considered exploitable:
   MFAService from binding. That is unavoidable with a fixed pipe name and it now fails closed
   and loudly — the service logs an error, emails `Smtp:NotifyAddress` once, and retries with
   backoff until the name is free. Interception is closed even in that window.
-- **This only adds allow rules; it never removes one.** If the protected port is reachable for
+- **This only adds allow rules, and removes only rules under its own prefix.** If the protected port is reachable for
   some other reason — a standing allow rule, a blanket accept on the internet-facing interface, a
   permissive default policy, an upstream forward that bypasses the host's INPUT chain — then every
   grant is redundant and the gate protects nothing, while the logs, the UI and the rule list all

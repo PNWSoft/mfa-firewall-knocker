@@ -47,6 +47,11 @@ jobs:
         run: dotnet run --project tests/MFAWeb.AlertTests -c Release -p:RestoreLockedMode=true -p:AllowTotp=${{ matrix.allow_totp }}
 
       - name: Firewall command regression checks
+        # On Windows this also runs the expiry script against the real Windows Firewall, with
+        # disabled rules under a random prefix that the test removes again. The runner is elevated
+        # and thrown away after the job.
+        env:
+          MFA_LIVE_FIREWALL_TESTS: ${{ matrix.os == 'windows-latest' && '1' || '0' }}
         run: dotnet run --project tests/MFAService.RegressionTests -c Release --no-build --no-restore -p:AllowTotp=${{ matrix.allow_totp }}
 
       - name: TOTP replay regression checks
@@ -109,8 +114,8 @@ jobs:
           fi
           echo "No vulnerable packages."
 
-      # Informational only: the 6.x IdentityModel line and LettuceEncrypt are both
-      # marked Legacy, and are accepted trade-offs documented in SECURITY.md.
+      # Informational only: the 6.x IdentityModel line is marked Legacy, an accepted trade-off
+      # documented in SECURITY.md.
       - name: Report deprecated packages
         continue-on-error: true
         run: dotnet list MFA.slnx package --deprecated

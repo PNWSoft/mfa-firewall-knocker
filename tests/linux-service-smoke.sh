@@ -104,13 +104,11 @@ web["AllowedDomains"] = ["example.com"]
 web["Kestrel"]["Endpoints"]["Https"]["Certificate"] = {
     "Path": "/etc/mfa-auth/tls/current/fullchain.pem",
     "KeyPath": "/etc/mfa-auth/tls/current/privkey.pem"}
-web["FirewallService"]["GmsaAccount"] = "mfaweb"
 smtp(web)
 
 adm = load("MFAAdmin/appsettings.example.json")
 adm["AllowedDomains"] = ["example.com"]
 adm["BouncerUrl"] = "https://localhost:8443"
-adm["FirewallService"]["GmsaAccount"] = "mfaweb"
 smtp(adm)
 
 for path, cfg in (("/opt/mfa-service/appsettings.json", svc),
@@ -118,9 +116,25 @@ for path, cfg in (("/opt/mfa-service/appsettings.json", svc),
                   ("/opt/mfa-admin/appsettings.json", adm)):
     json.dump(cfg, open(path, "w"), indent=2)
 PY
-chmod 640 /opt/mfa-service/appsettings.json /opt/mfa-admin/appsettings.json
+chmod 600 /opt/mfa-service/appsettings.json /opt/mfa-admin/appsettings.json   # as INSTALL.md
 chown root:mfaweb /opt/mfa-web/appsettings.json
 chmod 640 /opt/mfa-web/appsettings.json
+
+# --- What a compromised web account could plant in the shared log directory ----------------------
+# Today's privileged logs, created first by mfaweb: MFAService's as a named pipe (opening it for
+# writing would block, stalling every thread that logs, the sweeper included), MFAAdmin's as a
+# regular file with forged lines that mfaweb keeps open. Neither may be used; both must be set
+# aside and reported. (Symbolic and hard links are covered by the regression tests.)
+today=$(date -u +%F)
+rm -rf /var/log/mfa-auth/mfaservice_$today.log /var/log/mfa-auth/mfaadmin_$today.log /var/log/mfa-auth/untrusted-*
+# And the log directory without its sticky bit, as an install that skipped an upgrade step has it.
+# MFAService cannot change it under its sandbox (RestrictSUIDSGID), but must keep logging and report
+# it; MFAAdmin, run as root outside the sandbox, repairs it.
+chmod -t /var/log/mfa-auth
+sudo -u mfaweb mkfifo /var/log/mfa-auth/mfaservice_$today.log
+sudo -u mfaweb sh -c "echo '[forged] planted line' > /var/log/mfa-auth/mfaadmin_$today.log"
+sudo -u mfaweb sh -c "exec 3>>/var/log/mfa-auth/mfaadmin_$today.log; sleep 600" &
+holder=$!
 
 # --- MFAService ----------------------------------------------------------------------------------
 systemctl daemon-reload
@@ -128,6 +142,11 @@ systemctl start mfa-service || fail "mfa-service failed to start"
 sleep 8
 [ "$(systemctl is-active mfa-service)" = active ] || fail "mfa-service is not running 8 s after start"
 [ -S /run/mfafirewall.sock ] || fail "IPC socket /run/mfafirewall.sock was not created"
+# Before any MFAAdmin run: MFAService logged to a file of its own despite the non-sticky directory,
+# and said so.
+grep -q 'is not sticky' /var/log/mfa-auth/mfaservice_$today.log     || fail "MFAService did not log (or did not report the non-sticky log directory) before MFAAdmin ran"
+# Owner-only, or the web account could hold the single-instance lock across a restart.
+[ "$(stat -c %a /run/mfafirewall.lock)" = 600 ] || fail "/run/mfafirewall.lock is mode $(stat -c %a /run/mfafirewall.lock), not 600"
 
 ipc() {   # a raw request as the web account, the only uid MFAService accepts
     sudo -u mfaweb python3 -c '
@@ -207,19 +226,30 @@ mfa_rules() { grep -c 'MFA_Temp_' <<< "$(iptables -S INPUT; ip6tables -S INPUT)"
 grant 203.0.113.10
 grant 2001:db8::10
 
-diag_out=$(/opt/mfa-admin/MFAAdmin diag 2>&1)
+diag_out=$(/opt/mfa-admin/MFAAdmin diag 2>&1) || fail "MFAAdmin diag exited with status $?: $diag_out"
 [ "$(grep -c "$USER_EMAIL" <<< "$diag_out")" -eq 2 ] || fail "MFAAdmin diag did not list both grants with their user: $diag_out"
 echo "MFAAdmin diag -> both grants listed with their user"
 
-del_out=$(/opt/mfa-admin/MFAAdmin delete "$USER_EMAIL" 2>&1)
+del_out=$(/opt/mfa-admin/MFAAdmin delete "$USER_EMAIL" 2>&1) || fail "MFAAdmin delete exited with status $?: $del_out"
 grep -q '2 active firewall rule(s) for this user were also removed' <<< "$del_out" \
     || fail "MFAAdmin delete did not report removing the user's 2 rules: $del_out"
 [ "$(mfa_rules)" -eq 0 ] || fail "rules remain after MFAAdmin delete"
 echo "MFAAdmin delete -> user and both grants removed"
 
+# Running delete again retries the revocation: a grant that still carries the name is removed even
+# though the account is gone, and with nothing left the command reports failure.
+grant 203.0.113.11
+del_out=$(/opt/mfa-admin/MFAAdmin delete "$USER_EMAIL" 2>&1) || fail "MFAAdmin delete (retry) exited with status $?: $del_out"
+grep -q "is not in the database. 1 active firewall rule(s) for this user were also removed" <<< "$del_out" \
+    || fail "MFAAdmin delete (retry) did not revoke the remaining grant: $del_out"
+[ "$(mfa_rules)" -eq 0 ] || fail "rules remain after MFAAdmin delete (retry)"
+rc=0; del_out=$(/opt/mfa-admin/MFAAdmin delete "$USER_EMAIL" 2>&1) || rc=$?
+[ "$rc" -eq 1 ] || fail "MFAAdmin delete with nothing to delete exited with status $rc, not 1: $del_out"
+echo "MFAAdmin delete again -> revoked a grant left for the deleted user; exit status 1 once nothing is left"
+
 grant 203.0.113.10
 grant 2001:db8::10
-reset_out=$(echo Y | /opt/mfa-admin/MFAAdmin reset 2>&1)
+reset_out=$(echo Y | /opt/mfa-admin/MFAAdmin reset 2>&1) || fail "MFAAdmin reset exited with status $?: $reset_out"
 grep -q 'Removed 2 MFA-managed iptables/ip6tables rule(s); chains verified clear' <<< "$reset_out" \
     || fail "MFAAdmin reset did not report clearing 2 rules: $reset_out"
 [ "$(mfa_rules)" -eq 0 ] || fail "rules remain after MFAAdmin reset"
@@ -228,5 +258,22 @@ echo "MFAAdmin reset -> all grants removed"
 for u in mfa-service mfa-web; do
     [ "$(systemctl is-active $u)" = active ] || fail "$u stopped during the test"
 done
+
+# The planted entries: each was set aside, the day's log is a fresh regular file owned by root
+# that says what was found, and the forged line is not in it.
+kill $holder 2>/dev/null || true; pkill -u mfaweb -x sleep 2>/dev/null || true
+for f in mfaservice_$today.log mfaadmin_$today.log; do
+    p=/var/log/mfa-auth/$f
+    [ -f "$p" ] && [ ! -L "$p" ] || fail "$f is not a regular file"
+    [ "$(stat -c %U "$p")" = root ] || fail "$f is owned by $(stat -c %U "$p")"
+    # Owner only: readable by the group, the web account could lock it and stop every append.
+    [ "$(stat -c %a "$p")" = 600 ] || fail "$f is mode $(stat -c %a "$p"), not 600"
+    grep -q '\[SECURITY\] Log file:.*set aside' "$p" || fail "$f does not report the planted entry"
+    ! grep -q 'forged' "$p" || fail "$f contains the planted content"
+done
+[ -p "$(ls -d /var/log/mfa-auth/untrusted-*-mfaservice_$today.log | head -1)" ] || fail "the planted pipe was not set aside"
+grep -q 'forged' /var/log/mfa-auth/untrusted-*-mfaadmin_$today.log || fail "the planted file was not set aside"
+[ "$(stat -c %a /var/log/mfa-auth)" = 3770 ] || fail "MFAAdmin did not restore the log directory's sticky bit (mode $(stat -c %a /var/log/mfa-auth))"
+echo "planted log entries -> set aside and reported; fresh root-owned logs; MFAService kept logging in a non-sticky directory; MFAAdmin restored the sticky bit"
 systemctl stop mfa-web mfa-service
 echo "MFAService and MFAWeb ran under the documented systemd units; provisioning, IPC, grants, diag, delete and reset all worked."

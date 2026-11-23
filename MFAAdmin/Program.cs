@@ -69,18 +69,66 @@ namespace MFAAdmin
             {
                 if (!Directory.Exists(LogDirectory))
                     Directory.CreateDirectory(LogDirectory);
+                string path = Path.Combine(LogDirectory, $"mfaadmin_{DateTime.UtcNow:yyyy-MM-dd}.log");
                 lock (_lock)
                 {
                     DeleteExpiredLogs("mfaadmin_");
-                    File.AppendAllText(
-                        Path.Combine(LogDirectory, $"mfaadmin_{DateTime.UtcNow:yyyy-MM-dd}.log"),
-                        entry + Environment.NewLine);
+                    var writer = DailyWriter(path);
+                    try
+                    {
+                        // Another MFAAdmin run may have appended since; write at the current end.
+                        writer.BaseStream.Seek(0, SeekOrigin.End);
+                        writer.WriteLine(entry);
+                    }
+                    catch
+                    {
+                        // The held file went wrong (truncated, say). Drop it, so the next line goes back
+                        // through the checks and a fresh open instead of failing for the rest of the day.
+                        var held = _dailyWriter;
+                        _dailyWriter = null;   // first: Dispose flushes, and can throw again
+                        try { held?.Dispose(); } catch { }
+                        throw;
+                    }
                 }
             }
             catch (Exception ex)
             {
                 Console.WriteLine($"[LOG ERROR] Could not write to log file: {ex.Message}");
             }
+        }
+
+        // The web account can create files in the log directory, so before the first write to each
+        // day's file make sure it is this process's own (see Shared/PrivilegedLogFile.cs), then keep
+        // that file open and write through the handle for the rest of the day. Reopening it by name for
+        // each line would follow whatever is at the name by then: if the file were removed during the
+        // day, the web account could put a link there. Caller holds _lock. If it throws, this entry
+        // goes to the console only and the next write tries again.
+        private static string? _dailyRequested;
+        private static StreamWriter? _dailyWriter;
+        private static StreamWriter DailyWriter(string path)
+        {
+            if (path == _dailyRequested && _dailyWriter != null) return _dailyWriter;
+            _dailyWriter?.Dispose();
+            _dailyWriter = null;
+            var (actual, note) = PrivilegedLogFile.Prepare(path);
+            // Checked just now and ours; in the sticky directory nobody else can replace it before this
+            // open. Shared for reading and writing -- two MFAAdmin runs at once both append to the day's
+            // file, each seeking to the end first -- and for deletion (retention).
+            FileStream stream;
+            try { stream = new FileStream(actual, FileMode.Append, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete); }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                // Held open by something else with no sharing, for instance. Do not stop logging.
+                string fallback = PrivilegedLogFile.CreateUnique(path);
+                note = (note == null ? "" : note + "; ") + $"could not open {Path.GetFileName(actual)} ({ex.Message}); writing to {Path.GetFileName(fallback)} instead";
+                stream = new FileStream(fallback, FileMode.Append, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete);
+            }
+            var writer = new StreamWriter(stream, new UTF8Encoding(false)) { AutoFlush = true };
+            if (note != null)
+                writer.WriteLine($"[{DateTime.UtcNow:yyyy-MM-dd HH:mm:ss} UTC] [WRN] [SECURITY] Log file: {note}");
+            _dailyRequested = path;
+            _dailyWriter = writer;
+            return writer;
         }
 
         // Daily files are kept for LogRetentionDays, then deleted by the first write of a new UTC day.
@@ -98,7 +146,9 @@ namespace MFAAdmin
             {
                 foreach (var file in Directory.EnumerateFiles(LogDirectory, prefix + "*.log"))
                 {
-                    string datePart = Path.GetFileNameWithoutExtension(file).Substring(prefix.Length);
+                    // The date is the first 10 characters after the prefix; a fallback file adds a suffix.
+                    string rest = Path.GetFileNameWithoutExtension(file).Substring(prefix.Length);
+                    string datePart = rest.Length >= 10 ? rest[..10] : rest;
                     if (DateTime.TryParseExact(datePart, "yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture,
                             System.Globalization.DateTimeStyles.None, out var day)
                         && day < today.AddDays(-LogRetentionDays))
@@ -145,39 +195,9 @@ namespace MFAAdmin
     class Program
     {
         // Cross-process lock shared by MFAService and MFAAdmin, the only two writers, to serialize
-        // their writes. MFAWeb never writes the store and does not take it. On Windows it is a
-        // named mutex, ACL-restricted so only SYSTEM, Builtin Administrators, and the gMSA can
-        // acquire it, created in Main() after config is loaded so the service account name comes
-        // from appsettings. On Linux it is a lock file beside the database; see
-        // Shared/LinuxDbLock.cs for why not a mutex.
-        private static System.Threading.Mutex? _dbMutex;
-
-#pragma warning disable CA1416
-        private static System.Threading.Mutex CreateSecureDbMutex(string? serviceAccount)
-        {
-            const string mutexName = @"Global\MFA_DB_LOCK";
-
-            var security = new MutexSecurity();
-
-            // SYSTEM — full control
-            security.AddAccessRule(new MutexAccessRule(
-                new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null),
-                MutexRights.FullControl, AccessControlType.Allow));
-
-            // Builtin Administrators — covers MFAAdmin running elevated
-            security.AddAccessRule(new MutexAccessRule(
-                new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null),
-                MutexRights.FullControl, AccessControlType.Allow));
-
-            // gMSA service account — runs MFAWeb and MFAService
-            if (!string.IsNullOrWhiteSpace(serviceAccount))
-                security.AddAccessRule(new MutexAccessRule(
-                    new NTAccount(serviceAccount),
-                    MutexRights.FullControl, AccessControlType.Allow));
-
-            return MutexAcl.Create(false, mutexName, out _, security);
-        }
-#pragma warning restore CA1416
+        // their writes: a lock file beside the database on both platforms (Shared/DbFileLock.cs,
+        // which also says why it is no longer a named mutex). Taken only by the commands that touch
+        // the database, so reset and diag never depend on it.
 
         // OS-Aware File Paths
         private static string DbPath =>
@@ -231,6 +251,14 @@ namespace MFAAdmin
 
         static void Main(string[] args)
         {
+            // Format and parse with the invariant culture everywhere. Log timestamps, log file names (and
+            // the dates their 90-day cleanup reads back), and the expiry stored in Windows firewall rules all
+            // use .NET format strings, in which ':' is the culture's time separator and 'yyyy' is the year in
+            // the culture's calendar. On a Finnish or Thai system those differ, which once left Windows grants
+            // that the sweeper could never parse, and so never removed.
+            System.Globalization.CultureInfo.DefaultThreadCurrentCulture = System.Globalization.CultureInfo.InvariantCulture;
+            System.Globalization.CultureInfo.CurrentCulture = System.Globalization.CultureInfo.InvariantCulture;
+
             Config = new ConfigurationBuilder()
                 .SetBasePath(AppContext.BaseDirectory)
                 .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
@@ -279,8 +307,6 @@ namespace MFAAdmin
                 }
             }
 
-            if (OperatingSystem.IsWindows())
-                _dbMutex = CreateSecureDbMutex(Config["FirewallService:GmsaAccount"]);
 
             // Ensure the directory exists before doing anything
             var dir = Path.GetDirectoryName(DbPath);
@@ -851,8 +877,8 @@ namespace MFAAdmin
             List<UserEntry> users;
             using (AcquireDbLock()) { users = LoadUsers(); }
 
-            Console.WriteLine($"\n{"Username",-30} | {"MFA Status",-38} | {"Passkeys",-20}");
-            Console.WriteLine(new string('-', 95));
+            Console.WriteLine($"\n{"Username",-30} | {"MFA Status",-38} | {"Passkeys",-32}");
+            Console.WriteLine(new string('-', 107));
 
             foreach (var u in users)
             {
@@ -864,7 +890,10 @@ namespace MFAAdmin
                 string passkeyStatus;
                 if (u.PasskeyCredentials.Count > 0)
                 {
-                    passkeyStatus = $"{u.PasskeyCredentials.Count} registered";
+                    // When the newest one was registered (local time), so an unexpected recent
+                    // registration stands out -- SECURITY.md's advice after a suspected compromise.
+                    var newest = u.PasskeyCredentials.Max(c => c.RegisteredUtc);
+                    passkeyStatus = $"{u.PasskeyCredentials.Count} registered {newest.ToLocalTime():yyyy-MM-dd HH:mm}";
                 }
                 else if (!string.IsNullOrEmpty(u.PasskeyProvisioningToken))
                 {
@@ -895,7 +924,7 @@ namespace MFAAdmin
                 status = u.PasskeyCredentials.Count > 0 ? "Active" : "Awaiting passkey registration";
 #endif
 
-                Console.WriteLine($"{u.Username,-30} | {status,-38} | {passkeyStatus,-20}");
+                Console.WriteLine($"{u.Username,-30} | {status,-38} | {passkeyStatus,-32}");
             }
 
             Console.WriteLine($"\nTotal Users: {users.Count}");
@@ -923,67 +952,126 @@ namespace MFAAdmin
                 if (removed > 0) SaveUsers(users);
             }
 
+            const string sessionCaveat = "This closes the firewall to new connections. It does " +
+                "NOT end any session, tunnel, or process this user already has running. If " +
+                "removing them needs to be immediate and complete, separately verify -- and if " +
+                "necessary terminate -- their existing sessions on every system they could reach.";
+
             if (removed > 0)
             {
                 AdminLogger.Log($"[SUCCESS] User '{username}' deleted.");
-
-                // Deleting the account doesn't touch a firewall rule already open for this user --
-                // it persists until it naturally expires. Say only what actually happened.
-                string revocationNote;
-                if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-                {
-                    int revoked = RevokeWindowsRulesForUser(username);
-                    revocationNote = revoked > 0
-                        ? $"{revoked} active firewall rule(s) for this user were also removed."
-                        : "No active firewall rule was found for this user to remove.";
-                }
-                else
-                {
-                    // MFAService tags each Linux grant's comment with the username (see
-                    // OpenFirewallPort). The account is already gone from the database, so MFAWeb
-                    // can no longer sign it in; a sign-in already past verification when the
-                    // account was deleted can still land a grant after this pass.
-                    try
-                    {
-                        var (revoked, remaining, untagged) = RevokeLinuxRulesForUser(username);
-                        if (remaining > 0)
-                            revocationNote = $"{revoked} firewall rule(s) for this user were removed, but " +
-                                $"{remaining} REMAIN after deletion -- access is still open; check 'diag' " +
-                                "and remove them manually.";
-                        else
-                            revocationNote = revoked > 0
-                                ? $"{revoked} active firewall rule(s) for this user were also removed."
-                                : "No active firewall rule was found for this user to remove.";
-                        if (untagged > 0)
-                            revocationNote += $" {untagged} active rule(s) were granted by an older MFAService " +
-                                "that did not record usernames; any of them could belong to this user. They " +
-                                "expire on schedule, or can be found by address via 'diag'.";
-                    }
-                    catch (Exception ex)
-                    {
-                        // The firewall could not be read or changed. Say so rather than report that
-                        // nothing was found: the user's grants may still be open.
-                        revocationNote = "The firewall rules could NOT be checked or removed " +
-                            $"({ex.Message}). Any active grant for this user may still be open; check " +
-                            "'diag' and remove them manually.";
-                        AdminLogger.Error($"[ERROR] {revocationNote}");
-                    }
-                }
+                // Deleting the account doesn't touch a firewall rule already open for this user,
+                // so revoke those too, and say only what actually happened.
+                var (note, ok, _, _) = RevokeFirewallRulesForUser(username);
                 // Closing the firewall only blocks *new* connections -- it doesn't end a session
                 // this user already has established (see README.md's "Revoking access does not
                 // end active sessions").
-                const string sessionCaveat = "This closes the firewall to new connections. It does " +
-                    "NOT end any session, tunnel, or process this user already has running. If " +
-                    "removing them needs to be immediate and complete, separately verify -- and if " +
-                    "necessary terminate -- their existing sessions on every system they could reach.";
-                AdminLogger.Log($"[INFO] {revocationNote} {sessionCaveat}");
+                AdminLogger.Log($"[INFO] {note} {sessionCaveat}");
                 AuditNotify("USER DELETED",
-                    $"User '{username}' was removed from the database. {revocationNote} {sessionCaveat}");
+                    $"User '{username}' was removed from the database. {note} {sessionCaveat}");
+                if (!ok) Environment.ExitCode = 1;
             }
             else
             {
-                AdminLogger.Error($"[ERROR] User '{username}' not found.");
+                // Not in the database -- perhaps already deleted by an earlier run whose firewall
+                // revocation failed. Still revoke any rules carrying the name, so running delete
+                // again is how that is retried.
+                var (note, ok, found, untagged) = RevokeFirewallRulesForUser(username);
+                if (!ok)
+                {
+                    AdminLogger.Error($"[ERROR] User '{username}' is not in the database. {note} {sessionCaveat}");
+                    AuditNotify("FIREWALL REVOCATION INCOMPLETE",
+                        $"Revoking firewall rules for '{username}', who is not in the database, did not complete. {note} {sessionCaveat}");
+                    Environment.ExitCode = 1;
+                }
+                else if (found > 0)
+                {
+                    AdminLogger.Log($"[INFO] User '{username}' is not in the database. {note} {sessionCaveat}");
+                    AuditNotify("FIREWALL RULES REVOKED",
+                        $"Firewall rules for '{username}', who is not in the database, were revoked. {note} {sessionCaveat}");
+                }
+                else
+                {
+                    // Nothing to delete. On Linux, rules from before the user tag can't be attributed,
+                    // so pass on the note about them (it is the case right after an upgrade).
+                    AdminLogger.Error($"[ERROR] User '{username}' not found, and no firewall rule carries that name." +
+                        (untagged > 0 ? " " + note : ""));
+                    Environment.ExitCode = 1;
+                }
             }
+        }
+
+        // Removes the firewall rules that carry this username, on either platform, and reports what
+        // actually happened. Ok is false when rules remain or the firewall could not be checked;
+        // Found counts the user's rules seen (removed or remaining); Untagged counts Linux rules from
+        // before 0.5.0, which carry no username and so may or may not be this user's.
+        static (string Note, bool Ok, int Found, int Untagged) RevokeFirewallRulesForUser(string username)
+        {
+            int found = 0, untaggedFound = 0;
+            string revocationNote;
+            bool ok = false;
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+            {
+                try
+                {
+                    var (revoked, remaining) = RevokeWindowsRulesForUser(username);
+                    found = revoked + remaining;
+                    ok = remaining == 0;
+                    if (remaining > 0)
+                        revocationNote = $"{revoked} firewall rule(s) for this user were removed, but " +
+                            $"{remaining} REMAIN after deletion -- access is still open; check 'diag' " +
+                            "and remove them manually.";
+                    else
+                        revocationNote = revoked > 0
+                            ? $"{revoked} active firewall rule(s) for this user were also removed."
+                            : "No active firewall rule was found for this user to remove.";
+                }
+                catch (Exception ex)
+                {
+                    // The firewall could not be read or changed. Say so rather than report that
+                    // nothing was found: the user's grants may still be open.
+                    revocationNote = "The firewall rules could NOT be checked or removed " +
+                        $"({ex.Message}). Any active grant for this user may still be open; check " +
+                        "'diag' and remove them manually.";
+                    AdminLogger.Error($"[ERROR] {revocationNote}");
+                }
+            }
+            else
+            {
+                // MFAService tags each Linux grant's comment with the username (see
+                // OpenFirewallPort). The account is already gone from the database, so MFAWeb
+                // can no longer sign it in; a sign-in already past verification when the
+                // account was deleted can still land a grant after this pass.
+                try
+                {
+                    var (revoked, remaining, untagged) = RevokeLinuxRulesForUser(username);
+                    found = revoked + remaining;
+                    untaggedFound = untagged;
+                    ok = remaining == 0;
+                    if (remaining > 0)
+                        revocationNote = $"{revoked} firewall rule(s) for this user were removed, but " +
+                            $"{remaining} REMAIN after deletion -- access is still open; check 'diag' " +
+                            "and remove them manually.";
+                    else
+                        revocationNote = revoked > 0
+                            ? $"{revoked} active firewall rule(s) for this user were also removed."
+                            : "No active firewall rule was found for this user to remove.";
+                    if (untagged > 0)
+                        revocationNote += $" {untagged} active rule(s) were granted by an older MFAService " +
+                            "that did not record usernames; any of them could belong to this user. They " +
+                            "expire on schedule, or can be found by address via 'diag'.";
+                }
+                catch (Exception ex)
+                {
+                    // The firewall could not be read or changed. Say so rather than report that
+                    // nothing was found: the user's grants may still be open.
+                    revocationNote = "The firewall rules could NOT be checked or removed " +
+                        $"({ex.Message}). Any active grant for this user may still be open; check " +
+                        "'diag' and remove them manually.";
+                    AdminLogger.Error($"[ERROR] {revocationNote}");
+                }
+            }
+            return (revocationNote, ok, found, untaggedFound);
         }
 
         // Linux: MFAService writes each rule's comment as "<name> user:<email> exp:<epoch>" (see
@@ -1021,83 +1109,92 @@ namespace MFAAdmin
         // Windows only: MFAService writes each rule's Description as "User: <email> Exp: <time>"
         // (see OpenFirewallPort), so a targeted per-user revocation is possible. Returns the
         // number of rules removed.
-        static int RevokeWindowsRulesForUser(string username)
+        static (int Removed, int Remaining) RevokeWindowsRulesForUser(string username)
         {
-            string psQuery = $"-NoProfile -Command \"Get-NetFirewallRule -DisplayName '{RulePrefixPsEscaped}*' " +
-                "-ErrorAction SilentlyContinue | ForEach-Object { $_.Name + '||' + $_.Description }\"";
-            var queryPsi = new ProcessStartInfo("powershell", psQuery)
+            // Same shape diag already parses: "User: someone@example.com Exp: ...".
+            bool IsUsers(string description)
             {
-                RedirectStandardOutput = true, UseShellExecute = false, CreateNoWindow = true
-            };
-            using var queryProc = Process.Start(queryPsi);
-            if (queryProc is null) return 0;
-            string output = queryProc.StandardOutput.ReadToEnd();
-            queryProc.WaitForExit();
+                var match = Regex.Match(description, @"User:\s*(?<user>\S+)\s+Exp:");
+                return match.Success && match.Groups["user"].Value.Equals(username, StringComparison.OrdinalIgnoreCase);
+            }
 
             int removed = 0;
-            foreach (string line in output.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+            foreach (var (name, description) in ListWindowsManagedRules())
+            {
+                if (!IsUsers(description)) continue;
+                try
+                {
+                    RunPowerShell($"Remove-NetFirewallRule -Name '{name.Replace("'", "''")}' -ErrorAction Stop");
+                    removed++;
+                }
+                catch (InvalidOperationException ex)
+                {
+                    AdminLogger.Error($"[ERROR] Could not remove firewall rule {name}: {ex.Message}");
+                }
+            }
+            // Report what is actually left rather than assuming the removals worked.
+            int remaining = ListWindowsManagedRules().Count(rule => IsUsers(rule.Description));
+            return (removed, remaining);
+        }
+
+        // Every rule whose display name starts with RulePrefix, as (name, description). Throws if
+        // the rules cannot be listed: an empty result must mean there are none, never "could not
+        // read them", or delete and reset would report that nothing is open while something is.
+        static List<(string Name, string Description)> ListWindowsManagedRules()
+        {
+            string output = RunPowerShell(
+                // All rules with errors stopping, filtered here: -DisplayName with a wildcard plus
+                // SilentlyContinue would also hide a real failure behind an empty result.
+                $"Get-NetFirewallRule -ErrorAction Stop | Where-Object {{ $_.DisplayName -like '{RulePrefixPsEscaped}*' }} | " +
+                "ForEach-Object { $_.Name + '||' + $_.Description }");
+            var rules = new List<(string, string)>();
+            foreach (string line in output.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
             {
                 var parts = line.Split("||", 2);
-                if (parts.Length != 2) continue;
-                string ruleName = parts[0].Trim();
-                // Same shape diag already parses: "User: someone@example.com Exp: ...".
-                var match = Regex.Match(parts[1], @"User:\s*(?<user>\S+)\s+Exp:");
-                if (!match.Success || !match.Groups["user"].Value.Equals(username, StringComparison.OrdinalIgnoreCase))
-                    continue;
-
-                var removePsi = new ProcessStartInfo("powershell",
-                    $"-NoProfile -Command \"Remove-NetFirewallRule -Name '{ruleName}' -ErrorAction SilentlyContinue\"")
-                {
-                    CreateNoWindow = true, UseShellExecute = false
-                };
-                using var removeProc = Process.Start(removePsi);
-                removeProc?.WaitForExit();
-                removed++;
+                if (parts.Length == 2) rules.Add((parts[0], parts[1]));
             }
-            return removed;
+            return rules;
+        }
+
+        // Runs a Windows PowerShell script with errors stopping it, passed as -EncodedCommand so no
+        // value in it is ever parsed by a command line. Throws with the error output on failure.
+        static string RunPowerShell(string script)
+        {
+            string full = "$ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue'; " +
+                          "Import-Module NetSecurity -ErrorAction Stop; " + script;
+            var psi = new ProcessStartInfo(WindowsPowerShell.ExePath,
+                "-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand " +
+                Convert.ToBase64String(Encoding.Unicode.GetBytes(full)))
+            {
+                RedirectStandardOutput = true, RedirectStandardError = true,
+                UseShellExecute = false, CreateNoWindow = true
+            };
+            using var proc = Process.Start(psi) ?? throw new InvalidOperationException("could not start PowerShell");
+            var error = proc.StandardError.ReadToEndAsync();
+            string output = proc.StandardOutput.ReadToEnd();
+            proc.WaitForExit();
+            string stderr = error.GetAwaiter().GetResult().Trim();
+            if (proc.ExitCode != 0)
+                throw new InvalidOperationException($"PowerShell exited with code {proc.ExitCode}: {(stderr.Length > 0 ? stderr : output.Trim())}");
+            return output;
         }
 
         // --- Core Security & OS-Aware IO ---
 
         static IDisposable AcquireDbLock()
         {
-            if (!OperatingSystem.IsWindows())
-            {
-                try { return LinuxDbLock.TryAcquire(DbPath, TimeSpan.FromSeconds(10)) ?? TimedOut(); }
-                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-                {
-                    AdminLogger.Error($"[DB LOCK] Could not open the database lock file: {ex.Message}");
-                    Environment.Exit(1);
-                    return null!;
-                }
-                static IDisposable TimedOut()
-                {
-                    AdminLogger.Error("[DB LOCK] Timed out waiting for database lock.");
-                    Environment.Exit(1);
-                    return null!;
-                }
-            }
             try
             {
-                if (!_dbMutex!.WaitOne(TimeSpan.FromSeconds(10)))
-                {
-                    AdminLogger.Error("[DB LOCK] Timed out waiting for database lock.");
-                    Environment.Exit(1);
-                }
+                var held = DbFileLock.TryAcquire(DbPath, TimeSpan.FromSeconds(10));
+                if (held != null) return held;
+                AdminLogger.Error("[DB LOCK] Timed out waiting for database lock.");
             }
-            catch (AbandonedMutexException)
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
-                // A prior process crashed while holding the lock; Windows transferred ownership to us.
-                AdminLogger.Warn("[DB LOCK] Mutex was abandoned by a prior process - ownership transferred, proceeding.");
+                AdminLogger.Error($"[DB LOCK] Could not open the database lock file: {ex.Message}");
             }
-            return new DbLock(_dbMutex!);
-        }
-
-        private sealed class DbLock : IDisposable
-        {
-            readonly Mutex _m;
-            internal DbLock(Mutex m) => _m = m;
-            public void Dispose() => _m.ReleaseMutex();
+            Environment.Exit(1);
+            return null!;
         }
 
         static List<UserEntry> LoadUsers()
@@ -1313,19 +1410,21 @@ namespace MFAAdmin
                 // The rule's own RemoteAddress is read as well as its name: the name carries the
                 // client's exact address, but a grant widened by Ipv6GrantPrefixLength covers that
                 // address's network, and only the address filter says so.
-                string psCommand = $"-NoProfile -Command \"Get-NetFirewallRule -DisplayName '{RulePrefixPsEscaped}*' -ErrorAction SilentlyContinue | ForEach-Object {{ $_.DisplayName + '||' + $_.Description + '||' + ((($_ | Get-NetFirewallAddressFilter).RemoteAddress) -join ',') }}\"";
-
-                var psi = new ProcessStartInfo("powershell", psCommand)
+                // All rules with errors stopping the script, filtered here, through the same runner
+                // delete and reset use: a failed listing must be reported, never shown as "none".
+                string output;
+                try
                 {
-                    RedirectStandardOutput = true,
-                    UseShellExecute = false,
-                    CreateNoWindow = true
-                };
-
-                using var proc = Process.Start(psi);
-                if (proc is null) { Console.WriteLine("Could not start the query process."); return; }
-                string output = proc.StandardOutput.ReadToEnd();
-                proc.WaitForExit();
+                    output = RunPowerShell(
+                        $"Get-NetFirewallRule -ErrorAction Stop | Where-Object {{ $_.DisplayName -like '{RulePrefixPsEscaped}*' }} | " +
+                        "ForEach-Object { $_.DisplayName + '||' + $_.Description + '||' + ((($_ | Get-NetFirewallAddressFilter).RemoteAddress) -join ',') }");
+                }
+                catch (Exception ex)
+                {
+                    AdminLogger.Error($"[ERROR] Could not read the firewall rules: {ex.Message}");
+                    Environment.ExitCode = 1;
+                    return;
+                }
 
                 if (string.IsNullOrWhiteSpace(output))
                 {
@@ -1342,7 +1441,7 @@ namespace MFAAdmin
                         // Name is "<RulePrefix><ip>_<port>_<protocol>". Strip the prefix before
                         // splitting: it may contain any number of underscores (or none).
                         string name = parts[0].Trim();
-                        if (!name.StartsWith(RulePrefix, StringComparison.Ordinal)) continue;
+                        if (!name.StartsWith(RulePrefix, StringComparison.OrdinalIgnoreCase)) continue;   // as PowerShell -like
                         var nameParts = name.Substring(RulePrefix.Length).Split('_');
                         string ip = nameParts[0];
                         string port = nameParts.Length > 1 ? nameParts[1].Trim() : "?";
@@ -1405,6 +1504,7 @@ namespace MFAAdmin
                 catch (Exception ex)
                 {
                     AdminLogger.Error($"[ERROR] Could not read the firewall rules: {ex.Message}");
+                    Environment.ExitCode = 1;
                     return;
                 }
 
@@ -1510,20 +1610,25 @@ namespace MFAAdmin
             {
                 if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
                 {
-                    // WINDOWS: Delete all temporary Web API rules
-                    string psCommand = $"-NoProfile -Command \"Remove-NetFirewallRule -DisplayName '{RulePrefixPsEscaped}*' -ErrorAction SilentlyContinue\"";
+                    // WINDOWS: remove every MFA-granted rule, then list them again and report what
+                    // actually remains, rather than assuming the removal worked.
+                    int before = ListWindowsManagedRules().Count;
+                    if (before > 0)
+                        RunPowerShell($"Remove-NetFirewallRule -DisplayName '{RulePrefixPsEscaped}*' -ErrorAction Stop");
+                    int left = ListWindowsManagedRules().Count;
 
-                    var psi = new ProcessStartInfo("powershell", psCommand)
+                    if (left > 0)
                     {
-                        CreateNoWindow = true,
-                        UseShellExecute = false
-                    };
-
-                    using var proc = Process.Start(psi);
-                    proc?.WaitForExit();
-
-                    AdminLogger.Log($"[SUCCESS] Removed Windows firewall rules matching '{RulePrefix}*'. " +
-                        "Established connections are not terminated by this.");
+                        Environment.ExitCode = 1;
+                        AdminLogger.Error(
+                            $"[ERROR] {left} MFA-managed firewall rule(s) REMAIN after reset. Access is still open. " +
+                            $"Remove them manually: Get-NetFirewallRule -DisplayName '{RulePrefix}*' | Remove-NetFirewallRule");
+                    }
+                    else if (before == 0)
+                        AdminLogger.Log("[INFO] No MFA-managed firewall rules were present. Nothing to remove.");
+                    else
+                        AdminLogger.Log($"[SUCCESS] Removed {before} MFA-managed firewall rule(s); verified none remain. " +
+                            "Established connections are not terminated by this.");
                 }
                 else
                 {
@@ -1554,10 +1659,13 @@ namespace MFAAdmin
                     }
 
                     if (remaining > 0)
+                    {
+                        Environment.ExitCode = 1;
                         AdminLogger.Error(
                             $"[ERROR] {remaining} MFA-managed iptables/ip6tables rule(s) REMAIN after reset ({failed} delete(s) failed). " +
                             "Access is still open. Remove them manually: iptables -S INPUT | grep " + RulePrefix +
                             " (and ip6tables -S INPUT for IPv6).");
+                    }
                     else if (attempted == 0)
                         AdminLogger.Log("[INFO] No MFA-managed iptables/ip6tables rules were present. Nothing to remove.");
                     else
@@ -1579,6 +1687,7 @@ namespace MFAAdmin
             catch (Exception ex)
             {
                 AdminLogger.Error($"[ERROR] Failed to reset firewall: {ex.Message}");
+                Environment.ExitCode = 1;
             }
         }
     }

@@ -68,9 +68,6 @@ All three components read from their own `appsettings.json`. Copy the
   "DpapiEntropy":      "REPLACE-WITH-A-UNIQUE-RANDOM-STRING",
   "RateLimitPerWindow": 20,
   "AllowedDomains":    [ "your-domain.com" ],
-  "FirewallService": {
-    "GmsaAccount": "YOURDOMAIN\\MFA_Service$"
-  },
   "Smtp": {
     "Host": "your-smtp-server",  "Port": 587,  "UseSsl": true,
     "FromAddress": "security@your-domain.com",
@@ -90,10 +87,9 @@ All three components read from their own `appsettings.json`. Copy the
 | `SiteName` | Displayed in page titles, the TOTP issuer name, and provisioning emails. |
 | `LogoUrl` | Optional URL of a logo image shown on the login page. Leave empty to use the bundled knocker logo (`wwwroot/knocker.png`). If set to an external URL, that origin is added to the `img-src` CSP directive automatically. |
 | `DpapiEntropy` | **Required on Windows.** A deployment-specific value mixed into the DPAPI key derivation on Windows. It prevents other processes on the same machine from reading the database without knowing this value — keep it consistent across all three components. Startup fails if it is missing, under 16 characters, or still the placeholder from `appsettings.example.json` (that placeholder is published in the public repository and protects nothing). On Linux it is not used (the database is plain JSON) and is neither required nor checked. See [step 3](#3-configure-appsettingsjson-and-restrict-permissions) for how to generate one. |
-| `RateLimitPerWindow` | Maximum requests per 5-minute window to the login and registration routes, per partition. An IPv4 address is its own partition; an IPv6 address is bucketed by its /56 network prefix, since a single customer allocation commonly spans a /56 or /64 and partitioning on the full address would let anyone inside their own allocation get an effectively fresh bucket per request. Default: 20. |
-| `GlobalRateLimitPerWindow` | A single aggregate cap on those routes shared across every partition combined, as a backstop independent of the per-partition key. Default: 200. Only the app's own routes count toward it. Everything else (static files such as the login script, logo and favicon, unknown paths, and requests with the wrong HTTP method) has a fixed per-partition limit of its own instead (120 per 5 minutes), so one source cannot exhaust the shared budget that way and lock everyone out. |
+| `RateLimitPerWindow` | Maximum requests per 5-minute window to the login and registration routes, per partition. An IPv4 address is its own partition; an IPv6 address is bucketed by its /56 network prefix, since a single customer allocation commonly spans a /56 or /64 and partitioning on the full address would let anyone inside their own allocation get an effectively fresh bucket per request. Each IPv6 /48 as a whole is also limited, to ten times this value, since a /48 holds 256 /56s and is easy to obtain from many hosting providers. (Cellular carriers often give each device a /64 out of a shared /48, so unrelated users on one carrier can share that budget.) Default: 20. |
+| `GlobalRateLimitPerWindow` | A single aggregate cap on those routes shared across every partition combined, as a backstop independent of the per-partition key. Because every user shares it, the higher it is, the more sources it takes to use it up. Default: 2000 in the passkey-only build, where passkey sign-in cannot be guessed and the cap bounds password-hashing work; using it up takes about 100 IPv4 addresses or 10 IPv6 /48s. **Default: 200 in a TOTP build,** where it is what bounds distributed guessing of a 6-digit code once a password is known: with 3 valid codes in a million, enough sources to use the whole cap have an even chance of a correct code within about four days at 200, or about ten hours at 2000. Only the app's own routes count toward it, and only requests that are within their own partition's `RateLimitPerWindow`: a request already refused by its partition's limit does not use up the shared budget, so one source cannot drain it. Everything else (static files such as the login script, logo and favicon, unknown paths, and requests with the wrong HTTP method) has a fixed per-partition limit of its own instead (120 per 5 minutes) and never counts toward the shared budget. |
 | `AllowedDomains` | Email address domains permitted to use the system. Enforced in both MFAWeb (login form rejects other domains) and MFAAdmin (`add` refuses to provision an account outside these domains). |
-| `FirewallService:GmsaAccount` | Required IPC client identity. On Windows, the gMSA account that MFAWeb runs as. On Linux, set this to the local account `mfaweb` in MFAService's config. The service rejects clients whose identity does not match. |
 | `AccountAlert:Threshold` | Failed login attempts for one account, within `WindowMinutes`, before a `[SECURITY]` log line fires (and an email, if `SendEmail` is on). Detection only — the account is never locked. Default: 10. |
 | `AccountAlert:WindowMinutes` | The window `Threshold` and `MaxEmailsPerWindow` are measured over. Default: 15. |
 | `AccountAlert:SendEmail` | Off by default. When on, requires `Smtp:{Host,FromAddress,NotifyAddress}` to be fully configured or nothing is sent (logged as a warning instead). |
@@ -118,9 +114,10 @@ All three components read from their own `appsettings.json`. Copy the
 | Key | Description |
 |-----|-------------|
 | `DpapiEntropy` | Windows only. Must match MFAWeb and MFAAdmin exactly. |
+| `FirewallService:GmsaAccount` | **Required.** The account MFAWeb runs as: the gMSA on Windows, `mfaweb` on Linux. MFAService rejects IPC clients whose identity does not match. Only MFAService reads this setting. |
 | `BouncerConfig:AllowedPorts` | Ports opened for each authenticated IP, in `port/protocol` format. Examples: `"22/TCP"`, `"51820/UDP"`. |
-| `BouncerConfig:ExpirationHours` | How long firewall rules stay open. Rules are automatically removed by the sweeper when they expire. **Clamped to 1-48 on the privileged side**, so a larger value is reduced to 48 and logged with a `[CONFIG]` warning — a slipped digit cannot leave a standing grant. Every `AllowedPorts` entry must use a port in 1-65535 and protocol TCP or UDP; an invalid entry fails the grant request instead of returning a partial success. |
-| `BouncerConfig:RulePrefix` | Prefix applied to every firewall rule name. Must also match the value in MFAAdmin's config so the `diag` and `reset` commands can find the rules. Letters, digits, space, `_`, `.` and `-` only, 1-64 characters; MFAService refuses to start with anything else, since a quote in the prefix breaks the firewall commands and, on Linux, leaves grants the sweeper can never remove. |
+| `BouncerConfig:ExpirationHours` | How long firewall rules stay open. Rules are automatically removed by the sweeper when they expire. **Clamped to 1-48 on the privileged side**, so a larger value is reduced to 48 and logged with a `[CONFIG]` warning — a slipped digit cannot leave a standing grant. Every `AllowedPorts` entry must use a port in 1-65535 and protocol TCP or UDP; an invalid entry fails the grant request before any rule is written. If the firewall command itself fails for one port after another has opened (a held firewall lock, for instance), the request reports an error but the opened port stays open until it expires; signing in again re-applies all of them. |
+| `BouncerConfig:RulePrefix` | Prefix applied to every firewall rule name. Must also match the value in MFAAdmin's config so the `diag` and `reset` commands can find the rules. Letters, digits, space, `_`, `.` and `-` only, 1-64 characters; MFAService refuses to start with anything else, since a quote in the prefix breaks the firewall commands and, on Linux, leaves grants the sweeper can never remove. Use a prefix no other firewall rule on the host starts with: the sweeper treats every rule with the prefix as its own, and reports one without a readable expiry as an error on every pass, with an alert email at most once a day. |
 | `BouncerConfig:Ipv6GrantPrefixLength` | How much of an IPv6 client's address a grant covers: `128` (the default) is the exact address, and anything down to `64` widens the grant to that address's network, so a client whose address changes within its `/64` (privacy addresses, cellular carriers) keeps access. Values outside 64-128 are clamped, with a `[CONFIG]` warning. IPv4 grants are never widened. Applies on both platforms: Windows has always handled IPv6 grants, as the exact address only, until 0.4.0; on Linux IPv6 grants are new in 0.4.0. |
 | `HttpsCert:PemPath` | **Linux only, and required for expiry alerts there.** Full path to the certificate MFAWeb serves (e.g. `/etc/mfa-auth/tls/current/fullchain.pem`). There is no certificate store on Linux, so without this the expiry watchdog logs `[CERT] Monitor disabled` at startup and never alerts — and an expired certificate means no passkey sign-in at all. |
 
@@ -133,9 +130,6 @@ All three components read from their own `appsettings.json`. Copy the
   "DpapiEntropy":   "REPLACE-WITH-A-UNIQUE-RANDOM-STRING",
   "BouncerUrl":     "https://your.domain.com:8443",
   "RulePrefix":     "MFA_Temp_",
-  "FirewallService": {
-    "GmsaAccount": "YOURDOMAIN\\MFA_Service$"
-  },
   "Smtp": {
     "Host": "your-smtp-server",  "Port": 587,  "UseSsl": true,
     "FromAddress": "security@your-domain.com",
@@ -196,16 +190,39 @@ dotnet publish MFAWeb/MFAWeb.csproj     -c Release -r win-x64 --self-contained
 dotnet publish MFAAdmin/MFAAdmin.csproj -c Release -r win-x64 --self-contained
 ```
 
-Copy the publish outputs to their installation directories, for example:
-- `C:\Services\MFAService\`
-- `C:\Services\MFAWeb\`
-- `C:\Tools\MFAAdmin\`
+Copy the publish outputs to their installation directories under `C:\Program Files`:
+- `C:\Program Files\FirewallKnocker\MFAService\`
+- `C:\Program Files\FirewallKnocker\MFAWeb\`
+- `C:\Program Files\FirewallKnocker\MFAAdmin\`
+
+**Install under `C:\Program Files`, not in a new folder under `C:\`.** Program Files lets only
+SYSTEM, Administrators and TrustedInstaller modify its contents. A new folder under `C:\`
+instead inherits rights that let ordinary local accounts, service accounts included, write to it:
+on Windows Server they can create files and folders in it, and on client editions of Windows
+Authenticated Users have Modify and can also replace existing files. Either lets a local account
+place a file that MFAService loads as LocalSystem at its next start (and MFAAdmin's files run
+elevated). If you must install elsewhere, remove the inherited permissions from each program
+folder before copying anything into it:
+
+```powershell
+icacls "D:\FirewallKnocker" /inheritance:r `
+    /grant 'SYSTEM:(OI)(CI)F' `
+    /grant 'Administrators:(OI)(CI)F' `
+    /grant 'Users:(OI)(CI)RX'
+```
+
+Check the result with `icacls`: no account other than SYSTEM, Administrators and TrustedInstaller
+may have a write right (`F`, `M`, `W`, `WD` or `AD`, alone or in a list such as `(RX,WD)`) on the
+program folders or on any file in them. (An inherit-only
+`CREATOR OWNER` entry, marked `(IO)`, is normal under Program Files; it applies only to files an
+account creates itself, and other accounts cannot create files there.)
 
 ### 3. Configure appsettings.json and Restrict Permissions
 
 In each installation directory, copy `appsettings.example.json` to `appsettings.json`
 and fill in the values. The `DpapiEntropy` value must be identical in all three files (it is
-used on Windows only).
+used on Windows only). A file copied into a program folder is readable by all users until the
+`icacls` commands below run, so run those first and fill in the secrets afterwards.
 
 Generate a strong entropy string with a cryptographic RNG (works on both Windows
 PowerShell 5.1 and PowerShell 7):
@@ -222,9 +239,10 @@ $b = New-Object byte[] 32
 **Now restrict access to the secrets.** This step is mandatory, not optional.
 
 On Windows, DPAPI is used at `LocalMachine` scope, so `DpapiEntropy` is the only thing
-separating `users.dat` from any other process on the host. `C:\ProgramData` and newly
-created folders under `C:\` grant **Authenticated Users** read access by default — which
-would let any local non-admin read the entropy out of `appsettings.json`, read `users.dat`,
+separating `users.dat` from any other process on the host. `C:\ProgramData` grants **Users**
+read access by default, and a newly created folder under `C:\` lets ordinary accounts read it
+(and, on client editions of Windows, modify it) — either of which would let any local non-admin read the entropy out of
+`appsettings.json`, read `users.dat`,
 and call `ProtectedData.Unprotect` to recover the **plaintext TOTP secrets** and the current
 password hash of every user — which, for any account that has confirmed TOTP, is that account's
 actual ongoing login credential, not a one-time value.
@@ -258,14 +276,14 @@ icacls "C:\ProgramData\MFAAuth\Logs" `
 
 # Each appsettings.json holds DpapiEntropy and SMTP credentials.
 foreach ($f in @(
-    "C:\Services\MFAService\appsettings.json",
-    "C:\Services\MFAWeb\appsettings.json",
-    "C:\Tools\MFAAdmin\appsettings.json")) {
+    "C:\Program Files\FirewallKnocker\MFAService\appsettings.json",
+    "C:\Program Files\FirewallKnocker\MFAWeb\appsettings.json",
+    "C:\Program Files\FirewallKnocker\MFAAdmin\appsettings.json")) {
     icacls $f /inheritance:r /grant 'SYSTEM:F' /grant 'Administrators:F'
 }
 
 # Only MFAWeb runs as the gMSA, so only its config needs the extra grant.
-icacls "C:\Services\MFAWeb\appsettings.json" /grant 'YOURDOMAIN\MFA_Service$:R'
+icacls "C:\Program Files\FirewallKnocker\MFAWeb\appsettings.json" /grant 'YOURDOMAIN\MFA_Service$:R'
 ```
 
 
@@ -273,8 +291,13 @@ Verify that `Users` and `Authenticated Users` are absent from the result:
 
 ```powershell
 icacls "C:\ProgramData\MFAAuth"
-icacls "C:\Services\MFAWeb\appsettings.json"
+icacls "C:\Program Files\FirewallKnocker\MFAWeb\appsettings.json"
+icacls "C:\Program Files\FirewallKnocker\MFAService\appsettings.json"
+icacls "C:\Program Files\FirewallKnocker\MFAAdmin\appsettings.json"
 ```
+
+On the program folders themselves, `Users` has read and execute (`RX`) only; check them for write
+rights as in [step 2](#2-publish-the-applications): `icacls "C:\Program Files\FirewallKnocker" /T`.
 
 > MFAAdmin runs elevated, so Administrators access is sufficient for it; it does not need
 > a separate grant. The read-only file attribute that `DatabaseLockService` sets on
@@ -298,10 +321,14 @@ defaults to LocalSystem, so simply omit `-Credential`:
 ```powershell
 New-Service `
     -Name "MFAFirewallService" `
-    -BinaryPathName "C:\Services\MFAService\MFAService.exe" `
+    -BinaryPathName '"C:\Program Files\FirewallKnocker\MFAService\MFAService.exe"' `
     -DisplayName "MFA Firewall Service" `
     -StartupType Automatic
 ```
+
+> The inner double quotes around `-BinaryPathName` are required. The path contains spaces,
+> and an unquoted service path makes Windows try `C:\Program.exe` and then
+> `C:\Program Files\FirewallKnocker\MFAService\MFAService.exe` as separate candidates.
 
 > If firewall rules fail to open, **do not** "fix" it by adding the gMSA to local
 > Administrators — that collapses the privilege boundary this design exists to create.
@@ -312,7 +339,7 @@ New-Service `
 ```powershell
 New-Service `
     -Name "MFAWebService" `
-    -BinaryPathName "C:\Services\MFAWeb\MFAWeb.exe" `
+    -BinaryPathName '"C:\Program Files\FirewallKnocker\MFAWeb\MFAWeb.exe"' `
     -DisplayName "MFA Web Service" `
     -StartupType Automatic `
     -Credential "YOURDOMAIN\MFA_Service$"
@@ -364,7 +391,7 @@ New-NetFirewallRule `
     -Direction Inbound `
     -Protocol TCP `
     -LocalPort 8443 `
-    -Program "C:\Services\MFAWeb\MFAWeb.exe" `
+    -Program "C:\Program Files\FirewallKnocker\MFAWeb\MFAWeb.exe" `
     -Action Allow
 ```
 
@@ -379,8 +406,8 @@ Points worth getting right:
   matching silently — MFAWeb simply becomes unreachable. Update it rather than recreating:
 
   ```powershell
-  Get-NetFirewallRule -DisplayName "MFA Web (HTTPS)" |
-      Set-NetFirewallApplicationFilter -Program "D:\Services\MFAWeb\MFAWeb.exe"
+  Set-NetFirewallRule -DisplayName "MFA Web (HTTPS)" -Program "D:\FirewallKnocker\MFAWeb\MFAWeb.exe"
+  Get-NetFirewallRule -DisplayName "MFA Web (HTTPS)" | Get-NetFirewallApplicationFilter   # Program must show the new path
   ```
 
 - **Verify the filter took effect**, then confirm reachability from another machine *before* you
@@ -479,7 +506,8 @@ the setting and restart `mfa-service` before retrying a login. Removing the sett
 disable the identity check.
 
 MFAWeb and MFAService both log to `/var/log/mfa-auth` on Linux by default (created in step 1),
-so leave `LogPath` unset in both configs. If you set it, use that same directory: the MFAWeb unit
+so leave `LogPath` unset in MFAWeb's config (MFAService and MFAAdmin always use that directory
+and have no such setting). If you set it, use that same directory: the MFAWeb unit
 below grants write access to `/var/log/mfa-auth` only.
 
 On Linux you **must** keep the `Kestrel:Endpoints:Https:Certificate` block and point `Path`
@@ -620,7 +648,7 @@ UMask=0027
 NoNewPrivileges=true
 ProtectHome=true
 ProtectSystem=strict
-# MFAWeb logs to /var/log/mfa-auth, the directory shared with MFAService (see step 4) -- not a
+# MFAWeb logs to /var/log/mfa-auth, the directory shared with MFAService (see step 1) -- not a
 # LogsDirectory= of its own. Verified directly: LogsDirectory=mfa-web here silently pointed
 # write access at /var/log/mfa-web instead, and every log write failed under ProtectSystem=strict.
 ReadWritePaths=/var/log/mfa-auth
@@ -941,6 +969,12 @@ MFAAdmin import <file.json>    Import users from a previously exported file
 MFAAdmin purge-totp            Clear stored TOTP secrets (see Passkey-Only Mode below)
 ```
 
+`diag`, `delete` and `reset` exit with status 1 when the firewall could not be read; `delete`
+and `reset` also when rules remain afterwards; and `delete` also when there was nothing to
+delete. On Windows, run MFAAdmin
+from an elevated prompt if a script checks the status: started without elevation, it relaunches
+itself elevated and the original process returns 0.
+
 ### Passkey-Only Mode
 
 TOTP is a **build-time** decision, not a setting. The default build has no TOTP login or
@@ -994,7 +1028,8 @@ then re-run it.
 **Do this after installing, and again after any firewall change.** It is the one check that
 distinguishes a working deployment from a decorative one, and nothing else will tell you.
 
-This tool only adds *allow* rules. It never removes anything. If the protected port is already
+This tool only adds *allow* rules, and removes only rules under its own prefix. It never adds a
+block rule and never removes another rule. If the protected port is already
 reachable for another reason, every grant it opens is redundant and the gate protects nothing —
 while the logs, the web UI and the firewall rules all continue to look exactly as they would if it
 were working. There is no symptom.
@@ -1058,12 +1093,22 @@ inert.
 Then:
 
 1. **Back up first** — `users.dat` and the whole install directory. Rollback is putting the old
-   directory back, so it is worth having.
+   directory back, so it is worth having. The backup holds the same secrets as the install
+   (`DpapiEntropy`, SMTP credentials, the database), so keep it in a folder restricted to SYSTEM
+   and Administrators, under `C:\ProgramData\MFAAuth` (restricted in
+   [Windows Installation step 3](#3-configure-appsettingsjson-and-restrict-permissions)), as
+   below. (A new folder under `C:\` would be readable by all users, and another user could even
+   create it first.) Use
+   your actual install path; installs that followed earlier versions of this guide are under
+   `C:\Services` and `C:\Tools` (see step 6).
 
    ```powershell
    # Windows
-   robocopy "C:\Program Files\FirewallKnocker" "C:\Backups\FirewallKnocker\<date>" /E
-   copy C:\ProgramData\MFAAuth\users.dat C:\Backups\FirewallKnocker\<date>\
+   $backup = "C:\ProgramData\MFAAuth\Backups\$(Get-Date -Format yyyyMMdd-HHmmss)"
+   New-Item -ItemType Directory -Force -Path $backup | Out-Null
+   icacls $backup /inheritance:r /grant 'SYSTEM:(OI)(CI)F' /grant 'Administrators:(OI)(CI)F'
+   robocopy "C:\Program Files\FirewallKnocker" "$backup\FirewallKnocker" /E
+   copy C:\ProgramData\MFAAuth\users.dat "$backup\"
    ```
    ```bash
    # Linux
@@ -1084,7 +1129,8 @@ Then:
    ```
 
 2. **Keep your `appsettings.json`.** Release archives ship only `appsettings.example.json`, so
-   copy your existing config into the new directory rather than re-deriving it.
+   copy your existing config into the new directory rather than re-deriving it. (Exception:
+   step 6.)
 
 3. **If upgrading from 0.3.0 or earlier, check `RulePrefix` first.** It may now contain only
    letters, digits, space, `_`, `.` and `-`, at most 64 characters. MFAService refuses to start
@@ -1124,32 +1170,124 @@ Then:
    systemctl show mfa-service -p RestrictAddressFamilies   # should list AF_INET and AF_INET6
    ```
 
-6. **If upgrading from before 0.2.0, add `FirewallService:GmsaAccount` to MFAService's config.**
+6. **Windows, if upgrading from 0.5.0 or earlier: check the install folders.** Earlier versions
+   of this guide installed into new folders under `C:\` (`C:\Services\MFAService`,
+   `C:\Services\MFAWeb`, `C:\Tools\MFAAdmin`). By default, a new folder under `C:\` lets ordinary
+   local accounts, service accounts included, write to it: on Windows Server they can create files
+   and folders in it, and on client editions of Windows they can also replace existing files.
+   MFAService loads files from its folder as LocalSystem. Check each folder and the files in it:
+
+   ```powershell
+   icacls "C:\Services\MFAService" /T
+   icacls "C:\Services\MFAWeb" /T
+   icacls "C:\Tools\MFAAdmin" /T
+   ```
+
+   If any account other than SYSTEM, Administrators or TrustedInstaller has a write right (`F`,
+   `M`, `W`, `WD` or `AD`, alone or in a list such as `(RX,WD)`), install this release into
+   `C:\Program Files\FirewallKnocker` and retire the old folders.
+
+   The files already there are suspect only if an account or process on the server has created or
+   changed files in those folders; until the move, the folders remain writable. On a server where
+   only administrators sign in and no untrusted software runs, that risk is low. The program files
+   are replaced in any case; the configuration can be carried over once checked.
+
+   To look for changes, compare the old folders with the archive of the version that was
+   installed. Any file other than `appsettings.json` that is not in the archive, or whose SHA-256
+   differs, means the host should be treated as compromised, since MFAService runs as LocalSystem.
+
+   - **Program files:** extract the release archive's `MFAService`, `MFAWeb` and `MFAAdmin`
+     folders into `C:\Program Files\FirewallKnocker\` (location and permissions:
+     [Windows Installation step 2](#2-publish-the-applications)). Copy nothing else from the old
+     folders.
+   - **Configuration:** check each old `appsettings.json`, in particular `AppUrl`,
+     `AdditionalOrigins`, `AllowedDomains`, `FirewallService:GmsaAccount`, `BouncerConfig:*`,
+     `RulePrefix`, `Smtp:*` (provisioning email carries the temporary password), `BouncerUrl`
+     (the emailed link), and MFAWeb's `LogPath`, `Kestrel:*` and `HttpsCert:*`, and remove any
+     `DbPath` setting. Then copy it with the script below, which
+     restricts each new file before its contents arrive (a plain copy would inherit Program Files'
+     read access for all users). If you suspect the old folders were tampered with, create each
+     `appsettings.json` from the release's `appsettings.example.json` instead
+     ([Windows Installation step 3](#3-configure-appsettingsjson-and-restrict-permissions)) and
+     re-enter the values by hand; `DpapiEntropy` must match the old value exactly, or the database
+     cannot be read.
+
+     ```powershell
+     $moves = @{ "C:\Services\MFAService" = "MFAService"; "C:\Services\MFAWeb" = "MFAWeb"; "C:\Tools\MFAAdmin" = "MFAAdmin" }
+     foreach ($old in $moves.Keys) {
+         $new = "C:\Program Files\FirewallKnocker\$($moves[$old])\appsettings.json"
+         New-Item -ItemType File -Force -Path $new | Out-Null
+         icacls $new /inheritance:r /grant 'SYSTEM:F' /grant 'Administrators:F' | Out-Null
+         if ($moves[$old] -eq 'MFAWeb') { icacls $new /grant 'YOURDOMAIN\MFA_Service$:R' | Out-Null }
+         [IO.File]::WriteAllBytes($new, [IO.File]::ReadAllBytes("$old\appsettings.json"))  # keeps the ACL above
+     }
+     ```
+
+   - **Database:** `users.dat` is in `C:\ProgramData\MFAAuth`
+     ([Windows Installation step 3](#3-configure-appsettingsjson-and-restrict-permissions)) and is
+     not moved; MFAService uses that path regardless of configuration.
+   - **Old backups:** earlier versions of this guide backed up to `C:\Backups\FirewallKnocker`,
+     which is readable by all users by default and holds `DpapiEntropy` and the database. Move
+     those backups under `C:\ProgramData\MFAAuth\Backups` (step 1) or delete them.
+
+   Stop both services, point them and the firewall rule at the new location, start MFAService and
+   then MFAWeb, and update anything else that calls the old paths (scripts, shortcuts, scheduled
+   tasks). Quote each service path: for an unquoted path with spaces, Windows tries
+   `C:\Program.exe` first. Rollback is pointing the two service paths and the firewall rule's
+   program back at the old folders (the same commands with the old paths), not restoring the old
+   files over the new install. Delete the old program folders once step 10 passes.
+
+   ```powershell
+   Stop-Service MFAWebService, MFAFirewallService
+   # Single quotes outside, so the double quotes are stored in the value.
+   $svc = 'HKLM:\SYSTEM\CurrentControlSet\Services'
+   Set-ItemProperty "$svc\MFAFirewallService" ImagePath '"C:\Program Files\FirewallKnocker\MFAService\MFAService.exe"'
+   Set-ItemProperty "$svc\MFAWebService"      ImagePath '"C:\Program Files\FirewallKnocker\MFAWeb\MFAWeb.exe"'
+   sc.exe qc MFAFirewallService | Select-String BINARY_PATH_NAME   # must show the path in double quotes
+   sc.exe qc MFAWebService      | Select-String BINARY_PATH_NAME
+   Set-NetFirewallRule -DisplayName "MFA Web (HTTPS)" -Program "C:\Program Files\FirewallKnocker\MFAWeb\MFAWeb.exe"
+   Get-NetFirewallRule -DisplayName "MFA Web (HTTPS)" | Get-NetFirewallApplicationFilter   # Program must show the new path
+   Start-Service MFAFirewallService; Start-Service MFAWebService
+   ```
+
+7. **If upgrading from before 0.2.0, add `FirewallService:GmsaAccount` to MFAService's config.**
    The IPC identity check added in that release (see the next step) rejects every client —
    including a correctly upgraded MFAWeb — until this is set, because an older config simply
-   doesn't have the key (see `FirewallService:GmsaAccount` under MFAWeb's configuration reference
-   above — the same value belongs in MFAService's own config). On Windows this is the gMSA account
+   doesn't have the key (see `FirewallService:GmsaAccount` under MFAService's configuration
+   reference above). On Windows this is the gMSA account
    MFAWeb runs as; on Linux it's the local account MFAWeb runs as (`mfaweb` in this guide's
    example). Restart MFAService after adding it and confirm the log line
    `[IPC] Peer verification enabled: only uid <n> ('mfaweb') may connect.` (Linux) or
    `[IPC] Claiming pipe name for gMSA '<name>'...` (Windows, `Debug` log level) before moving on.
 
-7. **Upgrade MFAService before MFAWeb.** From 0.2.0 the client verifies the privileged service's
+8. **Upgrade MFAService before MFAWeb.** From 0.2.0 the client verifies the privileged service's
    identity before sending anything, so a newer MFAWeb against an older MFAService is the
-   combination most likely to fail. The reverse order is safe.
+   combination most likely to fail. The reverse order is safe. On Linux the backup in step 1
+   stopped both services; once the new files are in place, start them in that order
+   (`sudo systemctl start mfa-service`, then `sudo systemctl start mfa-web`). Expired grants are
+   not removed while MFAService is stopped.
 
-8. **Deploy all three components together** when the release changes `users.dat`'s schema — they
-   share it. Release notes say when that applies.
+9. **Deploy all three components together** when the release changes `users.dat`'s schema — they
+   share it. Release notes say when that applies. **Always replace MFAService and MFAAdmin
+   together:** they serialize their database writes with a shared lock, which changed in 0.4.2
+   (Linux) and in 0.5.1 (Windows, from a named mutex to `users.lock`); an older MFAAdmin and a
+   newer MFAService would not take the same lock.
 
-9. **Verify before you disconnect**, while you still have the independent path open:
+   **From 0.5.1 the sweeper treats every firewall rule whose name starts with the rule prefix as
+   its own.** It removes one whose expiry is further ahead than the 48-hour maximum (plus an hour's
+   allowance) and reports one with no readable expiry on every pass. If you keep firewall rules of your own whose names start with the
+   prefix, rename them before upgrading.
+
+10. **Verify before you disconnect**, while you still have the independent path open:
    - both services are running, and the logs show the expected version at startup
    - MFAWeb serves HTTPS and selects a certificate
    - **a real passkey login opens a rule** — this is the only test that exercises the whole
      chain, including the IPC identity check added in 0.2.0
    - the rule disappears at expiry (or shorten `ExpirationHours` temporarily to watch it)
 
-10. **If it fails**, stop both services, restore the backed-up directory, and start them again —
-   privileged service first.
+11. **If it fails**, stop both services, restore the backed-up directory, and start them again —
+   privileged service first. (If you moved the install in step 6, roll back as described there
+   instead.)
 
    On Linux, first move the failed installation directories aside under distinct names. Restore
    each snapshot directory to its now-absent original path (`mfa-service`, `mfa-web`, and
