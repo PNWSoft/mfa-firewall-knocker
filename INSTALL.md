@@ -89,7 +89,7 @@ All three components read from their own `appsettings.json`. Copy the
 | `AdditionalOrigins` | Optional list of other names for this same server where passkey sign-in should work, as exact origins such as `"https://v6.your.domain.com:8443"`. The usual reason is an IPv6-only name (AAAA record only), so phones on cellular can't choose IPv4 and land behind carrier NAT; see the README's IPv6 notes. Each entry must be `https`, must be `AppUrl`'s host or a name under it, must use `AppUrl`'s port, and must have no path; MFAWeb refuses to start otherwise, and logs the accepted list at startup. The **one** certificate MFAWeb serves must cover every name listed (it selects a single certificate for all names, so a separate certificate for the extra name is never used), and MFAService's expiry alert checks only the main name. Every name listed is trusted exactly as `AppUrl` is: if you remove a name's DNS record, remove it here too. Default: empty. |
 | `SiteName` | Displayed in page titles, the TOTP issuer name, and provisioning emails. |
 | `LogoUrl` | Optional URL of a logo image shown on the login page. Leave empty to use the bundled knocker logo (`wwwroot/knocker.png`). If set to an external URL, that origin is added to the `img-src` CSP directive automatically. |
-| `DpapiEntropy` | **Required.** A deployment-specific value mixed into the DPAPI key derivation on Windows. It prevents other processes on the same machine from reading the database without knowing this value — keep it consistent across all three components. Startup fails if it is missing, under 16 characters, or still the placeholder from `appsettings.example.json` (that placeholder is published in the public repository and protects nothing). On Linux it is unused for encryption (the database is plain JSON) but is still validated at startup. See [step 3](#3-configure-appsettingsjson-and-restrict-permissions) for how to generate one. |
+| `DpapiEntropy` | **Required on Windows.** A deployment-specific value mixed into the DPAPI key derivation on Windows. It prevents other processes on the same machine from reading the database without knowing this value — keep it consistent across all three components. Startup fails if it is missing, under 16 characters, or still the placeholder from `appsettings.example.json` (that placeholder is published in the public repository and protects nothing). On Linux it is not used (the database is plain JSON) and is neither required nor checked. See [step 3](#3-configure-appsettingsjson-and-restrict-permissions) for how to generate one. |
 | `RateLimitPerWindow` | Maximum requests per 5-minute window to the login and registration routes, per partition. An IPv4 address is its own partition; an IPv6 address is bucketed by its /56 network prefix, since a single customer allocation commonly spans a /56 or /64 and partitioning on the full address would let anyone inside their own allocation get an effectively fresh bucket per request. Default: 20. |
 | `GlobalRateLimitPerWindow` | A single aggregate cap on those routes shared across every partition combined, as a backstop independent of the per-partition key. Default: 200. Only the app's own routes count toward it. Everything else (static files such as the login script, logo and favicon, unknown paths, and requests with the wrong HTTP method) has a fixed per-partition limit of its own instead (120 per 5 minutes), so one source cannot exhaust the shared budget that way and lock everyone out. |
 | `AllowedDomains` | Email address domains permitted to use the system. Enforced in both MFAWeb (login form rejects other domains) and MFAAdmin (`add` refuses to provision an account outside these domains). |
@@ -117,7 +117,7 @@ All three components read from their own `appsettings.json`. Copy the
 
 | Key | Description |
 |-----|-------------|
-| `DpapiEntropy` | Must match MFAWeb and MFAAdmin exactly. |
+| `DpapiEntropy` | Windows only. Must match MFAWeb and MFAAdmin exactly. |
 | `BouncerConfig:AllowedPorts` | Ports opened for each authenticated IP, in `port/protocol` format. Examples: `"22/TCP"`, `"51820/UDP"`. |
 | `BouncerConfig:ExpirationHours` | How long firewall rules stay open. Rules are automatically removed by the sweeper when they expire. **Clamped to 1-48 on the privileged side**, so a larger value is reduced to 48 and logged with a `[CONFIG]` warning — a slipped digit cannot leave a standing grant. Every `AllowedPorts` entry must use a port in 1-65535 and protocol TCP or UDP; an invalid entry fails the grant request instead of returning a partial success. |
 | `BouncerConfig:RulePrefix` | Prefix applied to every firewall rule name. Must also match the value in MFAAdmin's config so the `diag` and `reset` commands can find the rules. Letters, digits, space, `_`, `.` and `-` only, 1-64 characters; MFAService refuses to start with anything else, since a quote in the prefix breaks the firewall commands and, on Linux, leaves grants the sweeper can never remove. |
@@ -204,7 +204,8 @@ Copy the publish outputs to their installation directories, for example:
 ### 3. Configure appsettings.json and Restrict Permissions
 
 In each installation directory, copy `appsettings.example.json` to `appsettings.json`
-and fill in the values. The `DpapiEntropy` value must be identical in all three files.
+and fill in the values. The `DpapiEntropy` value must be identical in all three files (it is
+used on Windows only).
 
 Generate a strong entropy string with a cryptographic RNG (works on both Windows
 PowerShell 5.1 and PowerShell 7):
@@ -461,15 +462,10 @@ other write permission. Run the admin tool as `sudo /opt/mfa-admin/MFAAdmin ...`
 ### 3. Configure appsettings.json
 
 In each installation directory, copy `appsettings.example.json` to `appsettings.json`.
-Generate a strong entropy string:
 
-```bash
-openssl rand -base64 32
-```
-
-Set the same value for `DpapiEntropy` in all three config files. On Linux, DPAPI is not
-used — the user database is stored as plain JSON — but the value is still required by
-the application to start.
+On Linux, DPAPI is not used — the user database is stored as plain JSON, protected by file
+permissions — so `DpapiEntropy` is not required and is ignored if set. You can remove it
+from all three config files.
 
 In **MFAService's** config, replace the Windows account placeholder with the local web account:
 
@@ -578,7 +574,7 @@ LockPersonality=true
 # Narrowed to what this process actually does: manage iptables/ip6tables (NET_ADMIN/NET_RAW, and
 # NETLINK for the address family below -- the same capabilities cover both tables) and own files
 # across users (DAC_OVERRIDE, CHOWN, FOWNER). CapabilityBoundingSet limits descendant processes
-# too, including the iptables/ip6tables subprocess this service shells out to -- test a real login
+# too, including the iptables/ip6tables processes this service runs -- test a real login
 # end to end (both an IPv4 and an IPv6 client, if you have one) after applying this,
 # the same way INSTALL.md already asks for the gate itself (see "Verify the gate is actually
 # gating"), since a too-narrow set fails firewall commands rather than refusing to start.
@@ -712,12 +708,19 @@ Linux (`iptables` for IPv4 grants, `ip6tables` for IPv6 ones). The Linux path is
 automatically when running on Linux — no source changes are required for a standard
 `iptables`/`ip6tables` setup.
 
-Rules are tracked using an `iptables`/`ip6tables` comment that embeds the rule name and
-expiry timestamp (e.g. `MFA_Temp_1.2.3.4_22_TCP exp:1746000000`). Which table a grant's
-rule lands in is decided by the client's own address family, not a config setting. The
-sweeper reads `iptables -S INPUT` **and** `ip6tables -S INPUT` on every pass, finds rules
-whose expiry has passed in either table, and deletes them. `MFAAdmin diag`/`reset` read
-and clear both tables the same way.
+Rules are tracked using an `iptables`/`ip6tables` comment that embeds the rule name, the
+username and the expiry timestamp (e.g. `MFA_Temp_1.2.3.4_22_TCP user:alice@example.com
+exp:1746000000`). Which table a grant's rule lands in is decided by the client's own address
+family, not a config setting. The sweeper reads `iptables -S INPUT` **and** `ip6tables -S
+INPUT` on every pass, finds rules whose expiry has passed in either table, and deletes them.
+`MFAAdmin diag`/`reset` read and clear both tables the same way, and `MFAAdmin delete`
+removes the deleted user's own rules from both. Rules granted by a version before the
+username was recorded have no `user:` part; they are still expired on schedule, and `diag`
+shows their user as `?`.
+
+`iptables` and `ip6tables` are run directly from `/usr/sbin` (or `/sbin`), without a shell,
+and with `-w 5`: if another program holds the xtables lock, such as fail2ban, Docker or a
+configuration-management run, a command waits up to 5 seconds for it instead of failing.
 
 **If your distro uses a different firewall backend**, replace the `iptables`/`ip6tables`
 calls in the clearly-commented sections of `MFAService/Program.cs`:
@@ -1164,9 +1167,8 @@ Then:
 - **`DpapiEntropy`** is a deployment-specific value mixed into the DPAPI key derivation
   on Windows. It prevents other processes on the same machine from reading the database
   without knowing this value. Keep it consistent across all three components and don't
-  use the default or a publicly known value. On Linux it is unused for encryption (the
-  database is plain JSON) but is still validated at startup — a missing value will
-  prevent the service from starting.
+  use the default or a publicly known value. On Linux it is not used (the database is
+  plain JSON, protected by file permissions) and is not required.
 - The user database contains **TOTP secrets** (not hashed) when TOTP is compiled in. A
   compromised database file allows an attacker to generate valid TOTP codes for every
   enrolled user. Protect the file with filesystem permissions as documented above.

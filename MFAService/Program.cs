@@ -265,9 +265,9 @@ public class FirewallWorkerService : BackgroundService
         _commands = commands;
     }
 
-    // RulePrefix is validated rather than escaped. It reaches single-quoted PowerShell, a
-    // single-quoted iptables --comment, and the patterns that read rules back, and a quote breaks
-    // each one differently. On Linux the failure was silent: grants were created under a name the
+    // RulePrefix is validated rather than escaped. It reaches single-quoted PowerShell, the
+    // iptables --comment, and the patterns that read rules back, and a quote breaks each one
+    // differently. On Linux the failure was silent: grants were created under a name the
     // sweeper could never match, so they were never removed. Refusing to start is the safe outcome
     // for a config error that would otherwise turn time-limited grants into standing ones.
     private static readonly Regex RulePrefixPattern = new(@"^[A-Za-z0-9 _.-]{1,64}\z");
@@ -1042,7 +1042,7 @@ public class FirewallWorkerService : BackgroundService
         //
         // IPAddress.TryParse accepts an IPv6 zone ID ("%...", RFC 4007) with arbitrary characters
         // and silently drops it in ToString() rather than validating it -- so a crafted zone ID
-        // like "2001:db8::1%$(id)" could survive into the privileged shell command built below.
+        // like "2001:db8::1%$(id)" could survive into the privileged firewall command built below.
         // No legitimate address here needs one (that's only link-local/scoped, already rejected
         // by IsPublicIpAddress), so reject it outright and use only the parsed form from here on.
         if (ip.Contains('%'))
@@ -1101,6 +1101,17 @@ public class FirewallWorkerService : BackgroundService
                                $"{MaxIpv6GrantPrefixLength}-bit maximum; clamping to {MaxIpv6GrantPrefixLength}. " +
                                "Check the configuration for a typo.");
             ipv6PrefixLength = MaxIpv6GrantPrefixLength;
+        }
+
+        // The Linux rule comment carries the username, and iptables stores at most 255 bytes of
+        // it. Check the longest comment any configured port could produce (5-digit port, 3-letter
+        // protocol, 11-digit expiry) before writing anything, so a long username is refused
+        // outright rather than after some of its ports are already open.
+        if (!_commands.IsWindows &&
+            LinuxIptables.Comment($"{_rulePrefix}{ip}_65535_TCP", username, 99_999_999_999).Length > LinuxIptables.MaxCommentLength)
+        {
+            ServiceLogger.Warn($"[FIREWALL] Refused: username too long for an iptables rule comment ({username.Length} characters).");
+            return $"ERROR: Username is too long for an iptables rule comment ({LinuxIptables.MaxCommentLength} characters at most).";
         }
 
         try
@@ -1287,23 +1298,32 @@ public class FirewallWorkerService : BackgroundService
             string table    = LinuxTable(ip);
             string proto    = protocol.ToLowerInvariant();
             long   expEpoch = DateTimeOffset.UtcNow.AddHours(expirationHours).ToUnixTimeSeconds();
-            string comment  = $"{ruleName} exp:{expEpoch}";
+            // The username goes into the comment so that 'MFAAdmin delete' can find and remove
+            // this user's grants, as it does on Windows. It is a plain email (checked in
+            // ProcessFirewallRequest), so it contains no quote, space or shell character.
+            string comment  = LinuxIptables.Comment(ruleName, username, expEpoch);
+            if (comment.Length > LinuxIptables.MaxCommentLength)
+                throw new InvalidOperationException(
+                    $"Username is too long for an iptables rule comment ({LinuxIptables.MaxCommentLength} characters at most).");
 
             // Upsert: remove any existing rule for this IP+port, then insert a fresh one.
             // iptables -I is not idempotent on its own — without the delete step it would
             // stack duplicate rules on repeated logins from the same IP. A prior rule for this
             // exact ruleName is necessarily in the same table, since the name embeds this IP.
+            // The rule name carries no username, so a sign-in by a different user from the same
+            // address replaces the rule and its user tag, as Set-NetFirewallRule does on Windows.
             // (A different host address in the same widened /64 gets its own ruleName and its
             // own overlapping rule rather than being deduplicated against this one -- simpler and
             // still correct, since the sweeper expires each independently regardless of overlap.)
-            string existing = _commands.Bash($"{table} -S INPUT");
+            string existing = _commands.Iptables(table, "-S", "INPUT");
             foreach (string line in existing.Split('\n', StringSplitOptions.RemoveEmptyEntries))
             {
                 if (TryGetManagedRule(line, out var name, out _) && name == ruleName)
                     DeleteLinuxRule(table, line);
             }
 
-            _commands.Bash($"{table} -I INPUT -p {proto} --dport {port} -s {sourceSpec} -j ACCEPT -m comment --comment '{comment}'");
+            _commands.Iptables(table, "-I", "INPUT", "-p", proto, "--dport", port.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                               "-s", sourceSpec, "-j", "ACCEPT", "-m", "comment", "--comment", comment);
             ServiceLogger.Debug($"[FIREWALL] {table} rule inserted in {fw.ElapsedMilliseconds}ms. Verifying...");
 
             // Verify by scanning the rule list for our comment, not with `iptables -C`.
@@ -1312,7 +1332,7 @@ public class FirewallWorkerService : BackgroundService
             // comment therefore never matches a rule that exists, which reported every
             // successful Linux grant as [FAILED] while the rule was in fact present and working.
             // Scanning also matches how the upsert above and SweepExpiredRules locate rules.
-            string after = _commands.Bash($"{table} -S INPUT");
+            string after = _commands.Iptables(table, "-S", "INPUT");
             bool verified = after
                 .Split('\n', StringSplitOptions.RemoveEmptyEntries)
                 .Any(l => TryGetManagedRule(l, out var name, out var expiry) && name == ruleName && expiry == expEpoch);
@@ -1349,19 +1369,13 @@ public class FirewallWorkerService : BackgroundService
         return result.StandardOutput;
     }
 
-    internal static string RunBash(string script)
+    // Runs iptables/ip6tables directly -- no shell is involved, so no argument is ever parsed as
+    // shell syntax -- and waits for the xtables lock if another program holds it.
+    internal static string RunIptables(string table, string[] args)
     {
-        var psi = new ProcessStartInfo("/bin/bash");
-        psi.ArgumentList.Add("-c");
-        psi.ArgumentList.Add(script);
-        psi.CreateNoWindow        = true;
-        psi.UseShellExecute       = false;
-        psi.RedirectStandardOutput = true;
-        psi.RedirectStandardError  = true;
-
-        var result = FirewallCommandRunner.Run(psi);
+        var result = FirewallCommandRunner.Run(LinuxIptables.StartInfo(table, args));
         if (!string.IsNullOrWhiteSpace(result.StandardError))
-            ServiceLogger.Warn($"[BASH STDERR] {result.StandardError}");
+            ServiceLogger.Warn($"[{table.ToUpperInvariant()} STDERR] {result.StandardError}");
         return result.StandardOutput;
     }
 
@@ -1449,9 +1463,9 @@ public class FirewallWorkerService : BackgroundService
             long nowEpoch = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
             int  count    = 0;
 
-            foreach (string table in new[] { "iptables", "ip6tables" })
+            foreach (string table in LinuxIptables.Tables)
             {
-                string rules = _commands.Bash($"{table} -S INPUT");
+                string rules = _commands.Iptables(table, "-S", "INPUT");
                 foreach (string line in rules.Split('\n', StringSplitOptions.RemoveEmptyEntries))
                 {
                     if (!TryGetManagedRule(line, out var name, out var expiry) || nowEpoch < expiry) continue;
@@ -1469,24 +1483,16 @@ public class FirewallWorkerService : BackgroundService
 
     // iptables -S quotes comments containing spaces. Match the complete generated comment,
     // including its delimiter: port 22 must never match 2222, nor TCP match UDP. The old
-    // protocol-less names are still understood by expiry, so upgrades do not strand grants.
+    // protocol-less names, and comments without a user tag, are still understood by expiry,
+    // so upgrades do not strand grants.
     private bool TryGetManagedRule(string line, out string name, out long expiry)
-    {
-        name = string.Empty;
-        expiry = 0;
-        if (!line.TrimStart().StartsWith("-A INPUT ", StringComparison.Ordinal)) return false;
-        var match = Regex.Match(line, @"(?:^|\s)--comment ""(?<name>[^""]+) exp:(?<expiry>\d+)""(?:\s|$)");
-        if (!match.Success || !match.Groups["name"].Value.StartsWith(_rulePrefix, StringComparison.Ordinal)
-            || !long.TryParse(match.Groups["expiry"].Value, out expiry)) return false;
-        name = match.Groups["name"].Value;
-        return true;
-    }
+        => LinuxIptables.TryParseManagedRule(line, _rulePrefix, out name, out expiry, out _);
 
     private void DeleteLinuxRule(string table, string line)
     {
         string rule = line.Trim();
-        _commands.Bash($"{table} -D INPUT" + rule["-A INPUT".Length..]);
-        string remaining = _commands.Bash($"{table} -S INPUT");
+        _commands.Iptables(table, LinuxIptables.DeleteArguments(rule));
+        string remaining = _commands.Iptables(table, "-S", "INPUT");
         if (remaining.Split('\n', StringSplitOptions.RemoveEmptyEntries).Any(l => l.Trim() == rule))
             throw new InvalidOperationException($"{table} rule remains after deletion.");
     }
@@ -1515,18 +1521,8 @@ public class DatabaseLockService : BackgroundService
 
     public DatabaseLockService(IConfiguration config)
     {
-        // DpapiEntropy must be a real per-deployment secret. DPAPI here is LocalMachine scope,
-        // so this value is the only thing stopping another process on the same host from
-        // decrypting users.dat — and the placeholder in appsettings.example.json is published
-        // in the public source repository. Refuse to start rather than run with a known value.
-        string? entropyStr = config["DpapiEntropy"];
-        if (string.IsNullOrWhiteSpace(entropyStr))
-            throw new InvalidOperationException("DpapiEntropy must be configured in appsettings.json. Set it to a unique random string for your deployment.");
-        if (entropyStr.Contains("REPLACE-WITH", StringComparison.OrdinalIgnoreCase))
-            throw new InvalidOperationException("DpapiEntropy is still set to the placeholder from appsettings.example.json. That value is public and offers no protection. Generate a unique random string for this deployment.");
-        if (entropyStr.Trim().Length < 16)
-            throw new InvalidOperationException("DpapiEntropy must be at least 16 characters. Generate a unique random string for this deployment (e.g. 32 random bytes, base64-encoded).");
-        Entropy = Encoding.UTF8.GetBytes(entropyStr);
+        // Required and validated on Windows only; see Shared/DpapiEntropy.cs.
+        Entropy = DpapiEntropy.Load(config);
         if (OperatingSystem.IsWindows())
             _dbMutex ??= CreateSecureDbMutex(config["FirewallService:GmsaAccount"]);
     }

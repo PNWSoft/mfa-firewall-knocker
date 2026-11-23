@@ -56,11 +56,12 @@ jobs:
         run: dotnet run --project tests/MFAWeb.RegistrationTests -c Release -p:RestoreLockedMode=true
 
   linux-service:
-    # Unit tests never start MFAService the way it is deployed. 0.4.1 passed them all and still
-    # failed at startup under the systemd unit in INSTALL.md (a runtime update moved files the
-    # unit's sandbox hides). This publishes the self-contained Linux build, installs it with the
-    # documented unit, and checks that it starts and handles a database and a firewall request.
-    name: Linux service under the documented systemd unit
+    # Unit tests never run the components the way they are deployed. 0.4.1 passed them all and
+    # still failed at startup under the systemd unit in INSTALL.md (a runtime update moved files
+    # the unit's sandbox hides). This publishes the self-contained Linux build, installs MFAService
+    # and MFAWeb with the documented units, and runs provisioning, the MFAWeb-to-MFAService IPC,
+    # IPv4/IPv6 grants, and MFAAdmin diag/delete/reset against them.
+    name: Linux services under the documented systemd units
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -69,11 +70,14 @@ jobs:
         with:
           global-json-file: global.json
 
-      - name: Publish MFAService (linux-x64, self-contained)
-        run: dotnet publish MFAService/MFAService.csproj -c Release -r linux-x64 --self-contained -p:RestoreLockedMode=true -p:SourceRevisionId=${{ github.sha }} -o "$RUNNER_TEMP/MFAService"
+      - name: Publish (linux-x64, self-contained)
+        run: |
+          for p in MFAService MFAWeb MFAAdmin; do
+            dotnet publish $p/$p.csproj -c Release -r linux-x64 --self-contained -p:RestoreLockedMode=true -p:SourceRevisionId=${{ github.sha }} -o "$RUNNER_TEMP/publish/$p"
+          done
 
-      - name: Start it under the INSTALL.md unit and send requests
-        run: sudo bash tests/linux-service-smoke.sh "$RUNNER_TEMP/MFAService"
+      - name: Run them under the INSTALL.md units
+        run: sudo bash tests/linux-service-smoke.sh "$RUNNER_TEMP/publish"
 
   audit:
     name: Dependency audit

@@ -3,7 +3,7 @@
   <PropertyGroup>
     <OutputType>Exe</OutputType>
     <TargetFramework>net10.0</TargetFramework>
-    <Version>0.4.2</Version>
+    <Version>0.5.0</Version>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <ApplicationIcon>knocker.ico</ApplicationIcon>
@@ -13,6 +13,8 @@
   <ItemGroup>
     <!-- One SMTP transport rule for all three components; see the file's header. -->
     <Compile Include="..\Shared\SmtpTransportPolicy.cs" Link="SmtpTransportPolicy.cs" />
+    <Compile Include="..\Shared\DpapiEntropy.cs" Link="DpapiEntropy.cs" />
+    <Compile Include="..\Shared\LinuxIptables.cs" Link="LinuxIptables.cs" />
     <Compile Include="..\Shared\LinuxDbLock.cs" Link="LinuxDbLock.cs" />
   </ItemGroup>
 

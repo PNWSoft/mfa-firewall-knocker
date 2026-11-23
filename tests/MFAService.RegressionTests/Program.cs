@@ -52,7 +52,7 @@ Test("Linux grant identities separate ports and protocols on renew", () =>
     Check(worker.ProcessFirewallRequest(Request) == "SUCCESS");
     Check(commands.Rules.Count == 3);
     foreach (var suffix in new[] { "_2222_TCP", "_22_UDP", "_22_TCP" })
-        Check(commands.Rules.Count(rule => rule.Contains(suffix + " exp:")) == 1);
+        Check(commands.Rules.Count(rule => rule.Contains(suffix + " user:")) == 1);
 });
 Test("Linux expiry removes legacy and current names but preserves future and unrelated rules", () =>
 {
@@ -84,7 +84,7 @@ Test("Linux custom prefixes with spaces preserve renewals and legacy expiry", ()
     Check(commands.Rules.Count == 3);
     worker.SweepExpiredRules();
     Check(commands.Rules.Count == 2);
-    Check(commands.Rules.Count(rule => rule.Contains("MFA Temp_8.8.8.8_22_TCP exp:")) == 1);
+    Check(commands.Rules.Count(rule => rule.Contains("MFA Temp_8.8.8.8_22_TCP user:")) == 1);
     Check(commands.Rules.Count(rule => rule.Contains("MFA Temp_8.8.8.8_2222_TCP exp:")) == 1);
 });
 Test("rule prefixes that would break quoting or rule parsing are refused at startup", () =>
@@ -186,10 +186,10 @@ Test("IPv6 zone ID is rejected before it can reach a shell command", () =>
 {
     // IPAddress.TryParse accepts a zone ID (RFC 4007) containing arbitrary characters, including
     // shell metacharacters, and its own ToString() silently drops it -- so using the raw input
-    // string past validation let a crafted zone ID survive into the privileged bash -c /
-    // PowerShell command built for the actual grant. FakeCommands.Bash/PowerShell receive the
-    // exact script that would have run, so this proves the payload never reaches that far, not
-    // just that the response happens to be an error.
+    // string past validation let a crafted zone ID survive into the privileged firewall
+    // command built for the actual grant. FakeCommands.Iptables/PowerShell record every command
+    // that would have run, so this proves the payload never reaches that far, not just that the
+    // response happens to be an error.
     var commands = new FakeCommands();
     var worker = Worker(commands);
     foreach (var payload in new[] { "2001:db8::1%$(id)", "2001:db8::1%';calc;#", "2001:db8::1%eth0" })
@@ -207,7 +207,7 @@ Test("IPv6 grant lands in ip6tables, never iptables", () =>
     Check(Worker(commands).ProcessFirewallRequest(RequestV6) == "SUCCESS");
     Check(commands.Rules.Count == 0);
     Check(commands.Rules6.Count == 1);
-    Check(commands.Rules6[0].Contains("2001:4860:4860::8888") && commands.Rules6[0].Contains("_22_TCP exp:"));
+    Check(commands.Rules6[0].Contains("2001:4860:4860::8888") && commands.Rules6[0].Contains("_22_TCP user:review@example.com exp:"));
 });
 Test("IPv4 and IPv6 grants coexist in their own tables without cross-deleting", () =>
 {
@@ -239,7 +239,7 @@ Test("IPv6 grant widens to the configured prefix's containing network", () =>
     var commands = new FakeCommands();
     Check(WorkerWithIpv6PrefixLength(commands, 64).ProcessFirewallRequest(RequestV6) == "SUCCESS");
     Check(commands.Rules6.Count == 1);
-    Check(commands.Rules6[0].Contains("-s 2001:4860:4860::/64 ") && commands.Rules6[0].Contains("_22_TCP exp:"));
+    Check(commands.Rules6[0].Contains("-s 2001:4860:4860::/64 ") && commands.Rules6[0].Contains("_22_TCP user:review@example.com exp:"));
 });
 Test("IPv6 grant prefix length below the documented minimum is clamped, not rejected", () =>
 {
@@ -296,6 +296,83 @@ Test("expired provisioning is cleared, but the password only when TOTP was never
     // Already clean and expired: idempotent, reports no change on a second pass.
     Check(!DatabaseLockService.TryCleanExpiredProvisioning(neverConfirmed, now));
 });
+Test("Linux grant comment records the username, and parsing recovers it", () =>
+{
+    var commands = new FakeCommands();
+    Check(Worker(commands).ProcessFirewallRequest(Request) == "SUCCESS");
+    Check(commands.Rules.Count == 1 && commands.Rules[0].Contains("\"MFA_Temp_8.8.8.8_22_TCP user:review@example.com exp:"));
+    Check(LinuxIptables.TryParseManagedRule(commands.Rules[0], "MFA_Temp_", out var name, out var expiry, out var user));
+    Check(name == "MFA_Temp_8.8.8.8_22_TCP" && user == "review@example.com" && expiry > DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+
+    // A rule written before the tag existed still parses, with no user.
+    Check(LinuxIptables.TryParseManagedRule(Rule("MFA_Temp_8.8.8.8_22_TCP", 5), "MFA_Temp_", out name, out expiry, out user));
+    Check(name == "MFA_Temp_8.8.8.8_22_TCP" && expiry == 5 && user == null);
+
+    // Prefixes with spaces still split correctly, and another prefix's rules are not ours.
+    Check(LinuxIptables.TryParseManagedRule(Rule("MFA Temp_8.8.8.8_22_TCP user:a.b+c@example.com", 5), "MFA Temp_", out name, out _, out user));
+    Check(name == "MFA Temp_8.8.8.8_22_TCP" && user == "a.b+c@example.com");
+    Check(!LinuxIptables.TryParseManagedRule(Rule("other_8.8.8.8_22_TCP user:a@example.com", 5), "MFA_Temp_", out _, out _, out _));
+});
+Test("a tagged rule is still recognized and expired by the 0.4.x parser", () =>
+{
+    // Downgrade safety: the parser in 0.4.1 and earlier, verbatim. If it could not read the new
+    // comment, a downgrade would leave every open grant as a standing rule.
+    var old = new Regex(@"(?:^|\s)--comment ""(?<name>[^""]+) exp:(?<expiry>\d+)""(?:\s|$)");
+    var match = old.Match(Rule(LinuxIptables.Comment("MFA_Temp_8.8.8.8_22_TCP", "review@example.com", 42)[..^" exp:42".Length], 42));
+    Check(match.Success && match.Groups["name"].Value.StartsWith("MFA_Temp_") && match.Groups["expiry"].Value == "42");
+});
+Test("a username too long for an iptables comment is refused before any rule is written", () =>
+{
+    var commands = new FakeCommands();
+    string user = "a@" + string.Join('.', Enumerable.Repeat(new string('b', 60), 4)) + ".com";
+    Check(Worker(commands).ProcessFirewallRequest($"8.8.8.8|{user}").Contains("too long"));
+    Check(commands.Rules.Count == 0 && !commands.SeenScripts.Any(s => s.Contains(" -I ")));
+
+    // A username that fits a 2-digit port's comment but not a 5-digit one is refused before the
+    // first port is opened, not after: no partial grant.
+    string Comment(string port) => LinuxIptables.Comment($"MFA_Temp_8.8.8.8_{port}_TCP", "", 99_999_999_999);
+    int room = LinuxIptables.MaxCommentLength - Comment("22").Length;
+    string local = new string('c', room - "@example.com".Length - 1);
+    string edge = local + "@example.com";
+    Check(Comment("22").Length + edge.Length <= LinuxIptables.MaxCommentLength);
+    Check(Comment("51820").Length + edge.Length > LinuxIptables.MaxCommentLength);
+    var two = new FakeCommands();
+    Check(Worker(two, "22/TCP", "51820/UDP").ProcessFirewallRequest($"8.8.8.8|{edge}").Contains("too long"));
+    Check(two.Rules.Count == 0 && !two.SeenScripts.Any(s => s.Contains(" -I ")));
+});
+Test("iptables runs without a shell, waits for the lock, and deletes the exact listed rule", () =>
+{
+    Check(LinuxIptables.Arguments(new[] { "-S", "INPUT" }).SequenceEqual(new[] { "-w", "5", "-S", "INPUT" }));
+    Throws<ArgumentException>(() => LinuxIptables.BinaryPath("sh"));
+    Throws<ArgumentException>(() => LinuxIptables.BinaryPath("/bin/iptables"));
+
+    string line = "-A INPUT -s 8.8.8.8/32 -p tcp -m tcp --dport 22 -m comment --comment \"MFA Temp_8.8.8.8_22_TCP user:a@example.com exp:9\" -j ACCEPT";
+    Check(LinuxIptables.DeleteArguments(line).SequenceEqual(new[] { "-D", "INPUT", "-s", "8.8.8.8/32", "-p", "tcp", "-m", "tcp",
+        "--dport", "22", "-m", "comment", "--comment", "MFA Temp_8.8.8.8_22_TCP user:a@example.com exp:9", "-j", "ACCEPT" }));
+    // Exactly as iptables 1.8.10 prints a comment holding ' " and \ (captured from a real ruleset).
+    Check(LinuxIptables.SplitRuleLine(@"-A INPUT -m comment --comment ""a\'b \""q\"" back\\slash"" -j ACCEPT")[5] == @"a'b ""q"" back\slash");
+    Throws<InvalidOperationException>(() => LinuxIptables.DeleteArguments("-A FORWARD -j ACCEPT"));
+    Throws<InvalidOperationException>(() => LinuxIptables.DeleteArguments("-A INPUT --comment \"unterminated"));
+});
+Test("DpapiEntropy is required and validated on Windows only", () =>
+{
+    static IConfiguration Entropy(string? value) => new ConfigurationBuilder()
+        .AddInMemoryCollection(value == null ? Array.Empty<KeyValuePair<string, string?>>()
+            : new[] { new KeyValuePair<string, string?>("DpapiEntropy", value) }).Build();
+
+    if (OperatingSystem.IsWindows())
+    {
+        foreach (var bad in new[] { null, "", "REPLACE-WITH-A-UNIQUE-RANDOM-STRING", "too-short" })
+            Throws<InvalidOperationException>(() => DpapiEntropy.Load(Entropy(bad)));
+        Check(DpapiEntropy.Load(Entropy("0123456789abcdef")).Length == 16);
+    }
+    else
+    {
+        // Unused on Linux (users.dat is plain JSON), so neither required nor checked.
+        Check(DpapiEntropy.Load(Entropy(null)).Length == 0);
+        Check(DpapiEntropy.Load(Entropy("REPLACE-WITH-A-UNIQUE-RANDOM-STRING")).Length == 0);
+    }
+});
 Test("the Linux database lock file excludes a second holder until released", () =>
 {
     string dir = Path.Combine(Path.GetTempPath(), "mfa-lock-" + Guid.NewGuid().ToString("N"));
@@ -317,7 +394,7 @@ Test("the Linux database lock file excludes a second holder until released", () 
     }
     finally { Directory.Delete(dir, true); }
 });
-Console.WriteLine(failed == 0 ? "All 28 regression checks passed." : $"{failed} regression check(s) failed.");
+Console.WriteLine(failed == 0 ? "All 33 regression checks passed." : $"{failed} regression check(s) failed.");
 return failed == 0 ? 0 : 1;
 
 void Test(string name, Action action)
@@ -400,34 +477,36 @@ sealed class FakeCommands : IFirewallCommands
         return WindowsNames.Contains(name) ? name : "";
     }
 
-    public string Bash(string script)
+    public string Iptables(string table, params string[] args)
     {
-        SeenScripts.Add(script);
-        foreach (var (table, rules, mask) in new (string, List<string>, string)[]
-                 { ("iptables", Rules, "32"), ("ip6tables", Rules6, "128") })
+        // Recorded as a readable command line; the real runner passes each argument separately.
+        SeenScripts.Add($"{table} {string.Join(' ', args)}");
+        if (Array.IndexOf(LinuxIptables.Tables, table) < 0) throw new Exception("Unexpected table");
+        var (rules, mask) = table == "iptables" ? (Rules, "32") : (Rules6, "128");
+
+        if (args is ["-S", "INPUT"]) return string.Join('\n', rules);
+        if (args.Length > 2 && args[0] == "-D" && args[1] == "INPUT")
         {
-            if (script == $"{table} -S INPUT") return string.Join('\n', rules);
-            if (script.StartsWith($"{table} -D INPUT"))
+            if (FailDelete) throw new InvalidOperationException("Command failed with code 1");
+            // Delete only on an exact match of the parsed rule, as iptables -D does.
+            if (!IgnoreDelete)
+                rules.RemoveAll(r => LinuxIptables.SplitRuleLine(r).Skip(2).SequenceEqual(args.Skip(2)));
+            return "";
+        }
+        if (args.Length > 2 && args[0] == "-I" && args[1] == "INPUT")
+        {
+            if (FailInsert) throw new InvalidOperationException("Command failed with code 1");
+            if (!IgnoreInsert)
             {
-                if (FailDelete) throw new InvalidOperationException("Command failed with code 1");
-                if (!IgnoreDelete) rules.Remove("-A INPUT" + script[$"{table} -D INPUT".Length..]);
-                return "";
+                string Arg(string flag) => args[Array.IndexOf(args, flag) + 1];
+                // A widened IPv6 source already carries its own /prefix (see OpenFirewallPort);
+                // only bare host addresses get the implicit /32 or /128 appended here.
+                string source = Arg("-s");
+                if (!source.Contains('/')) source += $"/{mask}";
+                string proto = Arg("-p");
+                rules.Add($"-A INPUT -s {source} -p {proto} -m {proto} --dport {Arg("--dport")} -m comment --comment \"{Arg("--comment")}\" -j ACCEPT");
             }
-            if (script.StartsWith($"{table} -I INPUT"))
-            {
-                if (FailInsert) throw new InvalidOperationException("Command failed with code 1");
-                if (!IgnoreInsert)
-                {
-                    var match = Regex.Match(script, @"-p (\w+) --dport (\d+) -s (\S+).*--comment '([^']+)'$");
-                    if (!match.Success) throw new Exception("Unexpected insertion format");
-                    // A widened IPv6 source already carries its own /prefix (see OpenFirewallPort);
-                    // only bare host addresses get the implicit /32 or /128 appended here.
-                    string source = match.Groups[3].Value;
-                    if (!source.Contains('/')) source += $"/{mask}";
-                    rules.Add($"-A INPUT -s {source} -p {match.Groups[1].Value} -m {match.Groups[1].Value} --dport {match.Groups[2].Value} -m comment --comment \"{match.Groups[4].Value}\" -j ACCEPT");
-                }
-                return "";
-            }
+            return "";
         }
         throw new Exception("Unexpected firewall operation");
     }

@@ -4,14 +4,15 @@ internal interface IFirewallCommands
 {
     bool IsWindows { get; }
     string PowerShell(string script);
-    string Bash(string script);
+    // Runs iptables or ip6tables directly with these arguments -- no shell. See LinuxIptables.
+    string Iptables(string table, params string[] args);
 }
 
 internal sealed class SystemFirewallCommands : IFirewallCommands
 {
     public bool IsWindows => OperatingSystem.IsWindows();
     public string PowerShell(string script) => FirewallWorkerService.RunPowerShell(script);
-    public string Bash(string script) => FirewallWorkerService.RunBash(script);
+    public string Iptables(string table, params string[] args) => FirewallWorkerService.RunIptables(table, args);
 }
 
 internal sealed record CommandOutput(string StandardOutput, string StandardError);

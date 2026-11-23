@@ -363,8 +363,9 @@ cd mfa-firewall-knocker
 cp MFAWeb/appsettings.example.json     MFAWeb/appsettings.json
 cp MFAService/appsettings.example.json MFAService/appsettings.json
 cp MFAAdmin/appsettings.example.json   MFAAdmin/appsettings.json
-# ...then edit each one. At minimum: AppUrl, AllowedDomains, HttpsCert, Smtp, and a
-# DpapiEntropy that is IDENTICAL in all three (startup refuses the placeholder value).
+# ...then edit each one. At minimum: AppUrl, AllowedDomains, HttpsCert, Smtp, and, on Windows,
+# a DpapiEntropy that is IDENTICAL in all three (startup refuses the placeholder value; Linux
+# does not use it).
 
 # Build all three
 dotnet build MFA.slnx -c Release
@@ -396,8 +397,9 @@ Copy the matching `appsettings.example.json` and fill it in. The full key refere
 
 A few that are easy to get wrong:
 
-- **`DpapiEntropy`** — a unique random string mixed into the DPAPI key derivation. It must be
-  **identical across all three components** and must not be left at the placeholder value.
+- **`DpapiEntropy`** (Windows) — a unique random string mixed into the DPAPI key derivation. It
+  must be **identical across all three components** and must not be left at the placeholder value.
+  Linux does not use DPAPI, so the setting is not required there.
 - **`HttpsCert:Subject` / `Store` / `Location`** — must match between MFAWeb and MFAService, or the
   cert monitor will watch a different certificate than the one being served.
 - **`AllowedDomains`** — restricts which email domains can be provisioned.
@@ -463,8 +465,9 @@ They do not remove the need for a second way in.
 
 ## Revoking access does not end active sessions
 
-Rules disappear a few ways: they expire, an admin runs `MFAAdmin reset`, or (on Windows)
-`MFAAdmin delete` removes a deleted user's own rules as part of removing the account. All of
+Rules disappear a few ways: they expire, an admin runs `MFAAdmin reset`, or `MFAAdmin delete`
+removes a deleted user's own rules as part of removing the account (with limits on Linux: see
+SECURITY.md, "What happens if MFAService stops"). All of
 them **close the firewall to new connections**. None reliably ends a session that is already
 connected.
 

@@ -237,18 +237,8 @@ namespace MFAAdmin
                 .Build();
 
             AdminLogger.SetMinLevel(Config["Logging:AppMinLevel"]);
-            // DpapiEntropy must be a real per-deployment secret. DPAPI here is LocalMachine scope,
-            // so this value is the only thing stopping another process on the same host from
-            // decrypting users.dat — and the placeholder in appsettings.example.json is published
-            // in the public source repository. Refuse to start rather than run with a known value.
-            string? entropyStr = Config["DpapiEntropy"];
-            if (string.IsNullOrWhiteSpace(entropyStr))
-                throw new InvalidOperationException("DpapiEntropy must be configured in appsettings.json. Set it to a unique random string for your deployment.");
-            if (entropyStr.Contains("REPLACE-WITH", StringComparison.OrdinalIgnoreCase))
-                throw new InvalidOperationException("DpapiEntropy is still set to the placeholder from appsettings.example.json. That value is public and offers no protection. Generate a unique random string for this deployment.");
-            if (entropyStr.Trim().Length < 16)
-                throw new InvalidOperationException("DpapiEntropy must be at least 16 characters. Generate a unique random string for this deployment (e.g. 32 random bytes, base64-encoded).");
-            Entropy = Encoding.UTF8.GetBytes(entropyStr);
+            // Required and validated on Windows only; see Shared/DpapiEntropy.cs.
+            Entropy = DpapiEntropy.Load(Config);
 
             // Surface the authentication posture on every run. Which mode is active decides
             // whether 'add'/'reprovision' mint a TOTP secret and whether the provisioning email
@@ -949,11 +939,35 @@ namespace MFAAdmin
                 }
                 else
                 {
-                    // Unlike Windows, the Linux iptables comment carries no username (see
-                    // OpenFirewallPort), so there's no way to find "this user's rules" here.
-                    revocationNote = "Any active firewall rule for this user was NOT removed -- " +
-                        "Linux rules are not tracked by username. It will expire naturally " +
-                        "(within ExpirationHours) or can be found and removed by IP via 'diag'.";
+                    // MFAService tags each Linux grant's comment with the username (see
+                    // OpenFirewallPort). The account is already gone from the database, so MFAWeb
+                    // can no longer sign it in; a sign-in already past verification when the
+                    // account was deleted can still land a grant after this pass.
+                    try
+                    {
+                        var (revoked, remaining, untagged) = RevokeLinuxRulesForUser(username);
+                        if (remaining > 0)
+                            revocationNote = $"{revoked} firewall rule(s) for this user were removed, but " +
+                                $"{remaining} REMAIN after deletion -- access is still open; check 'diag' " +
+                                "and remove them manually.";
+                        else
+                            revocationNote = revoked > 0
+                                ? $"{revoked} active firewall rule(s) for this user were also removed."
+                                : "No active firewall rule was found for this user to remove.";
+                        if (untagged > 0)
+                            revocationNote += $" {untagged} active rule(s) were granted by an older MFAService " +
+                                "that did not record usernames; any of them could belong to this user. They " +
+                                "expire on schedule, or can be found by address via 'diag'.";
+                    }
+                    catch (Exception ex)
+                    {
+                        // The firewall could not be read or changed. Say so rather than report that
+                        // nothing was found: the user's grants may still be open.
+                        revocationNote = "The firewall rules could NOT be checked or removed " +
+                            $"({ex.Message}). Any active grant for this user may still be open; check " +
+                            "'diag' and remove them manually.";
+                        AdminLogger.Error($"[ERROR] {revocationNote}");
+                    }
                 }
                 // Closing the firewall only blocks *new* connections -- it doesn't end a session
                 // this user already has established (see README.md's "Revoking access does not
@@ -972,9 +986,41 @@ namespace MFAAdmin
             }
         }
 
+        // Linux: MFAService writes each rule's comment as "<name> user:<email> exp:<epoch>" (see
+        // OpenFirewallPort and LinuxIptables.Comment). Deletes this user's grants from both
+        // tables, then re-reads them and reports what is left rather than assuming success.
+        // 'untagged' counts managed rules written before the user tag existed.
+        static (int Removed, int Remaining, int Untagged) RevokeLinuxRulesForUser(string username)
+        {
+            bool IsUsers(string line, out bool untagged)
+            {
+                untagged = false;
+                if (!LinuxIptables.TryParseManagedRule(line, RulePrefix, out _, out _, out string? user)) return false;
+                untagged = user is null;
+                return user is not null && user.Equals(username, StringComparison.OrdinalIgnoreCase);
+            }
+
+            int removed = 0, remaining = 0, untaggedCount = 0;
+            foreach (string table in LinuxIptables.Tables)
+            {
+                foreach (string line in ListInputRules(table))
+                {
+                    if (!IsUsers(line, out _)) continue;
+                    RunIptables(table, LinuxIptables.DeleteArguments(line), out int rc);
+                    if (rc == 0) removed++;
+                }
+                foreach (string line in ListInputRules(table))
+                {
+                    if (IsUsers(line, out bool untagged)) remaining++;
+                    else if (untagged) untaggedCount++;
+                }
+            }
+            return (removed, remaining, untaggedCount);
+        }
+
         // Windows only: MFAService writes each rule's Description as "User: <email> Exp: <time>"
-        // (see OpenFirewallPort), so a targeted per-user revocation is possible there in a way
-        // it currently is not on Linux. Returns the number of rules removed.
+        // (see OpenFirewallPort), so a targeted per-user revocation is possible. Returns the
+        // number of rules removed.
         static int RevokeWindowsRulesForUser(string username)
         {
             string psQuery = $"-NoProfile -Command \"Get-NetFirewallRule -DisplayName '{RulePrefixPsEscaped}*' " +
@@ -1344,15 +1390,23 @@ namespace MFAAdmin
                 // writes -- a grant can land in either table depending on the client's address
                 // family. An earlier version queried 'ipset list', which this service never
                 // populates, so diag always showed nothing regardless of how many sessions were
-                // open. The Linux rule comment carries only "<RulePrefix><ip>_<port> exp:<epoch>"
-                // -- no username -- so that column is unavailable here, unlike on Windows.
+                // open. The rule comment is "<RulePrefix><ip>_<port>_<proto> user:<email> exp:<epoch>";
+                // rules granted before the user tag existed show "?" in the User column.
                 Console.WriteLine("Querying iptables/ip6tables for active MFA sessions...\n");
 
-                string rules = RunBash("iptables -S INPUT 2>/dev/null", out _)
-                             + "\n" + RunBash("ip6tables -S INPUT 2>/dev/null", out _);
-                var mine = rules.Split('\n', StringSplitOptions.RemoveEmptyEntries)
-                                .Where(IsManagedRule)
-                                .ToList();
+                var mine = new List<(string Line, string? User, long Expiry)>();
+                try
+                {
+                    foreach (string table in LinuxIptables.Tables)
+                        foreach (string line in ListInputRules(table))
+                            if (LinuxIptables.TryParseManagedRule(line, RulePrefix, out _, out long expiry, out string? user))
+                                mine.Add((line, user, expiry));
+                }
+                catch (Exception ex)
+                {
+                    AdminLogger.Error($"[ERROR] Could not read the firewall rules: {ex.Message}");
+                    return;
+                }
 
                 if (mine.Count == 0)
                 {
@@ -1360,28 +1414,24 @@ namespace MFAAdmin
                 }
                 else
                 {
-                    Console.WriteLine($"{"Source",-43} | {"Port",-6} | {"Expires",-20}");
-                    Console.WriteLine(new string('-', 77));
+                    Console.WriteLine($"{"Source",-43} | {"Port",-6} | {"User",-25} | {"Expires",-20}");
+                    Console.WriteLine(new string('-', 105));
 
-                    foreach (string line in mine)
+                    foreach (var (line, user, epoch) in mine)
                     {
                         // Keep the prefix length when the grant covers a network (Ipv6GrantPrefixLength
                         // below 128); drop it only for a single host (/32, /128), as before.
                         string ip   = Regex.Match(line, @"-s\s+(\S+)").Groups[1].Value;
                         if (ip.EndsWith("/32") || ip.EndsWith("/128")) ip = ip[..ip.LastIndexOf('/')];
                         string port = Regex.Match(line, @"--dport\s+(\d+)").Groups[1].Value;
-
-                        string expires = "Unknown";
-                        var exp = Regex.Match(line, @"exp:(\d+)");
-                        if (exp.Success && long.TryParse(exp.Groups[1].Value, out long epoch))
-                            expires = DateTimeOffset.FromUnixTimeSeconds(epoch)
-                                        .ToLocalTime().ToString("MM/dd/yyyy HH:mm");
+                        string expires = DateTimeOffset.FromUnixTimeSeconds(epoch)
+                                            .ToLocalTime().ToString("MM/dd/yyyy HH:mm");
 
                         Console.WriteLine($"{(ip.Length   == 0 ? "?" : ip),-43} | " +
-                                          $"{(port.Length == 0 ? "?" : port),-6} | {expires,-20}");
+                                          $"{(port.Length == 0 ? "?" : port),-6} | {user ?? "?",-25} | {expires,-20}");
                     }
 
-                    Console.WriteLine($"\n{mine.Count} active rule(s). Usernames are not recorded in iptables comments.");
+                    Console.WriteLine($"\n{mine.Count} active rule(s).");
                 }
             }
             Console.WriteLine();
@@ -1396,46 +1446,46 @@ namespace MFAAdmin
         }
 #pragma warning restore CA1416
 
-        // Runs a bash command and returns trimmed stdout, with the exit code so callers can
-        // tell a real failure from empty output. ArgumentList avoids shell-quoting pitfalls.
-        // Mirrors MFAService.RunBash. Linux paths only.
-        static string RunBash(string script, out int exitCode)
+        // Runs iptables/ip6tables directly -- no shell -- and returns trimmed stdout, with the
+        // exit code so callers can tell a real failure from empty output. Waits for the xtables
+        // lock like MFAService does (see LinuxIptables). Linux paths only.
+        static string RunIptables(string table, IEnumerable<string> args, out int exitCode)
         {
             exitCode = -1;
 
-            var psi = new ProcessStartInfo("/bin/bash");
-            psi.ArgumentList.Add("-c");
-            psi.ArgumentList.Add(script);
-            psi.CreateNoWindow         = true;
-            psi.UseShellExecute        = false;
-            psi.RedirectStandardOutput = true;
-            psi.RedirectStandardError  = true;
-
-            using var proc = Process.Start(psi);
+            using var proc = Process.Start(LinuxIptables.StartInfo(table, args));
             if (proc == null) return string.Empty;
 
+            // Read stderr concurrently: reading the streams one after the other can deadlock if
+            // the child fills the pipe that is not being read.
+            var error = proc.StandardError.ReadToEndAsync();
             string output = proc.StandardOutput.ReadToEnd().Trim();
-            string error  = proc.StandardError.ReadToEnd().Trim();
             proc.WaitForExit();
             exitCode = proc.ExitCode;
 
-            if (!string.IsNullOrWhiteSpace(error))
-                AdminLogger.Debug($"[BASH] {error}");
+            string stderr = error.GetAwaiter().GetResult().Trim();
+            if (!string.IsNullOrWhiteSpace(stderr))
+                AdminLogger.Debug($"[{table.ToUpperInvariant()}] {stderr}");
 
             return output;
         }
 
-        // Matches MFAService's own parsing exactly: the rule name is whatever the quoted comment
-        // says, not any text elsewhere on the line. A prior substring match against RulePrefix
-        // could delete an unrelated operator rule whose IP, port, or comment contained that text.
-        static readonly Regex ManagedRuleComment =
-            new(@"(?:^|\s)--comment ""(?<name>[^""]+) exp:\d+""(?:\s|$)", RegexOptions.Compiled);
-
-        static bool IsManagedRule(string iptablesLine)
+        // Throws if the listing fails: an empty result must mean an empty chain, never "could not
+        // read it", or delete and reset would report that no rule was found while one is open.
+        static string[] ListInputRules(string table)
         {
-            var match = ManagedRuleComment.Match(iptablesLine);
-            return match.Success && match.Groups["name"].Value.StartsWith(RulePrefix, StringComparison.Ordinal);
+            string output = RunIptables(table, new[] { "-S", "INPUT" }, out int exitCode);
+            if (exitCode != 0)
+                throw new InvalidOperationException($"'{table} -S INPUT' failed with exit code {exitCode}");
+            return output.Split('\n', StringSplitOptions.RemoveEmptyEntries);
         }
+
+        // Same parser MFAService uses (LinuxIptables.TryParseManagedRule): the rule name is
+        // whatever the quoted comment says, not any text elsewhere on the line. A prior substring
+        // match against RulePrefix could delete an unrelated operator rule whose IP, port, or
+        // comment contained that text.
+        static bool IsManagedRule(string iptablesLine)
+            => LinuxIptables.TryParseManagedRule(iptablesLine, RulePrefix, out _, out _, out _);
 
         static void ResetFirewall()
         {
@@ -1489,23 +1539,18 @@ namespace MFAAdmin
                     // it worked.
                     int attempted = 0, failed = 0, remaining = 0;
 
-                    foreach (string table in new[] { "iptables", "ip6tables" })
+                    foreach (string table in LinuxIptables.Tables)
                     {
-                        string rules = RunBash($"{table} -S INPUT 2>/dev/null", out _);
-
-                        foreach (string line in rules.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+                        foreach (string line in ListInputRules(table))
                         {
-                            if (!line.TrimStart().StartsWith("-A INPUT")) continue;
                             if (!IsManagedRule(line)) continue;
 
                             attempted++;
-                            RunBash($"{table} " + line.TrimStart().Replace("-A INPUT", "-D INPUT"), out int rc);
+                            RunIptables(table, LinuxIptables.DeleteArguments(line), out int rc);
                             if (rc != 0) failed++;
                         }
 
-                        string after = RunBash($"{table} -S INPUT 2>/dev/null", out _);
-                        remaining += after.Split('\n', StringSplitOptions.RemoveEmptyEntries)
-                                          .Count(IsManagedRule);
+                        remaining += ListInputRules(table).Count(IsManagedRule);
                     }
 
                     if (remaining > 0)

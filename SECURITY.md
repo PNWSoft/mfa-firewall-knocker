@@ -149,10 +149,12 @@ deletions succeeded; on Windows it issues the removal and reports success withou
 re-check. This applies to emergency revocation generally, not only to outages. `MFAAdmin diag`
 lists the rules without removing them.
 
-`reset` removes every grant, so all users must re-authenticate afterwards. On Windows,
-`MFAAdmin delete` also removes the deleted user's own rules, because Windows rules record the
-username. Linux rules do not, so there a single grant is removed by deleting that rule directly
-(`diag` lists them by address).
+`reset` removes every grant, so all users must re-authenticate afterwards. `MFAAdmin delete`
+also removes the deleted user's own rules, which record the username: in the rule description on
+Windows, and in the rule comment on Linux. Linux rules granted by a version before the username
+was recorded carry none; `delete` reports how many such rules are open, and `diag` lists them by
+address so a single one can be removed directly. Rules are named by address, not by user, so when
+two users sign in from the same address the rule carries whichever signed in last.
 
 ### Where the credential goes
 
